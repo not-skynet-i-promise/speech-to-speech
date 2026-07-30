@@ -1275,6 +1275,47 @@ class TestDispatchPipelineEvent:
         assert runtime_config.chat.buffer == []
         assert service._state(conn_id).response_pending is False
 
+    def test_create_response_false_stores_transcript_for_explicit_response(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+        text_prompt_queue,
+    ):
+        from openai.types.realtime.realtime_audio_input_turn_detection import ServerVad
+
+        runtime_config.session.audio.input.turn_detection = ServerVad(
+            type="server_vad",
+            create_response=False,
+        )
+
+        events = service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(
+                transcript="hello world",
+                language_code="en",
+                turn_id="turn_1",
+                turn_revision=2,
+                speech_stopped_at_s=123.0,
+            ),
+        )
+
+        assert len(events) == 1
+        assert isinstance(events[0], ConversationItemInputAudioTranscriptionCompletedEvent)
+        assert text_prompt_queue.empty()
+        assert service._state(conn_id).response_pending is False
+        assert runtime_config.chat.buffer[-1].content[0].text == "hello world"
+
+        result = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+
+        assert isinstance(result, ResponseCreatedEvent)
+        request = text_prompt_queue.get_nowait()
+        assert isinstance(request, GenerateResponseRequest)
+        assert request.turn_id == "turn_1"
+        assert request.turn_revision == 2
+        assert request.speech_stopped_at_s == 123.0
+        assert request.runtime_config.chat.buffer[-1].content[0].text == "hello world"
+
     def test_revised_transcription_replaces_speculative_user_message(self, runtime_config, should_listen):
         text_prompt_queue = Queue()
         tracker = SpeculativeTurnTracker()
@@ -1646,6 +1687,57 @@ class TestInterruptResponseEnabled:
             "type": "server_vad",
         }
         assert runtime_config.interrupt_response_enabled is True
+
+
+# ===================================================================
+# create_response_enabled property
+# ===================================================================
+
+
+class TestCreateResponseEnabled:
+    def test_default_true_when_no_turn_detection(self, runtime_config):
+        runtime_config.session.audio.input.turn_detection = None
+        assert runtime_config.create_response_enabled is True
+
+    def test_true_when_server_vad_create_response_true(self, runtime_config):
+        from openai.types.realtime.realtime_audio_input_turn_detection import ServerVad
+
+        runtime_config.session.audio.input.turn_detection = ServerVad(
+            type="server_vad",
+            create_response=True,
+        )
+        assert runtime_config.create_response_enabled is True
+
+    def test_false_when_server_vad_create_response_false(self, runtime_config):
+        from openai.types.realtime.realtime_audio_input_turn_detection import ServerVad
+
+        runtime_config.session.audio.input.turn_detection = ServerVad(
+            type="server_vad",
+            create_response=False,
+        )
+        assert runtime_config.create_response_enabled is False
+
+    def test_default_true_when_server_vad_create_response_none(self, runtime_config):
+        from openai.types.realtime.realtime_audio_input_turn_detection import ServerVad
+
+        runtime_config.session.audio.input.turn_detection = ServerVad(
+            type="server_vad",
+            create_response=None,
+        )
+        assert runtime_config.create_response_enabled is True
+
+    def test_reads_dict_turn_detection(self, runtime_config):
+        runtime_config.session.audio.input.turn_detection = {
+            "type": "server_vad",
+            "create_response": False,
+        }
+        assert runtime_config.create_response_enabled is False
+
+    def test_dict_defaults_to_true(self, runtime_config):
+        runtime_config.session.audio.input.turn_detection = {
+            "type": "server_vad",
+        }
+        assert runtime_config.create_response_enabled is True
 
 
 # ===================================================================

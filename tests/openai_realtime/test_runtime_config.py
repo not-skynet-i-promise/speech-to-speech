@@ -120,6 +120,22 @@ class TestApplySessionUpdate:
         assert cfg.session.audio.input.turn_detection.threshold == 0.8
         assert cfg.session.audio.input.turn_detection.silence_duration_ms == 800
 
+    def test_create_response_false_survives_partial_turn_detection_update(self):
+        cfg = RuntimeConfig()
+        cfg.apply_session_update(
+            _parse_session(
+                audio={"input": {"turn_detection": {"type": "server_vad", "create_response": False}}},
+            )
+        )
+        cfg.apply_session_update(
+            _parse_session(
+                audio={"input": {"turn_detection": {"type": "server_vad", "threshold": 0.8}}},
+            )
+        )
+
+        assert cfg.create_response_enabled is False
+        assert cfg.session.audio.input.turn_detection.threshold == 0.8
+
     def test_tools_replaced_wholesale(self):
         """Tools is a list, not a BaseModel — the whole list is replaced."""
         cfg = RuntimeConfig()
