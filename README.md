@@ -303,6 +303,7 @@ with client.realtime.connect(model="local") as conn:
                     "input": {
                         "turn_detection": {
                             "type": "server_vad",
+                            "create_response": True,
                             "interrupt_response": True,
                         }
                     }
