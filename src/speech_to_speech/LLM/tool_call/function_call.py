@@ -10,6 +10,7 @@ import ast
 import io
 import json
 import logging
+import math
 import re
 import tokenize
 from collections import OrderedDict
@@ -28,6 +29,11 @@ _LENIENT_CALL_RE = re.compile(
     r"\b[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\s*"
     r"\((?:[^()\"']+|\"(?:\\.|[^\"])*\"|'(?:\\.|[^'])*')*\)"
 )
+
+# Narrow JSON Schema subset understood well enough to place a positional value.
+_SCHEMA_JSON_TYPES = frozenset({"string", "number", "integer", "boolean", "array", "object", "null"})
+_SCHEMA_OBJECT_KEYS = frozenset({"type", "properties", "required"})
+_SCHEMA_PROPERTY_KEYS = frozenset({"type", "description", "enum", "default", "items", "minimum", "maximum"})
 
 
 # ── AST / tokenize helpers ───────────────────────────────────────────
@@ -98,16 +104,29 @@ def _parse_function_exprs(
     expressions: List[str],
     pattern_to_match: list[str],
     *,
-    skip_invalid: bool = False,
+    lenient_fallback: bool = False,
 ) -> List["FunctionToolCall"]:
+    """Parse *expressions* into calls, optionally with the lenient fallback rules.
+
+    The regex fallback re-scans output the tokenizer already rejected, so its
+    spans are the untrustworthy ones: unparsable spans are skipped, and any call
+    carrying a positional value is dropped entirely rather than reaching
+    conversion, where a positional value may otherwise be recovered.
+    """
     results: List[FunctionToolCall] = []
     for expr in expressions:
         try:
             call = _parse_call_expr(expr)
         except Exception:
-            if skip_invalid:
+            if lenient_fallback:
                 continue
             raise
+        if lenient_fallback and any(_POSITIONAL_RE.match(key) for key in call.parameters):
+            logger.warning(
+                "Dropping recovered call '%s' with positional arguments from malformed output",
+                call.function_name,
+            )
+            continue
         if pattern_to_match and all(pattern not in call.function_name for pattern in pattern_to_match):
             continue
         results.append(call)
@@ -125,41 +144,106 @@ def _extract_function_name(node: ast.expr) -> str:
 
 
 def _literal_from_ast(node: ast.AST) -> Any:
-    """Convert an AST node to a Python literal value."""
+    """Convert an AST node to a JSON-safe Python literal value.
+
+    Only the literal shapes ``json.dumps`` can serialise are accepted -- ``None``,
+    ``bool``, ``int``, finite ``float``, ``str``, lists/tuples of those, and dicts
+    with string keys -- so a parsed call can never make argument serialisation
+    fail later with an uncaught ``TypeError``. Bare identifiers keep their legacy
+    representation as their own name; the string they yield is deliberately not
+    treated as a quoted literal anywhere.
+    """
     if isinstance(node, ast.Constant):
-        return node.value
+        constant = node.value
+        if constant is None or isinstance(constant, (bool, int, str)):
+            return constant
+        if isinstance(constant, float) and math.isfinite(constant):
+            return constant
+        raise ValueError(f"Unsupported constant literal: {ast.dump(node)}")
 
     if isinstance(node, ast.Name):
         return node.id
 
-    if isinstance(node, ast.List):
-        return [_literal_from_ast(elt) for elt in node.elts]
-
-    if isinstance(node, ast.Tuple):
+    if isinstance(node, (ast.List, ast.Tuple)):
         return [_literal_from_ast(elt) for elt in node.elts]
 
     if isinstance(node, ast.Dict):
-        return {
-            _literal_from_ast(key): _literal_from_ast(value)
-            for key, value in zip(node.keys, node.values)
-            if key is not None
-        }
+        literal: Dict[str, Any] = {}
+        for key, value in zip(node.keys, node.values):
+            if key is None:
+                raise ValueError("Dict unpacking is not supported")
+            literal_key = _literal_from_ast(key)
+            if not isinstance(literal_key, str):
+                raise ValueError(f"Unsupported dict key: {ast.dump(key)}")
+            literal[literal_key] = _literal_from_ast(value)
+        return literal
 
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
         value = _literal_from_ast(node.operand)
-        if not isinstance(value, (int, float)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(f"Unsupported unary literal: {ast.dump(node)}")
         return -value if isinstance(node.op, ast.USub) else value
 
     raise ValueError(f"Unsupported literal: {ast.dump(node)}")
 
 
-def _parse_call_expr(expr: str) -> "FunctionToolCall":
-    """Parse a single ``name(args...)`` expression string into a FunctionToolCall."""
-    parsed = ast.parse(expr, mode="eval").body
-    if not isinstance(parsed, ast.Call):
-        raise ValueError(f"Expression is not a function call: {expr!r}")
+def _json_fingerprint(value: Any) -> tuple[Any, ...] | None:
+    """Return a recursive type-tagged JSON fingerprint, or ``None``.
 
+    Exact built-in JSON types are required at every level. Type tags distinguish
+    values Python equality or ``json.dumps`` otherwise collapses, including
+    ``1``/``1.0``/``True``, list/tuple, and integer/string mapping keys. Mapping
+    order remains part of the fingerprint because call parameters are ordered.
+    """
+    value_type = type(value)
+    if value is None:
+        return ("null",)
+    if value_type is bool:
+        return ("bool", value)
+    if value_type is int:
+        return ("int", value)
+    if value_type is float:
+        return ("float", value.hex()) if math.isfinite(value) else None
+    if value_type is str:
+        return ("str", value)
+    if value_type is list:
+        members: list[tuple[Any, ...]] = []
+        for item in value:
+            member = _json_fingerprint(item)
+            if member is None:
+                return None
+            members.append(member)
+        return ("list", tuple(members))
+    if value_type is dict:
+        entries: list[tuple[str, tuple[Any, ...]]] = []
+        for key, item in value.items():
+            if type(key) is not str:
+                return None
+            member = _json_fingerprint(item)
+            if member is None:
+                return None
+            entries.append((key, member))
+        return ("dict", tuple(entries))
+    return None
+
+
+def _is_json_safe(value: Any) -> bool:
+    """Return whether *value* can be serialised as an argument value."""
+    return _json_fingerprint(value) is not None
+
+
+def _log_dropped_positionals(function_name: str, positional: list[tuple[str, Any]]) -> None:
+    """Log positional parameter keys without logging their values."""
+    if positional:
+        logger.warning(
+            "Dropping positional arguments for '%s': %s",
+            function_name,
+            {key for key, _value in positional},
+        )
+
+
+def _call_from_ast(parsed: ast.Call, expr: str) -> "FunctionToolCall":
+    """Build a FunctionToolCall from an already-parsed ``name(args...)`` node."""
     parameters: "OrderedDict[str, Any]" = OrderedDict()
 
     for idx, arg in enumerate(parsed.args):
@@ -168,6 +252,10 @@ def _parse_call_expr(expr: str) -> "FunctionToolCall":
     for kw in parsed.keywords:
         if kw.arg is None:
             raise ValueError("**kwargs are not supported")
+        if _POSITIONAL_RE.match(kw.arg):
+            raise ValueError(f"Keyword name is reserved for parser positionals: {kw.arg}")
+        if kw.arg in parameters:
+            raise ValueError(f"Duplicate keyword argument: {kw.arg}")
         parameters[kw.arg] = _literal_from_ast(kw.value)
 
     return FunctionToolCall(
@@ -175,6 +263,90 @@ def _parse_call_expr(expr: str) -> "FunctionToolCall":
         parameters=parameters,
         original_string=expr,
     )
+
+
+def _parse_call_expr(expr: str) -> "FunctionToolCall":
+    """Parse a single ``name(args...)`` expression string into a FunctionToolCall."""
+    parsed = ast.parse(expr, mode="eval").body
+    if not isinstance(parsed, ast.Call):
+        raise ValueError(f"Expression is not a function call: {expr!r}")
+    return _call_from_ast(parsed, expr)
+
+
+def _positional_recovery_field(
+    schema: dict,
+    properties: dict,
+    required_names: list,
+) -> str | None:
+    """Return the field a single quoted positional may fill, or ``None``.
+
+    Only the exact shape the recovery targets is accepted: an object schema whose
+    sole required field is its first declared property and is typed ``string``,
+    with every property definition written in a small, unambiguous subset. This
+    is not a JSON Schema validator -- a richer but perfectly valid schema simply
+    declines recovery and the call then fails its missing-required check.
+    """
+    if (
+        not set(schema) <= _SCHEMA_OBJECT_KEYS
+        or schema.get("type") != "object"
+        or len(required_names) != 1
+        or not properties
+    ):
+        return None
+    field = required_names[0]
+    if next(iter(properties)) != field:
+        return None
+    if any(not isinstance(name, str) for name in properties):
+        return None
+    if not all(_supported_property_definition(definition) for definition in properties.values()):
+        return None
+    return field if properties[field].get("type") == "string" else None
+
+
+def _supported_property_definition(definition: Any) -> bool:
+    """Return whether a property definition is written in the supported subset."""
+    if not isinstance(definition, dict) or not set(definition) <= _SCHEMA_PROPERTY_KEYS:
+        return False
+
+    json_type = definition.get("type")
+    if not isinstance(json_type, str) or json_type not in _SCHEMA_JSON_TYPES:
+        return False
+
+    if "description" in definition and not isinstance(definition["description"], str):
+        return False
+
+    if "default" in definition and not _is_json_safe(definition["default"]):
+        return False
+
+    if "enum" in definition:
+        enum = definition["enum"]
+        if not isinstance(enum, list) or not enum:
+            return False
+        members = [_json_fingerprint(value) for value in enum]
+        if any(member is None for member in members) or len(set(members)) != len(members):
+            return False
+
+    if "items" in definition:
+        if json_type != "array" or not _supported_property_definition(definition["items"]):
+            return False
+
+    bounds: list[int | float] = []
+    for keyword in ("minimum", "maximum"):
+        if keyword not in definition:
+            continue
+        bound = definition[keyword]
+        if type(bound) not in (int, float):
+            return False
+        if type(bound) is float and not math.isfinite(bound):
+            return False
+        bounds.append(bound)
+    if bounds and json_type not in {"integer", "number"}:
+        return False
+    if "minimum" in definition and "maximum" in definition:
+        if definition["minimum"] > definition["maximum"]:
+            return False
+
+    return True
 
 
 # ── Data model ───────────────────────────────────────────────────────
@@ -188,17 +360,43 @@ class FunctionToolCall(BaseModel):
     original_string: str
     description: str = ""
 
+    def _direct_quoted_positional(self) -> str | None:
+        """Return the sole quoted-string positional of ``original_string``, if any.
+
+        Re-parsing here *is* the parser observation, so nothing has to be carried
+        on the object: the value is returned only when ``original_string`` still
+        parses to exactly the call this object describes -- same function name and
+        same ordered parameters, compared type-sensitively -- and its single
+        positional argument is a string literal rather than a bare identifier.
+        Fields changed together into another valid call are just a different
+        parsed call; ``description`` is documentation, not syntax, and is free.
+        """
+        try:
+            node = ast.parse(self.original_string, mode="eval").body
+        except (SyntaxError, TypeError, ValueError):
+            return None
+        if not isinstance(node, ast.Call) or len(node.args) != 1:
+            return None
+        argument = node.args[0]
+        if not isinstance(argument, ast.Constant) or not isinstance(argument.value, str):
+            return None
+
+        try:
+            reparsed = _call_from_ast(node, self.original_string)
+        except ValueError:
+            return None
+        if reparsed.function_name != self.function_name:
+            return None
+        fingerprint = _json_fingerprint(self.parameters)
+        if fingerprint is None or fingerprint != _json_fingerprint(reparsed.parameters):
+            return None
+        return argument.value
+
     def to_realtime_function_tool_call(
         self,
         function_tools: list[FunctionTool] | None = None,
     ) -> ResponseFunctionToolCall:
-        positional = {k for k in self.parameters if _POSITIONAL_RE.match(k)}
-        if positional:
-            logger.warning(
-                "Dropping positional arguments for '%s': %s",
-                self.function_name,
-                positional,
-            )
+        positional = [(k, v) for k, v in self.parameters.items() if _POSITIONAL_RE.match(k)]
         arguments = {k: v for k, v in self.parameters.items() if not _POSITIONAL_RE.match(k)}
 
         if function_tools is not None:
@@ -210,9 +408,22 @@ class FunctionToolCall(BaseModel):
                 available = [t.name for t in function_tools]
                 raise ValueError(f"Function '{self.function_name}' not found in available tools: {available}")
 
+            # A missing or unusable schema keeps its long-standing meaning: nothing
+            # is declared, so every argument is dropped. Only shapes this code has
+            # to read to make a decision are rejected outright.
             schema = tool.parameters if isinstance(tool.parameters, dict) else {}
             properties = schema.get("properties", {})
-            required = set(schema.get("required", []))
+            if not isinstance(properties, dict) or any(
+                not isinstance(name, str) or _POSITIONAL_RE.match(name) for name in properties
+            ):
+                raise ValueError(f"Malformed properties schema for '{self.function_name}'")
+            required_names = schema.get("required", [])
+            if (
+                not isinstance(required_names, list)
+                or any(not isinstance(name, str) or _POSITIONAL_RE.match(name) for name in required_names)
+                or len(set(required_names)) != len(required_names)
+            ):
+                raise ValueError(f"Malformed required schema for '{self.function_name}'")
 
             undeclared = {k for k in arguments if k not in properties}
             if undeclared:
@@ -223,13 +434,34 @@ class FunctionToolCall(BaseModel):
                 )
                 arguments = {k: v for k, v in arguments.items() if k in properties}
 
-            missing = required - set(arguments.keys())
+            missing = set(required_names) - set(arguments.keys())
+            if len(positional) == 1 and not undeclared:
+                field = _positional_recovery_field(schema, properties, required_names)
+                if field is not None and missing == {field}:
+                    value = self._direct_quoted_positional()
+                    if value is not None:
+                        arguments[field] = value
+                        positional = []
+                        missing = set()
+                        logger.warning(
+                            "Mapped one positional string for '%s' to required field '%s'",
+                            self.function_name,
+                            field,
+                        )
             if missing:
+                _log_dropped_positionals(self.function_name, positional)
                 raise ValueError(f"Missing required parameters for '{self.function_name}': {missing}")
+
+        _log_dropped_positionals(self.function_name, positional)
+
+        try:
+            serialized_arguments = json.dumps(arguments, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Arguments for '{self.function_name}' are not JSON-safe") from exc
 
         return ResponseFunctionToolCall(
             name=self.function_name,
-            arguments=json.dumps(arguments),
+            arguments=serialized_arguments,
             call_id=_generate_id("call"),
             type="function_call",
             id=_generate_id("fc"),
@@ -261,7 +493,7 @@ def parse_function_call(function_string: str, pattern_to_match: list[str] = []) 
         return _parse_function_exprs(
             _split_simple_calls_with_regex(function_string),
             pattern_to_match,
-            skip_invalid=True,
+            lenient_fallback=True,
         )
 
     return _parse_function_exprs(expressions, pattern_to_match)
