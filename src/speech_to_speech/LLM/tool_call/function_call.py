@@ -20,6 +20,7 @@ from openai.types.responses import ResponseFunctionToolCall
 from pydantic import BaseModel
 
 from speech_to_speech.LLM.tool_call.function_tool import FunctionTool
+from speech_to_speech.LLM.tool_call.signature_from_schema import signature_from_schema
 from speech_to_speech.utils.utils import _generate_id
 
 logger = logging.getLogger(__name__)
@@ -32,7 +33,7 @@ _LENIENT_CALL_RE = re.compile(
 
 # Narrow JSON Schema subset understood well enough to place a positional value.
 _SCHEMA_JSON_TYPES = frozenset({"string", "number", "integer", "boolean", "array", "object", "null"})
-_SCHEMA_OBJECT_KEYS = frozenset({"type", "properties", "required"})
+_SCHEMA_OBJECT_KEYS = frozenset({"type", "properties", "required", "additionalProperties"})
 _SCHEMA_PROPERTY_KEYS = frozenset({"type", "description", "enum", "default", "items", "minimum", "maximum"})
 
 
@@ -273,24 +274,29 @@ def _parse_call_expr(expr: str) -> "FunctionToolCall":
     return _call_from_ast(parsed, expr)
 
 
-def _positional_recovery_field(
+def _positional_recovery_fields(
     schema: dict,
     properties: dict,
     required_names: list,
-) -> str | None:
-    """Return the field a single quoted positional may fill, or ``None``.
+    positional_count: int,
+) -> tuple[str, ...] | None:
+    """Return the leading fields direct scalar positionals may fill, or ``None``.
 
-    Only the exact shape the recovery targets is accepted: an object schema whose
-    sole required field is its first declared property and is typed ``string``,
-    with every property definition written in a small, unambiguous subset. This
-    is not a JSON Schema validator -- a richer but perfectly valid schema simply
-    declines recovery and the call then fails its missing-required check.
+    Recovery remains deliberately narrow: the object schema has one required
+    first string field and positionals map only to the leading declared
+    properties. ``additionalProperties`` does not affect declared-field
+    binding, but must be a boolean when present. A recovered field may be a
+    string or integer, which covers the observed one-fact and official search
+    calls without turning this parser into a JSON Schema implementation. A
+    richer but valid schema simply declines recovery.
     """
     if (
         not set(schema) <= _SCHEMA_OBJECT_KEYS
         or schema.get("type") != "object"
+        or ("additionalProperties" in schema and type(schema["additionalProperties"]) is not bool)
         or len(required_names) != 1
         or not properties
+        or not 1 <= positional_count <= len(properties)
     ):
         return None
     field = required_names[0]
@@ -300,7 +306,12 @@ def _positional_recovery_field(
         return None
     if not all(_supported_property_definition(definition) for definition in properties.values()):
         return None
-    return field if properties[field].get("type") == "string" else None
+    fields = tuple(properties)[:positional_count]
+    if properties[field].get("type") != "string":
+        return None
+    if any(properties[name].get("type") not in {"string", "integer"} for name in fields):
+        return None
+    return fields
 
 
 def _supported_property_definition(definition: Any) -> bool:
@@ -360,26 +371,35 @@ class FunctionToolCall(BaseModel):
     original_string: str
     description: str = ""
 
-    def _direct_quoted_positional(self) -> str | None:
-        """Return the sole quoted-string positional of ``original_string``, if any.
+    def _direct_scalar_positionals(self) -> tuple[str | int, ...] | None:
+        """Return exact direct string/integer positionals from ``original_string``.
 
         Re-parsing here *is* the parser observation, so nothing has to be carried
         on the object: the value is returned only when ``original_string`` still
         parses to exactly the call this object describes -- same function name and
-        same ordered parameters, compared type-sensitively -- and its single
-        positional argument is a string literal rather than a bare identifier.
-        Fields changed together into another valid call are just a different
-        parsed call; ``description`` is documentation, not syntax, and is free.
+        same ordered parameters, compared type-sensitively -- and every positional
+        is a direct quoted string or integer literal. Bare identifiers, booleans,
+        floats, containers, and computed expressions are never recovered. Fields
+        changed together into another valid call are just a different parsed call;
+        ``description`` is documentation, not syntax, and is free.
         """
         try:
             node = ast.parse(self.original_string, mode="eval").body
         except (SyntaxError, TypeError, ValueError):
             return None
-        if not isinstance(node, ast.Call) or len(node.args) != 1:
+        if not isinstance(node, ast.Call) or not node.args:
             return None
-        argument = node.args[0]
-        if not isinstance(argument, ast.Constant) or not isinstance(argument.value, str):
-            return None
+        values: list[str | int] = []
+        for argument in node.args:
+            if not isinstance(argument, ast.Constant):
+                return None
+            value = argument.value
+            if isinstance(value, str):
+                values.append(value)
+            elif isinstance(value, int) and not isinstance(value, bool):
+                values.append(value)
+            else:
+                return None
 
         try:
             reparsed = _call_from_ast(node, self.original_string)
@@ -390,7 +410,27 @@ class FunctionToolCall(BaseModel):
         fingerprint = _json_fingerprint(self.parameters)
         if fingerprint is None or fingerprint != _json_fingerprint(reparsed.parameters):
             return None
-        return argument.value
+        return tuple(values)
+
+    @staticmethod
+    def _positionals_match_declared_types(
+        fields: tuple[str, ...],
+        values: tuple[str | int, ...],
+        properties: dict,
+    ) -> bool:
+        """Return whether direct scalar values have the exact declared types."""
+        for field, value in zip(fields, values, strict=True):
+            definition = properties[field]
+            json_type = definition["type"]
+            if json_type == "string":
+                if type(value) is not str:
+                    return False
+            elif json_type == "integer":
+                if type(value) is not int:
+                    return False
+            else:
+                return False
+        return True
 
     def to_realtime_function_tool_call(
         self,
@@ -435,19 +475,34 @@ class FunctionToolCall(BaseModel):
                 arguments = {k: v for k, v in arguments.items() if k in properties}
 
             missing = set(required_names) - set(arguments.keys())
-            if len(positional) == 1 and not undeclared:
-                field = _positional_recovery_field(schema, properties, required_names)
-                if field is not None and missing == {field}:
-                    value = self._direct_quoted_positional()
-                    if value is not None:
-                        arguments[field] = value
-                        positional = []
-                        missing = set()
-                        logger.warning(
-                            "Mapped one positional string for '%s' to required field '%s'",
-                            self.function_name,
-                            field,
-                        )
+            if positional and not undeclared:
+                fields = _positional_recovery_fields(
+                    schema,
+                    properties,
+                    required_names,
+                    len(positional),
+                )
+                if fields is not None and missing == {fields[0]}:
+                    values = self._direct_scalar_positionals()
+                    if (
+                        values is not None
+                        and len(values) == len(fields)
+                        and self._positionals_match_declared_types(fields, values, properties)
+                    ):
+                        try:
+                            signature_from_schema(schema).bind_partial(*values, **arguments)
+                        except (TypeError, ValueError):
+                            pass
+                        else:
+                            arguments.update(zip(fields, values, strict=True))
+                            positional = []
+                            missing = set(required_names) - set(arguments)
+                            logger.warning(
+                                "Mapped %d positional arguments for '%s' to declared fields %s",
+                                len(fields),
+                                self.function_name,
+                                fields,
+                            )
             if missing:
                 _log_dropped_positionals(self.function_name, positional)
                 raise ValueError(f"Missing required parameters for '{self.function_name}': {missing}")
