@@ -104,7 +104,40 @@ function_name(arg_name_1=value1, arg_name_2='string_value')
 </code>
 ```
 
-After generation, `_extract_tools` uses a regex to find `<code>` blocks, then `extract_function_calls_from_text` parses each `name(kwargs)` call and validates it against registered tools. Valid calls become `ResponseFunctionToolCall` dicts with generated `call_id`s.
+During streaming post-processing, `LanguageModelHandler` passes each complete
+tool-code block to `extract_function_calls_from_text`, which parses each
+`name(kwargs)` call and validates it against registered tools. Valid calls
+become `ResponseFunctionToolCall` dicts with generated `call_id`s.
+
+Only JSON-safe literals are accepted as argument values (`None`, booleans,
+integers, finite floats, strings, and lists/dicts of those with string keys), so
+a parsed call can always be serialised for the wire.
+
+Local models occasionally emit one quoted positional value despite the named-
+argument instruction, most often the sole `query` of a search tool. The
+validator recovers that value only when all of the following hold: the call has
+exactly one positional value and no undeclared named argument; re-parsing the
+original call expression at conversion time yields exactly the same function
+name and ordered parameters and shows that single positional as a quoted string
+literal rather than a bare identifier; and the tool schema matches a deliberately
+narrow subset -- an object schema whose single required field is its first
+declared property and is typed `string`, with every property definition written
+using only `type`, `description`, `enum`, `default`, (for arrays) `items`, and
+(for numeric fields) finite, ordered `minimum`/`maximum` bounds. The object
+schema itself may contain only `type`, `properties`, and `required`.
+Anything richer -- a valid but less predictable schema, a malformed `enum`, a
+second required field, a non-string or bare-identifier positional, more than one
+positional -- simply declines recovery, and the call then fails closed on its
+missing required field. This is not a JSON Schema validator: as with named
+arguments, the executing client remains responsible for constraints such as enum
+membership and patterns. Duplicate keyword names, and schema fields colliding
+with the parser's reserved `__arg_N__` namespace, are rejected as ambiguous
+instead of silently taking last-one-wins.
+
+The lenient regex fallback used after a tokenizer error cannot reach recovery at
+all: it re-scans output the tokenizer already rejected, so any call it recovers
+that carries a positional value is dropped before conversion, while already-named
+calls are kept.
 
 ### OpenAI API path (`ResponsesApiModelHandler`)
 
