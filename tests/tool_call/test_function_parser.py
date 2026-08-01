@@ -287,6 +287,53 @@ class TestToRealtimeToolCall:
             "query": "current temperature in Chicago",
         }
 
+    def test_maps_observed_live_search_query_and_result_count_positionally(self):
+        tool_name = "pollen_robotics_reachy_mini_search_tool__search_web"
+        fc = parse_function_call(f"{tool_name}('current Chicago Cubs score', 3)")[0]
+        tool = _make_tool(
+            tool_name,
+            {
+                "query": {"type": "string", "description": "Search query."},
+                "max_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 3,
+                    "default": 3,
+                },
+            },
+            required=["query"],
+        )
+
+        result = fc.to_realtime_function_tool_call([tool])
+
+        assert json.loads(result.arguments) == {
+            "query": "current Chicago Cubs score",
+            "max_results": 3,
+        }
+
+    @pytest.mark.parametrize("additional_properties", [False, True])
+    def test_maps_observed_person_fact_with_boolean_additional_properties(self, additional_properties):
+        fc = parse_function_call("remember_person_fact('The POC test color is teal.')")[0]
+        tool = FunctionTool(
+            type="function",
+            name="remember_person_fact",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "fact": {
+                        "type": "string",
+                        "description": "One short third-person fact.",
+                    }
+                },
+                "required": ["fact"],
+                "additionalProperties": additional_properties,
+            },
+        )
+
+        result = fc.to_realtime_function_tool_call([tool])
+
+        assert json.loads(result.arguments) == {"fact": "The POC test color is teal."}
+
     def test_maps_one_positional_string_to_sole_missing_required_string(self):
         fc = parse_function_call("search('current temperature', max_results=3)")[0]
         tool = _make_tool(
@@ -455,7 +502,7 @@ class TestToRealtimeToolCall:
     @pytest.mark.parametrize(
         "extra",
         [
-            {"additionalProperties": False},
+            {"additionalProperties": 0},
             {"allOf": [{"required": ["locale"]}]},
             {"oneOf": "not-an-array"},
             {"$ref": "#/$defs/search"},
@@ -527,6 +574,75 @@ class TestToRealtimeToolCall:
         result = fc.to_realtime_function_tool_call([tool])
 
         assert json.loads(result.arguments) == {"query": "weather"}
+
+    @pytest.mark.parametrize("count", [0, 4])
+    def test_parser_binds_integer_without_enforcing_schema_bounds(self, count):
+        fc = parse_function_call(f"search('weather', {count})")[0]
+        tool = _make_tool(
+            "search",
+            {
+                "query": {"type": "string"},
+                "max_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 3,
+                    "default": 3,
+                },
+            },
+            required=["query"],
+        )
+
+        result = fc.to_realtime_function_tool_call([tool])
+
+        assert json.loads(result.arguments) == {"query": "weather", "max_results": count}
+
+    @pytest.mark.parametrize("call", ["search('weather', True)", "search('weather', '3')", "search('weather', 3.0)"])
+    def test_declines_wrong_positional_type_for_integer_field(self, call):
+        fc = parse_function_call(call)[0]
+        tool = _make_tool(
+            "search",
+            {
+                "query": {"type": "string"},
+                "max_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 3,
+                    "default": 3,
+                },
+            },
+            required=["query"],
+        )
+
+        with pytest.raises(ValueError, match="Missing required"):
+            fc.to_realtime_function_tool_call([tool])
+
+    def test_declines_multi_positional_recovery_when_named_argument_collides(self):
+        fc = parse_function_call("search('weather', 3, max_results=2)")[0]
+        tool = _make_tool(
+            "search",
+            {
+                "query": {"type": "string"},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 3},
+            },
+            required=["query"],
+        )
+
+        with pytest.raises(ValueError, match="Missing required"):
+            fc.to_realtime_function_tool_call([tool])
+
+    def test_declines_multi_positional_recovery_for_non_scalar_optional_field(self):
+        fc = parse_function_call("search('weather', ['news'])")[0]
+        tool = _make_tool(
+            "search",
+            {
+                "query": {"type": "string"},
+                "sources": {"type": "array", "items": {"type": "string"}},
+            },
+            required=["query"],
+        )
+
+        with pytest.raises(ValueError, match="Missing required"):
+            fc.to_realtime_function_tool_call([tool])
 
     def test_valid_arbitrary_precision_integer_bound_does_not_escape_recovery(self):
         fc = parse_function_call("search('weather')")[0]

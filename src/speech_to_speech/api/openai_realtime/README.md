@@ -113,26 +113,31 @@ Only JSON-safe literals are accepted as argument values (`None`, booleans,
 integers, finite floats, strings, and lists/dicts of those with string keys), so
 a parsed call can always be serialised for the wire.
 
-Local models occasionally emit one quoted positional value despite the named-
-argument instruction, most often the sole `query` of a search tool. The
-validator recovers that value only when all of the following hold: the call has
-exactly one positional value and no undeclared named argument; re-parsing the
-original call expression at conversion time yields exactly the same function
-name and ordered parameters and shows that single positional as a quoted string
-literal rather than a bare identifier; and the tool schema matches a deliberately
-narrow subset -- an object schema whose single required field is its first
-declared property and is typed `string`, with every property definition written
-using only `type`, `description`, `enum`, `default`, (for arrays) `items`, and
-(for numeric fields) finite, ordered `minimum`/`maximum` bounds. The object
-schema itself may contain only `type`, `properties`, and `required`.
+Local models occasionally emit positional values despite the named-argument
+instruction, for example a search tool's `query` and optional result count. The
+validator recovers one or more leading values only when all of the following
+hold: there is no undeclared named argument; re-parsing the original call
+expression at conversion time yields exactly the same function name and ordered
+parameters; every positional is a direct string or non-boolean integer literal;
+and binding those values to the exact signature shown to the model introduces
+no duplicate or colliding argument. The tool schema must also match a
+deliberately narrow subset -- an object schema whose single required field is
+its first declared property and is typed `string`, whose recovered leading
+fields are typed `string` or `integer`, and whose property definitions use only
+`type`, `description`, `enum`, `default`, (for arrays) `items`, and (for numeric
+fields) finite, ordered `minimum`/`maximum` bounds. The object schema may contain
+only `type`, `properties`, `required`, and an optional boolean
+`additionalProperties`.
+
 Anything richer -- a valid but less predictable schema, a malformed `enum`, a
-second required field, a non-string or bare-identifier positional, more than one
-positional -- simply declines recovery, and the call then fails closed on its
-missing required field. This is not a JSON Schema validator: as with named
-arguments, the executing client remains responsible for constraints such as enum
-membership and patterns. Duplicate keyword names, and schema fields colliding
-with the parser's reserved `__arg_N__` namespace, are rejected as ambiguous
-instead of silently taking last-one-wins.
+second required field, a bare identifier, boolean, float, container, computed
+positional, too many positionals, or a named-argument collision -- simply
+declines recovery, and the call then fails closed on its missing required field.
+This is not a JSON Schema validator: as with named arguments, the executing
+client remains responsible for constraints such as enum membership, numeric
+bounds, and patterns. Duplicate keyword names, and schema fields colliding with
+the parser's reserved `__arg_N__` namespace, are rejected as ambiguous instead
+of silently taking last-one-wins.
 
 The lenient regex fallback used after a tokenizer error cannot reach recovery at
 all: it re-scans output the tokenizer already rejected, so any call it recovers
