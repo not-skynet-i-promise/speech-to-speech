@@ -81,7 +81,7 @@ should begin.
 | `conversation.item.input_audio_transcription.completed` | Final transcript for the user turn (with duration usage). |
 | `response.created` | Emitted before the first assistant output part or outbound audio chunk, whichever arrives first (response is `in_progress`). |
 | `response.output_audio.delta` | Base64 PCM audio chunk from TTS. |
-| `response.output_audio.done` | Audio stream complete for the current output item. |
+| `response.output_audio.done` | Audio stream complete for the current output item; emitted only after at least one `response.output_audio.delta`. |
 | `response.output_audio_transcript.done` | Full assistant text transcript for the turn. |
 | `response.function_call_arguments.done` | Tool call with `call_id`, `name`, and JSON `arguments`. |
 | `response.done` | Response finished (`completed`, `cancelled` with reason `turn_detected` or `client_cancelled`). |
@@ -158,6 +158,11 @@ translates these into:
 - `response.output_audio_transcript.done` for the text
 - `response.function_call_arguments.done` for each tool call
 
+For audio responses, output index 0 is reserved for the continuous audio item
+and tool calls use later indices. A tool-only response therefore starts its tool
+indices at 1 without materialising index 0; clients must not assume output
+indices are dense.
+
 ### Tool result flow
 
 1. Client executes the tool and sends `conversation.item.create` with `type: "function_call_output"` and `output: "<result>"`
@@ -207,7 +212,7 @@ sequenceDiagram
 **Step by step:**
 
 1. **VAD detects speech**: puts a `SpeechStartedEvent` on `text_output_queue`.
-2. **`_send_loop` processes text events first** (priority over audio): translates `speech_started` into protocol events. If an active response was in progress, `RealtimeService.dispatch_pipeline_event` emits `response.output_audio.done` + `response.done` with `status="cancelled"` and `reason="turn_detected"`.
+2. **`_send_loop` processes text events first** (priority over audio): translates `speech_started` into protocol events. If an active response was in progress, `RealtimeService.dispatch_pipeline_event` emits `response.done` with `status="cancelled"` and `reason="turn_detected"`; it first emits `response.output_audio.done` only when at least one audio delta was sent.
 3. **Cancel + queue flush**: if a response is active (`in_response`) *or* pending (`response_pending` -- accepted `response.create`, no audio yet), and interrupts are enabled (see step 4), the send loop calls `cancel_scope.cancel()` (increments generation, enables discard), clears `response_pending`, drains `output_queue` (preserving `__RESPONSE_DONE__` sentinels) and `text_output_queue` (preserving user-side events: `speech_stopped`, partial/completed transcriptions, token usage), then clears `response_playing`.
 4. **Interrupt gating**: the cancel only fires if the `SpeechStartedEvent.interrupt_response` flag is set *and* the session config allows it (`turn_detection.interrupt_response`, read via `RuntimeConfig.interrupt_response_enabled`, default true). When disabled, user speech during a response is transcribed but the response keeps playing.
 5. **LLM/TTS cancellation**: handlers capture `gen = cancel_scope.generation` at the start of each response and check `cancel_scope.is_stale(gen)` on every streaming token, aborting early when stale.
