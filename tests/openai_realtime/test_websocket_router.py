@@ -530,6 +530,7 @@ class TestSendLoop:
                 text_output_queue.put(TokenUsageEvent(input_tokens=10, output_tokens=5))
                 output_queue.put(AUDIO_RESPONSE_DONE)
 
+                assert ws.receive_json()["type"] == "response.created"
                 assert ws.receive_json()["type"] == "response.function_call_arguments.done"
                 msg1 = ws.receive_json()
                 msg2 = ws.receive_json()

@@ -296,7 +296,7 @@ class ResponseHandler(RealtimeBaseHandler):
         *,
         wait_for_pending_reopen: bool = True,
     ) -> list[ServerEvent] | None:
-        """Handle assistant_text: emit transcript and/or tool-call events."""
+        """Handle assistant_text: create the implicit response, then emit its ordered parts."""
         if self._service.speculative_turns:
             commit_result: bool | None
             if wait_for_pending_reopen:
@@ -316,7 +316,16 @@ class ResponseHandler(RealtimeBaseHandler):
                 return []
         st = self._state(conn_id)
         events: list[ServerEvent] = []
+        need_created = st.current_response_id is None
         resp_id, _ = self._ensure_response(conn_id)
+        if need_created:
+            events.append(
+                ResponseCreatedEvent(
+                    type="response.created",
+                    event_id=self._next_event_id(),
+                    response=self._build_response(conn_id, "in_progress"),
+                )
+            )
         for part in event.parts:
             if isinstance(part, AssistantTextPart):
                 if not part.text:
