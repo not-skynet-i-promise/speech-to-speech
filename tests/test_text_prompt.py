@@ -37,7 +37,9 @@ def test_text_tool_prompt_drops_speak_first_but_keeps_structural_rules():
 
     assert "no preamble sentence is required" in prompt
     assert "each named-argument function call inside its own" in prompt
-    assert "preserve the intended text/tool order" in prompt
+    assert "Use at most two tool calls" in prompt
+    assert "never repeat an identical call" in prompt
+    assert "Preserve the intended text/tool order" in prompt
     assert "Only one tool call may appear in a response." not in prompt
     assert "Omit optional args instead of placeholder values" in prompt
     assert "do not claim tool results before a tool result is available" in prompt

@@ -73,6 +73,7 @@ class ResponseHandler(RealtimeBaseHandler):
         st.next_output_index = 0
         st.current_output_index = None
         st.current_output_kind = None
+        st.current_output_item_id = None
         st.last_text_item_id = None
         st.last_text_output_index = None
         st.pending_text_outputs = []
@@ -108,15 +109,20 @@ class ResponseHandler(RealtimeBaseHandler):
             kind == "text"
             and st.current_output_kind == "text"
             and st.current_output_index is not None
-            and st.current_item_id is not None
+            and st.current_output_item_id is not None
         ):
-            return st.current_output_index, st.current_item_id
+            return st.current_output_index, st.current_output_item_id
 
-        item_id = self._current_item_id(conn_id) if st.next_output_index == 0 else self._start_item(conn_id)
+        # Keep the response's audio item stable. Audio chunks are produced on a
+        # separate queue and use ``current_item_id``; rebinding it for a tool
+        # output would incorrectly attribute the already-streaming audio to the
+        # function-call item and reset its content index.
+        item_id = self._current_item_id(conn_id) if st.next_output_index == 0 else _generate_id("item")
         output_index = st.next_output_index
         st.next_output_index += 1
         st.current_output_index = output_index
         st.current_output_kind = "text" if kind == "text" else "tool_call"
+        st.current_output_item_id = item_id
         return output_index, item_id
 
     def _build_response(
@@ -240,9 +246,9 @@ class ResponseHandler(RealtimeBaseHandler):
         """Close the current response (audio/text done + response done).
 
         Audio responses emit ``response.output_audio.done`` for any terminal
-        status. Text-only responses emit a single ``response.output_text.done``
-        carrying the full streamed text, but only on ``status="completed"`` —
-        a cancelled or failed text response sends no audio, so it just closes
+        status. Text-only responses emit one ``response.output_text.done`` per
+        contiguous text output item, but only on ``status="completed"`` — a
+        cancelled or failed text response sends no audio, so it just closes
         with ``response.done``.
         """
         st = self._state(conn_id)
@@ -317,7 +323,8 @@ class ResponseHandler(RealtimeBaseHandler):
         st = self._state(conn_id)
         events: list[ServerEvent] = []
         need_created = st.current_response_id is None
-        resp_id, _ = self._ensure_response(conn_id)
+        resp_id, initial_item_id = self._ensure_response(conn_id)
+        last_item_id = initial_item_id
         if need_created:
             events.append(
                 ResponseCreatedEvent(
@@ -378,5 +385,6 @@ class ResponseHandler(RealtimeBaseHandler):
                         response_id=resp_id,
                     )
                 )
-            st.last_item_id = item_id
+            last_item_id = item_id
+        st.last_item_id = last_item_id
         return events

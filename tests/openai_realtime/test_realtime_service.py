@@ -494,6 +494,14 @@ class TestHandleResponseCreate:
         assert st.current_response_id is not None
         assert st.current_item_id is not None
 
+    def test_explicit_response_create_prevents_duplicate_created_from_assistant_output(self, service, conn_id):
+        created = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+
+        assistant_events = service.dispatch_pipeline_event(conn_id, AssistantTextEvent(text="Hello"))
+
+        assert isinstance(created, ResponseCreatedEvent)
+        assert not any(isinstance(event, ResponseCreatedEvent) for event in assistant_events)
+
     def test_response_create_while_active(self, service, conn_id):
         service._state(conn_id).in_response = True
         evt = ResponseCreateEvent(type="response.create")
@@ -742,6 +750,49 @@ class TestEncodeAudioChunk:
         assert isinstance(audio_events[0], ResponseAudioDeltaEvent)
         assert audio_events[0].response_id == assistant_events[0].response.id
 
+    def test_tool_outputs_do_not_rebind_streaming_audio_item(self, service, conn_id):
+        assistant_events = service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(
+                parts=[
+                    AssistantTextPart(text="I will handle that."),
+                    AssistantToolCallPart(
+                        tool={"type": "function_call", "call_id": "c1", "name": "first", "arguments": "{}"}
+                    ),
+                    AssistantToolCallPart(
+                        tool={"type": "function_call", "call_id": "c2", "name": "second", "arguments": "{}"}
+                    ),
+                ]
+            ),
+        )
+        transcript = assistant_events[1]
+        first_tool = assistant_events[2]
+        second_tool = assistant_events[3]
+
+        first_audio = service.encode_audio_chunk(conn_id, _pcm_bytes(256))[0]
+        second_audio = service.encode_audio_chunk(conn_id, _pcm_bytes(256))[0]
+        done = service.finish_response(conn_id)[0]
+
+        assert isinstance(transcript, ResponseAudioTranscriptDoneEvent)
+        assert isinstance(first_audio, ResponseAudioDeltaEvent)
+        assert isinstance(second_audio, ResponseAudioDeltaEvent)
+        assert isinstance(done, ResponseAudioDoneEvent)
+        assert first_tool.item_id != transcript.item_id
+        assert second_tool.item_id != transcript.item_id
+        assert first_audio.item_id == second_audio.item_id == done.item_id == transcript.item_id
+        assert (
+            first_audio.output_index == second_audio.output_index == done.output_index == transcript.output_index == 0
+        )
+        assert [first_audio.content_index, second_audio.content_index] == [0, 1]
+
+    def test_audio_created_first_prevents_duplicate_created_from_assistant_output(self, service, conn_id):
+        audio_events = service.encode_audio_chunk(conn_id, _pcm_bytes(256))
+
+        assistant_events = service.dispatch_pipeline_event(conn_id, AssistantTextEvent(text="Hello"))
+
+        assert sum(isinstance(event, ResponseCreatedEvent) for event in audio_events) == 1
+        assert not any(isinstance(event, ResponseCreatedEvent) for event in assistant_events)
+
     def test_response_created_includes_metadata(self, service, conn_id):
         from openai.types.realtime.realtime_response_create_params import RealtimeResponseCreateParams
 
@@ -986,6 +1037,16 @@ class TestDispatchPipelineEvent:
         assert events[1].output_index == 0
         assert events[1].response_id == events[0].response.id
 
+    def test_partless_assistant_event_updates_last_item_without_unbound_state(self, service, conn_id):
+        service._state(conn_id).last_item_id = "item_old"
+
+        events = service.dispatch_pipeline_event(conn_id, AssistantTextEvent())
+
+        assert len(events) == 1
+        assert isinstance(events[0], ResponseCreatedEvent)
+        assert service._state(conn_id).last_item_id == service._state(conn_id).current_item_id
+        assert service._state(conn_id).last_item_id != "item_old"
+
     def test_assistant_parts_preserve_tool_text_tool_text_order(self, service, conn_id):
         events = service.dispatch_pipeline_event(
             conn_id,
@@ -1024,6 +1085,26 @@ class TestDispatchPipelineEvent:
         assert isinstance(first[0], ResponseCreatedEvent)
         assert [first[1].output_index, second[0].output_index, third[0].output_index] == [0, 1, 2]
         assert len({first[1].item_id, second[0].item_id, third[0].item_id}) == 3
+
+    def test_output_indices_restart_after_response_finishes(self, service, conn_id):
+        first = service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(
+                tools=[
+                    {"type": "function_call", "call_id": "c1", "name": "first", "arguments": "{}"},
+                    {"type": "function_call", "call_id": "c2", "name": "second", "arguments": "{}"},
+                ]
+            ),
+        )
+        service.finish_response(conn_id)
+
+        second = service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(tools=[{"type": "function_call", "call_id": "c3", "name": "third", "arguments": "{}"}]),
+        )
+
+        assert [event.output_index for event in first[1:]] == [0, 1]
+        assert second[1].output_index == 0
 
     def test_text_only_interleaving_closes_each_text_item_before_response_done(self, service, conn_id):
         from openai.types.realtime.realtime_response_create_params import RealtimeResponseCreateParams

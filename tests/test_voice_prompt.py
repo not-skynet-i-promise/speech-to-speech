@@ -17,7 +17,8 @@ def test_voice_prompt_makes_speech_the_default_and_handles_noisy_stt():
     prompt = build_voice_system_prompt("Be concise.")
 
     assert "Speech is the default." in prompt
-    assert "Use tools when they help" in prompt
+    assert "Use at most two tools when they help" in prompt
+    assert "never repeat an identical call" in prompt
     assert "Use at most one tool" not in prompt
     assert "Treat transcripts as noisy." in prompt
     assert "Correct likely mishearings only if asked or meaning depends on it" in prompt
@@ -38,7 +39,7 @@ def test_voice_prompt_requests_spoken_lead_in_and_sparing_expression_tools():
     assert "Use motion, dance, emotion, and similar tools sparingly" in prompt
 
 
-def test_local_tool_prompt_preserves_multiple_tool_call_order():
+def test_local_tool_prompt_bounds_multiple_tool_calls_and_voice_order():
     prompt = build_tool_system_prompt(
         [
             FunctionTool(
@@ -50,8 +51,10 @@ def test_local_tool_prompt_preserves_multiple_tool_call_order():
         ]
     )
 
-    assert "each named-argument function call inside its own" in prompt
-    assert "preserve the intended text/tool order" in prompt
+    assert "Use at most two tool calls" in prompt
+    assert "never repeat an identical call" in prompt
+    assert "all spoken prose before the first tool call" in prompt
+    assert "do not add prose between or after tool calls" in prompt
     assert "Only one tool call may appear in a response." not in prompt
 
 
@@ -129,7 +132,7 @@ def test_local_tool_parser_flushes_pending_batch_before_tool_with_empty_before_t
     assert remaining == ""
 
 
-def test_local_tool_parser_preserves_repeated_tool_blocks(monkeypatch):
+def test_local_tool_parser_drops_repeated_tool_blocks(monkeypatch):
     monkeypatch.setattr(
         "speech_to_speech.LLM.language_model.sent_tokenize",
         lambda value: [value.strip()] if value.strip() else [],
@@ -152,10 +155,35 @@ def test_local_tool_parser_preserves_repeated_tool_blocks(monkeypatch):
 
     chunks, tools, remaining = handler._process_printable_text(text, None, [], ctx)
 
-    assert [chunk.text for chunk in chunks] == ["Watch this.", "", "Watch this.", ""]
+    assert [chunk.text for chunk in chunks] == ["Watch this.", "", "Watch this."]
     assert [tool.name for tool in chunks[1].tools] == ["dance"]
-    assert [tool.name for tool in chunks[3].tools] == ["dance"]
-    assert [tool.name for tool in tools] == ["dance", "dance"]
+    assert chunks[2].tools == []
+    assert [tool.name for tool in tools] == ["dance"]
+    assert remaining == ""
+
+
+def test_local_tool_parser_caps_distinct_calls_at_two():
+    handler = object.__new__(LanguageModelHandler)
+    ctx = StreamContext(
+        function_tools=[
+            FunctionTool(
+                type="function",
+                name=name,
+                description=f"Run {name} once.",
+                parameters={"type": "object", "properties": {}},
+            )
+            for name in ("dance", "camera", "sleep")
+        ],
+        block_regex=build_block_regex(),
+        enter_code=ENTER_CODE,
+        end_code=END_CODE,
+    )
+    text = f"{ENTER_CODE}dance(){END_CODE}{ENTER_CODE}camera(){END_CODE}{ENTER_CODE}sleep(){END_CODE}"
+
+    chunks, tools, remaining = handler._process_printable_text(text, None, [], ctx)
+
+    assert [[tool.name for tool in chunk.tools] for chunk in chunks] == [["dance"], ["camera"]]
+    assert [tool.name for tool in tools] == ["dance", "camera"]
     assert remaining == ""
 
 

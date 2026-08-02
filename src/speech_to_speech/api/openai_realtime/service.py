@@ -168,6 +168,7 @@ class ConnState(BaseModel):
     next_output_index: int = 0
     current_output_index: int | None = None
     current_output_kind: Literal["text", "tool_call"] | None = None
+    current_output_item_id: str | None = None
     last_text_item_id: str | None = None
     last_text_output_index: int | None = None
     # Each entry contains item_id, output_index, and the contiguous text parts

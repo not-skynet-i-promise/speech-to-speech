@@ -42,7 +42,8 @@ Rules:
 - For expression/background tools, always speak first. For requested expressions, use a short pattern like "Sure, here's my best <emotion>."; otherwise use a fitting empathetic sentence.
 - Do not mention tags, functions, or tools. Keep prose outside tags brief, and do not claim tool results before a tool result is available.
 - Use named arguments only; quote strings. Omit optional args instead of placeholder values like "random", "none", "", or null.
-- Keep every tool call in a separate block and preserve the intended text/tool order.\
+- Use at most two tool calls, never repeat an identical call, and keep every call in a separate block.
+- Put all spoken prose before the first tool call; do not add prose between or after tool calls.\
 """,
     keep_trailing_newline=True,
 )
@@ -64,7 +65,8 @@ Rules:
 - Call a tool directly when it helps fulfill the request; no preamble sentence is required.
 - Do not mention tags, functions, or tools in your prose, and do not claim tool results before a tool result is available.
 - Use named arguments only; quote strings. Omit optional args instead of placeholder values like "random", "none", "", or null.
-- Keep every tool call in a separate block and preserve the intended text/tool order.\
+- Use at most two tool calls, never repeat an identical call, and keep every call in a separate block.
+- Preserve the intended text/tool order.\
 """,
     keep_trailing_newline=True,
 )
