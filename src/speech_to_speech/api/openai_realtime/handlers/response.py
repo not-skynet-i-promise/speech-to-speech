@@ -115,6 +115,10 @@ class ResponseHandler(RealtimeBaseHandler):
             st.current_output_kind = "text"
             st.current_output_item_id = item_id
             return 0, item_id
+        if kind == "tool_call" and response_wants_audio(st.current_response_params):
+            # Output zero is reserved for the response's continuous audio item,
+            # even when the model emits a tool before any spoken text.
+            st.next_output_index = max(1, st.next_output_index)
         if (
             kind == "text"
             and st.current_output_kind == "text"
@@ -330,6 +334,11 @@ class ResponseHandler(RealtimeBaseHandler):
             if not commit_result:
                 logger.debug("Dropping stale assistant text for turn=%s rev=%s", event.turn_id, event.turn_revision)
                 return []
+        if not any(
+            isinstance(part, AssistantToolCallPart) or (isinstance(part, AssistantTextPart) and bool(part.text))
+            for part in event.parts
+        ):
+            return []
         st = self._state(conn_id)
         events: list[ServerEvent] = []
         need_created = st.current_response_id is None

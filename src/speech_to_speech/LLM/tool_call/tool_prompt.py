@@ -12,8 +12,6 @@ from jinja2 import Template
 
 from speech_to_speech.LLM.tool_call.function_tool import FunctionTool
 
-MAX_TOOL_CALLS_PER_RESPONSE = 2
-
 # ---------------------------------------------------------------------------
 # Default delimiters
 # ---------------------------------------------------------------------------

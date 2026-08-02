@@ -42,11 +42,10 @@ from speech_to_speech.LLM.chat import (
 from speech_to_speech.LLM.compaction_prompt import CompactGenerateFn, build_compactor
 from speech_to_speech.LLM.text_prompt import build_text_system_prompt
 from speech_to_speech.LLM.tool_call.function_call import extract_function_calls_from_text
-from speech_to_speech.LLM.tool_call.function_tool import FunctionTool
+from speech_to_speech.LLM.tool_call.function_tool import MAX_TOOL_CALLS_PER_RESPONSE, FunctionTool
 from speech_to_speech.LLM.tool_call.tool_prompt import (
     END_CODE,
     ENTER_CODE,
-    MAX_TOOL_CALLS_PER_RESPONSE,
     build_block_regex,
     build_tool_system_prompt,
 )

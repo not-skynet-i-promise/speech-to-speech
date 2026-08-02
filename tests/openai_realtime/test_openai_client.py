@@ -487,8 +487,8 @@ class TestSDKToolCalling:
             assert created.type == "response.created"
             assert e1.type == FUNCTION_CALL_DONE
             assert e2.type == FUNCTION_CALL_DONE
-            assert e1.output_index == 0
-            assert e2.output_index == 1
+            assert e1.output_index == 1
+            assert e2.output_index == 2
 
 
 # ===================================================================
