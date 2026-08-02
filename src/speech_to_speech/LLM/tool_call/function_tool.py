@@ -4,6 +4,8 @@ from openai.types.realtime import RealtimeFunctionTool
 
 from speech_to_speech.LLM.tool_call.signature_from_schema import signature_from_schema
 
+MAX_TOOL_CALLS_PER_RESPONSE = 2
+
 
 class FunctionTool(RealtimeFunctionTool):
     def to_code_prompt(self, include_args_doc: bool = True) -> str:

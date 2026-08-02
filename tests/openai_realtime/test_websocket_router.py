@@ -233,11 +233,7 @@ class TestClientEventDispatch:
                 conn_id = list(service._conns.keys())[0]
                 service.response._ensure_response(conn_id)
                 ws.send_json({"type": "response.cancel"})
-                msg1 = ws.receive_json()
-                msg2 = ws.receive_json()
-                types = {msg1["type"], msg2["type"]}
-                assert "response.output_audio.done" in types
-                assert "response.done" in types
+                assert ws.receive_json()["type"] == "response.done"
 
     def test_response_cancel_flushes_queues(self, setup):
         app, service, _, output_queue, text_output_queue, _, _, response_playing, cancel_scope = setup
@@ -251,8 +247,7 @@ class TestClientEventDispatch:
                 output_queue.put(_pcm_bytes(256))
                 text_output_queue.put(AssistantTextEvent(text="stale"))
                 ws.send_json({"type": "response.cancel"})
-                ws.receive_json()  # response.output_audio.done
-                ws.receive_json()  # response.done
+                assert ws.receive_json()["type"] == "response.done"
                 time.sleep(0.1)
                 assert output_queue.empty()
                 assert text_output_queue.empty()
@@ -281,8 +276,7 @@ class TestClientEventDispatch:
                 service.response._ensure_response(conn_id)
                 response_playing.set()
                 ws.send_json({"type": "response.cancel"})
-                ws.receive_json()  # response.output_audio.done
-                ws.receive_json()  # response.done
+                assert ws.receive_json()["type"] == "response.done"
                 time.sleep(0.1)
                 assert cancel_scope.discarding
                 output_queue.put(_pcm_bytes(256))
@@ -394,9 +388,8 @@ class TestSendLoop:
                 response_playing.set()
                 # Trigger barge-in
                 text_output_queue.put(SpeechStartedEvent())
-                ws.receive_json()  # input_audio_buffer.speech_started
-                ws.receive_json()  # response.output_audio.done
-                ws.receive_json()  # response.done
+                assert ws.receive_json()["type"] == "response.done"
+                assert ws.receive_json()["type"] == "input_audio_buffer.speech_started"
                 time.sleep(0.1)
                 assert cancel_scope.discarding
                 output_queue.put(AUDIO_RESPONSE_DONE)
@@ -530,10 +523,9 @@ class TestSendLoop:
                 text_output_queue.put(TokenUsageEvent(input_tokens=10, output_tokens=5))
                 output_queue.put(AUDIO_RESPONSE_DONE)
 
+                assert ws.receive_json()["type"] == "response.created"
                 assert ws.receive_json()["type"] == "response.function_call_arguments.done"
-                msg1 = ws.receive_json()
-                msg2 = ws.receive_json()
-                assert {msg1["type"], msg2["type"]} == {"response.output_audio.done", "response.done"}
+                assert ws.receive_json()["type"] == "response.done"
 
                 assert service.total_usage.input_tokens == 10
                 assert service.total_usage.output_tokens == 5
@@ -578,11 +570,11 @@ class TestSendLoop:
         done_events = service.finish_response(conn_id)
 
         assert [payload["type"] for payload in ws.sent] == ["response.function_call_arguments.done"]
-        assert [event.type for event in done_events] == ["response.output_audio.done", "response.done"]
+        assert [event.type for event in done_events] == ["response.done"]
         assert ws.sent[0]["response_id"] == response_id
-        assert done_events[1].response.id == response_id
-        assert done_events[1].response.usage.input_tokens == 10
-        assert done_events[1].response.usage.output_tokens == 5
+        assert done_events[0].response.id == response_id
+        assert done_events[0].response.usage.input_tokens == 10
+        assert done_events[0].response.usage.output_tokens == 5
         assert text_output_queue.empty()
 
     def test_response_completion_drain_preserves_usage_across_non_response_boundary(self, setup):
@@ -619,8 +611,8 @@ class TestSendLoop:
 
         assert [payload["type"] for payload in ws.sent] == ["response.function_call_arguments.done"]
         assert ws.sent[0]["response_id"] == response_id
-        assert done_events[1].response.usage.input_tokens == 10
-        assert done_events[1].response.usage.output_tokens == 5
+        assert done_events[0].response.usage.input_tokens == 10
+        assert done_events[0].response.usage.output_tokens == 5
 
         boundary = text_output_queue.get_nowait()
         queued_assistant = text_output_queue.get_nowait()

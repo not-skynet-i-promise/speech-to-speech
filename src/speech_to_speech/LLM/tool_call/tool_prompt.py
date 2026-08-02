@@ -34,7 +34,7 @@ Available tools:
 {{ tool.to_code_prompt() }}
 
 {% endfor %}
-To call a tool, put exactly one named-argument function call inside {{ enter_code }}...{{ end_code }}:
+To call tools, put each named-argument function call inside its own {{ enter_code }}...{{ end_code }} block:
 {{ enter_code }}function_name(required_arg='value'){{ end_code }}
 
 Rules:
@@ -42,7 +42,8 @@ Rules:
 - For expression/background tools, always speak first. For requested expressions, use a short pattern like "Sure, here's my best <emotion>."; otherwise use a fitting empathetic sentence.
 - Do not mention tags, functions, or tools. Keep prose outside tags brief, and do not claim tool results before a tool result is available.
 - Use named arguments only; quote strings. Omit optional args instead of placeholder values like "random", "none", "", or null.
-- Only one tool call may appear in a response.\
+- Use at most two tool calls, never repeat an identical call, and keep every call in a separate block.
+- Put all spoken prose before the first tool call; do not add prose between or after tool calls.\
 """,
     keep_trailing_newline=True,
 )
@@ -57,14 +58,15 @@ Available tools:
 {{ tool.to_code_prompt() }}
 
 {% endfor %}
-To call a tool, put exactly one named-argument function call inside {{ enter_code }}...{{ end_code }}:
+To call tools, put each named-argument function call inside its own {{ enter_code }}...{{ end_code }} block:
 {{ enter_code }}function_name(required_arg='value'){{ end_code }}
 
 Rules:
 - Call a tool directly when it helps fulfill the request; no preamble sentence is required.
 - Do not mention tags, functions, or tools in your prose, and do not claim tool results before a tool result is available.
 - Use named arguments only; quote strings. Omit optional args instead of placeholder values like "random", "none", "", or null.
-- Only one tool call may appear in a response.\
+- Use at most two tool calls, never repeat an identical call, and keep every call in a separate block.
+- Preserve the intended text/tool order.\
 """,
     keep_trailing_newline=True,
 )

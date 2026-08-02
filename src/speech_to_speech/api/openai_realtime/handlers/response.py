@@ -21,7 +21,7 @@ from openai.types.realtime.realtime_response_usage import RealtimeResponseUsage
 from speech_to_speech.api.openai_realtime.handlers.base import RealtimeBaseHandler
 from speech_to_speech.LLM.chat import ChatItemError
 from speech_to_speech.pipeline.events import AssistantTextEvent
-from speech_to_speech.pipeline.messages import GenerateResponseRequest
+from speech_to_speech.pipeline.messages import AssistantTextPart, AssistantToolCallPart, GenerateResponseRequest
 from speech_to_speech.utils.utils import _generate_id, is_out_of_band, response_wants_audio
 
 if TYPE_CHECKING:
@@ -70,7 +70,14 @@ class ResponseHandler(RealtimeBaseHandler):
         st.in_response = False
         st.response_pending = False
         st.current_response_params = None
-        st.pending_output_text_parts = []
+        st.next_output_index = 0
+        st.current_output_index = None
+        st.current_output_kind = None
+        st.current_output_item_id = None
+        st.last_text_item_id = None
+        st.last_text_output_index = None
+        st.audio_output_started = False
+        st.pending_text_outputs = []
 
     def _start_item(self, conn_id: str) -> str:
         """Generate a new item ID, reset content index, and store it."""
@@ -90,6 +97,48 @@ class ResponseHandler(RealtimeBaseHandler):
         idx = st.content_index
         st.content_index += 1
         return idx
+
+    def _output_part_context(self, conn_id: str, kind: str) -> tuple[int, str]:
+        """Return a stable output index and item id for an ordered part.
+
+        An audio response has one audio item because the TTS queue streams one
+        continuous output without per-text-part metadata. All of its text
+        therefore stays on output zero while tools receive later items. For a
+        text-only response, consecutive text chunks share one assistant item,
+        every tool starts a new item, and text after a tool starts a new item.
+        """
+        st = self._state(conn_id)
+        if kind == "text" and response_wants_audio(st.current_response_params):
+            item_id = self._current_item_id(conn_id)
+            if st.next_output_index == 0:
+                st.next_output_index = 1
+            st.current_output_index = 0
+            st.current_output_kind = "text"
+            st.current_output_item_id = item_id
+            return 0, item_id
+        if kind == "tool_call" and response_wants_audio(st.current_response_params):
+            # Output zero is reserved for the response's continuous audio item,
+            # even when the model emits a tool before any spoken text.
+            st.next_output_index = max(1, st.next_output_index)
+        if (
+            kind == "text"
+            and st.current_output_kind == "text"
+            and st.current_output_index is not None
+            and st.current_output_item_id is not None
+        ):
+            return st.current_output_index, st.current_output_item_id
+
+        # Keep the response's audio item stable. Audio chunks are produced on a
+        # separate queue and use ``current_item_id``; rebinding it for a tool
+        # output would incorrectly attribute the already-streaming audio to the
+        # function-call item and reset its content index.
+        item_id = self._current_item_id(conn_id) if st.next_output_index == 0 else _generate_id("item")
+        output_index = st.next_output_index
+        st.next_output_index += 1
+        st.current_output_index = output_index
+        st.current_output_kind = "text" if kind == "text" else "tool_call"
+        st.current_output_item_id = item_id
+        return output_index, item_id
 
     def _build_response(
         self,
@@ -212,38 +261,39 @@ class ResponseHandler(RealtimeBaseHandler):
         """Close the current response (audio/text done + response done).
 
         Audio responses emit ``response.output_audio.done`` for any terminal
-        status. Text-only responses emit a single ``response.output_text.done``
-        carrying the full streamed text, but only on ``status="completed"`` —
-        a cancelled or failed text response sends no audio, so it just closes
+        status. Text-only responses emit one ``response.output_text.done`` per
+        contiguous text output item, but only on ``status="completed"`` — a
+        cancelled or failed text response sends no audio, so it just closes
         with ``response.done``.
         """
         st = self._state(conn_id)
         events: list[ServerEvent] = []
         if st.in_response:
             resp_id, item_id = self._ensure_response(conn_id)
-            if response_wants_audio(st.current_response_params):
+            if response_wants_audio(st.current_response_params) and st.audio_output_started:
                 events.append(
                     ResponseAudioDoneEvent(
                         type="response.output_audio.done",
                         event_id=self._next_event_id(),
                         content_index=0,
-                        item_id=item_id,
-                        output_index=0,
+                        item_id=st.last_text_item_id or item_id,
+                        output_index=(st.last_text_output_index if st.last_text_output_index is not None else 0),
                         response_id=resp_id,
                     )
                 )
-            elif status == "completed" and st.pending_output_text_parts:
-                events.append(
-                    ResponseTextDoneEvent(
-                        type="response.output_text.done",
-                        event_id=self._next_event_id(),
-                        content_index=0,
-                        item_id=item_id,
-                        output_index=0,
-                        response_id=resp_id,
-                        text="".join(st.pending_output_text_parts),
+            elif status == "completed":
+                for pending in st.pending_text_outputs:
+                    events.append(
+                        ResponseTextDoneEvent(
+                            type="response.output_text.done",
+                            event_id=self._next_event_id(),
+                            content_index=0,
+                            item_id=str(pending["item_id"]),
+                            output_index=int(pending["output_index"]),
+                            response_id=resp_id,
+                            text="".join(pending["parts"]),
+                        )
                     )
-                )
             events.append(
                 ResponseDoneEvent(
                     type="response.done",
@@ -267,7 +317,7 @@ class ResponseHandler(RealtimeBaseHandler):
         *,
         wait_for_pending_reopen: bool = True,
     ) -> list[ServerEvent] | None:
-        """Handle assistant_text: emit transcript and/or tool-call events."""
+        """Handle assistant_text: create the implicit response, then emit its ordered parts."""
         if self._service.speculative_turns:
             commit_result: bool | None
             if wait_for_pending_reopen:
@@ -285,44 +335,64 @@ class ResponseHandler(RealtimeBaseHandler):
             if not commit_result:
                 logger.debug("Dropping stale assistant text for turn=%s rev=%s", event.turn_id, event.turn_revision)
                 return []
+        if not any(
+            isinstance(part, AssistantToolCallPart) or (isinstance(part, AssistantTextPart) and bool(part.text))
+            for part in event.parts
+        ):
+            return []
         st = self._state(conn_id)
         events: list[ServerEvent] = []
-        resp_id, item_id = self._ensure_response(conn_id)
-        st.last_item_id = item_id
-        output_idx = 0
-        if event.text:
-            if response_wants_audio(st.current_response_params):
-                events.append(
-                    ResponseAudioTranscriptDoneEvent(
-                        type="response.output_audio_transcript.done",
-                        event_id=self._next_event_id(),
-                        content_index=0,
-                        item_id=item_id,
-                        output_index=output_idx,
-                        response_id=resp_id,
-                        transcript=event.text,
-                    )
+        need_created = st.current_response_id is None
+        resp_id, initial_item_id = self._ensure_response(conn_id)
+        last_item_id = initial_item_id
+        if need_created:
+            events.append(
+                ResponseCreatedEvent(
+                    type="response.created",
+                    event_id=self._next_event_id(),
+                    response=self._build_response(conn_id, "in_progress"),
                 )
-            else:
-                # Stream the delta now; the matching response.output_text.done is
-                # emitted once at close in finish_response, carrying the per-chunk
-                # parts collected here, space-joined ("" when there were none).
-                st.pending_output_text_parts.append(event.text)
-                events.append(
-                    ResponseTextDeltaEvent(
-                        type="response.output_text.delta",
-                        event_id=self._next_event_id(),
-                        content_index=0,
-                        item_id=item_id,
-                        output_index=output_idx,
-                        response_id=resp_id,
-                        delta=event.text,
+            )
+        for part in event.parts:
+            if isinstance(part, AssistantTextPart):
+                if not part.text:
+                    continue
+                output_idx, item_id = self._output_part_context(conn_id, "text")
+                st.last_text_item_id = item_id
+                st.last_text_output_index = output_idx
+                if response_wants_audio(st.current_response_params):
+                    events.append(
+                        ResponseAudioTranscriptDoneEvent(
+                            type="response.output_audio_transcript.done",
+                            event_id=self._next_event_id(),
+                            content_index=0,
+                            item_id=item_id,
+                            output_index=output_idx,
+                            response_id=resp_id,
+                            transcript=part.text,
+                        )
                     )
-                )
-            output_idx += 1
-        if event.tools:
-            st.response_usage.tool_calls += len(event.tools)
-            for tool in event.tools:
+                else:
+                    # Stream the delta now; finish_response emits one matching
+                    # done event for each contiguous text output item.
+                    if not st.pending_text_outputs or st.pending_text_outputs[-1]["output_index"] != output_idx:
+                        st.pending_text_outputs.append({"item_id": item_id, "output_index": output_idx, "parts": []})
+                    st.pending_text_outputs[-1]["parts"].append(part.text)
+                    events.append(
+                        ResponseTextDeltaEvent(
+                            type="response.output_text.delta",
+                            event_id=self._next_event_id(),
+                            content_index=0,
+                            item_id=item_id,
+                            output_index=output_idx,
+                            response_id=resp_id,
+                            delta=part.text,
+                        )
+                    )
+            elif isinstance(part, AssistantToolCallPart):
+                tool = part.tool
+                output_idx, item_id = self._output_part_context(conn_id, "tool_call")
+                st.response_usage.tool_calls += 1
                 events.append(
                     ResponseFunctionCallArgumentsDoneEvent(
                         type="response.function_call_arguments.done",
@@ -335,5 +405,6 @@ class ResponseHandler(RealtimeBaseHandler):
                         response_id=resp_id,
                     )
                 )
-                output_idx += 1
+            last_item_id = item_id
+        st.last_item_id = last_item_id
         return events

@@ -17,7 +17,9 @@ def test_voice_prompt_makes_speech_the_default_and_handles_noisy_stt():
     prompt = build_voice_system_prompt("Be concise.")
 
     assert "Speech is the default." in prompt
-    assert "Use at most one tool" in prompt
+    assert "Use at most two tools when they help" in prompt
+    assert "never repeat an identical call" in prompt
+    assert "Use at most one tool" not in prompt
     assert "Treat transcripts as noisy." in prompt
     assert "Correct likely mishearings only if asked or meaning depends on it" in prompt
     assert "Reachy/Richie/Richy" not in prompt
@@ -37,7 +39,7 @@ def test_voice_prompt_requests_spoken_lead_in_and_sparing_expression_tools():
     assert "Use motion, dance, emotion, and similar tools sparingly" in prompt
 
 
-def test_local_tool_prompt_forbids_multiple_tool_calls():
+def test_local_tool_prompt_bounds_multiple_tool_calls_and_voice_order():
     prompt = build_tool_system_prompt(
         [
             FunctionTool(
@@ -49,8 +51,11 @@ def test_local_tool_prompt_forbids_multiple_tool_calls():
         ]
     )
 
-    assert "Only one tool call may appear in a response." in prompt
-    assert "Multiple tool calls can live" not in prompt
+    assert "Use at most two tool calls" in prompt
+    assert "never repeat an identical call" in prompt
+    assert "all spoken prose before the first tool call" in prompt
+    assert "do not add prose between or after tool calls" in prompt
+    assert "Only one tool call may appear in a response." not in prompt
 
 
 def test_local_tool_prompt_allows_spoken_lead_in_before_code_block():
@@ -127,7 +132,11 @@ def test_local_tool_parser_flushes_pending_batch_before_tool_with_empty_before_t
     assert remaining == ""
 
 
-def test_local_tool_parser_skips_duplicate_tool_blocks_and_preserves_trailing_text():
+def test_local_tool_parser_drops_repeated_tool_blocks(monkeypatch):
+    monkeypatch.setattr(
+        "speech_to_speech.LLM.language_model.sent_tokenize",
+        lambda value: [value.strip()] if value.strip() else [],
+    )
     handler = object.__new__(LanguageModelHandler)
     ctx = StreamContext(
         function_tools=[
@@ -146,7 +155,101 @@ def test_local_tool_parser_skips_duplicate_tool_blocks_and_preserves_trailing_te
 
     chunks, tools, remaining = handler._process_printable_text(text, None, [], ctx)
 
-    assert [chunk.text for chunk in chunks] == ["Watch this.", ""]
+    assert [chunk.text for chunk in chunks] == ["Watch this.", "", "Watch this."]
     assert [tool.name for tool in chunks[1].tools] == ["dance"]
+    assert chunks[2].tools == []
     assert [tool.name for tool in tools] == ["dance"]
-    assert remaining.strip() == "Watch this."
+    assert remaining == ""
+
+
+def test_local_tool_parser_caps_distinct_calls_at_two():
+    handler = object.__new__(LanguageModelHandler)
+    ctx = StreamContext(
+        function_tools=[
+            FunctionTool(
+                type="function",
+                name=name,
+                description=f"Run {name} once.",
+                parameters={"type": "object", "properties": {}},
+            )
+            for name in ("dance", "camera", "sleep")
+        ],
+        block_regex=build_block_regex(),
+        enter_code=ENTER_CODE,
+        end_code=END_CODE,
+    )
+    text = f"{ENTER_CODE}dance(){END_CODE}{ENTER_CODE}camera(){END_CODE}{ENTER_CODE}sleep(){END_CODE}"
+
+    chunks, tools, remaining = handler._process_printable_text(text, None, [], ctx)
+
+    assert [[tool.name for tool in chunk.tools] for chunk in chunks] == [["dance"], ["camera"]]
+    assert [tool.name for tool in tools] == ["dance", "camera"]
+    assert remaining == ""
+
+
+def test_local_tool_parser_cap_and_dedup_hold_across_streaming_invocations():
+    handler = object.__new__(LanguageModelHandler)
+    ctx = StreamContext(
+        function_tools=[
+            FunctionTool(
+                type="function",
+                name=name,
+                description=f"Run {name} once.",
+                parameters={"type": "object", "properties": {}},
+            )
+            for name in ("dance", "camera", "sleep")
+        ],
+        block_regex=build_block_regex(),
+        enter_code=ENTER_CODE,
+        end_code=END_CODE,
+    )
+
+    first, tools, _ = handler._process_printable_text(f"{ENTER_CODE}dance(){END_CODE}", None, [], ctx)
+    duplicate, tools, _ = handler._process_printable_text(f"{ENTER_CODE}dance(){END_CODE}", None, tools, ctx)
+    second, tools, _ = handler._process_printable_text(f"{ENTER_CODE}camera(){END_CODE}", None, tools, ctx)
+    excess, tools, _ = handler._process_printable_text(f"{ENTER_CODE}sleep(){END_CODE}", None, tools, ctx)
+
+    assert [[tool.name for tool in chunk.tools] for chunk in first] == [["dance"]]
+    assert duplicate == []
+    assert [[tool.name for tool in chunk.tools] for chunk in second] == [["camera"]]
+    assert excess == []
+    assert [tool.name for tool in tools] == ["dance", "camera"]
+
+
+def test_local_tool_parser_preserves_interleaved_text_and_tool_calls(monkeypatch):
+    monkeypatch.setattr(
+        "speech_to_speech.LLM.language_model.sent_tokenize",
+        lambda value: [value.strip()] if value.strip() else [],
+    )
+    handler = object.__new__(LanguageModelHandler)
+    ctx = StreamContext(
+        function_tools=[
+            FunctionTool(
+                type="function",
+                name="dance",
+                description="Dance once.",
+                parameters={"type": "object", "properties": {}},
+            ),
+            FunctionTool(
+                type="function",
+                name="camera",
+                description="Look through the camera.",
+                parameters={"type": "object", "properties": {}},
+            ),
+        ],
+        block_regex=build_block_regex(),
+        enter_code=ENTER_CODE,
+        end_code=END_CODE,
+    )
+    text = f"First. {ENTER_CODE}dance(){END_CODE} Middle. {ENTER_CODE}camera(){END_CODE} Last."
+
+    chunks, tools, remaining = handler._process_printable_text(text, None, [], ctx)
+
+    assert [(chunk.text, [tool.name for tool in chunk.tools]) for chunk in chunks] == [
+        ("First.", []),
+        ("", ["dance"]),
+        ("Middle.", []),
+        ("", ["camera"]),
+    ]
+    assert [tool.name for tool in tools] == ["dance", "camera"]
+    assert remaining.strip() == "Last."

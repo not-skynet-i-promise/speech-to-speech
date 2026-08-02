@@ -29,6 +29,7 @@ from speech_to_speech.LLM.chat import (
 )
 from speech_to_speech.LLM.compaction_prompt import CompactGenerateFn, build_compactor
 from speech_to_speech.LLM.text_prompt import build_text_system_prompt
+from speech_to_speech.LLM.tool_call.function_tool import MAX_TOOL_CALLS_PER_RESPONSE
 from speech_to_speech.LLM.utils import remove_unspeechable, resolve_auto_language
 from speech_to_speech.LLM.voice_prompt import build_voice_system_prompt
 from speech_to_speech.pipeline.cancel_scope import CancelScope
@@ -302,6 +303,16 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
         Out-of-band turns never touch the default conversation, and a stale turn
         records nothing (it is not forwarded to the client either)."""
+        if any(previous.name == item.name and previous.arguments == item.arguments for previous in state.tools):
+            logger.warning("Skipping duplicate tool call '%s'", item.name)
+            return
+        if len(state.tools) >= MAX_TOOL_CALLS_PER_RESPONSE:
+            logger.warning(
+                "Skipping extra tool call '%s'; at most %d tool calls are allowed per response",
+                item.name,
+                MAX_TOOL_CALLS_PER_RESPONSE,
+            )
+            return
         state.tools.append(item)
         fc_item = RealtimeConversationItemFunctionCall(
             type="function_call",
