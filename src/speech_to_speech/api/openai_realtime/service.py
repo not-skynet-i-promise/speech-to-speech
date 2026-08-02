@@ -171,6 +171,7 @@ class ConnState(BaseModel):
     current_output_item_id: str | None = None
     last_text_item_id: str | None = None
     last_text_output_index: int | None = None
+    audio_output_started: bool = False
     # Each entry contains item_id, output_index, and the contiguous text parts
     # for one assistant message. Kept as plain internal data to avoid coupling
     # connection state to protocol event models.

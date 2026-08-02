@@ -76,6 +76,7 @@ class ResponseHandler(RealtimeBaseHandler):
         st.current_output_item_id = None
         st.last_text_item_id = None
         st.last_text_output_index = None
+        st.audio_output_started = False
         st.pending_text_outputs = []
 
     def _start_item(self, conn_id: str) -> str:
@@ -269,7 +270,7 @@ class ResponseHandler(RealtimeBaseHandler):
         events: list[ServerEvent] = []
         if st.in_response:
             resp_id, item_id = self._ensure_response(conn_id)
-            if response_wants_audio(st.current_response_params):
+            if response_wants_audio(st.current_response_params) and st.audio_output_started:
                 events.append(
                     ResponseAudioDoneEvent(
                         type="response.output_audio.done",

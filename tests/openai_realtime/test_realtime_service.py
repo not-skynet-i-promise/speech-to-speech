@@ -698,11 +698,10 @@ class TestHandleResponseCancel:
         should_listen.clear()
         service.response._ensure_response(conn_id)
         events = service.handle_response_cancel(conn_id)
-        assert len(events) == 2
-        assert isinstance(events[0], ResponseAudioDoneEvent)
-        assert isinstance(events[1], ResponseDoneEvent)
-        assert events[1].response.status == "cancelled"
-        assert events[1].response.status_details.reason == "client_cancelled"
+        assert len(events) == 1
+        assert isinstance(events[0], ResponseDoneEvent)
+        assert events[0].response.status == "cancelled"
+        assert events[0].response.status_details.reason == "client_cancelled"
         assert should_listen.is_set()
 
     def test_cancel_no_active_response(self, service, conn_id):
@@ -838,7 +837,7 @@ class TestEncodeAudioChunk:
 
 class TestFinishAudioResponse:
     def test_finish_emits_audio_done_and_response_done(self, service, conn_id):
-        service.response._ensure_response(conn_id)
+        service.encode_audio_chunk(conn_id, _pcm_bytes(256))
         events = service.finish_response(conn_id)
         assert len(events) == 2
         assert isinstance(events[0], ResponseAudioDoneEvent)
@@ -860,11 +859,23 @@ class TestFinishAudioResponse:
         assert not any(isinstance(e, ResponseAudioDoneEvent) for e in events)
 
     def test_finish_with_cancel_status(self, service, conn_id):
-        service.response._ensure_response(conn_id)
+        service.encode_audio_chunk(conn_id, _pcm_bytes(256))
         events = service.finish_response(conn_id, status="cancelled", reason="turn_detected")
         done = events[1]
         assert done.response.status == "cancelled"
         assert done.response.status_details.reason == "turn_detected"
+
+    def test_tool_only_response_skips_orphaned_audio_done(self, service, conn_id):
+        service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(tools=[{"type": "function_call", "call_id": "c1", "name": "tool", "arguments": "{}"}]),
+        )
+
+        events = service.finish_response(conn_id)
+
+        assert len(events) == 1
+        assert isinstance(events[0], ResponseDoneEvent)
+        assert not any(isinstance(event, ResponseAudioDoneEvent) for event in events)
 
     def test_finish_resets_state(self, service, conn_id):
         from openai.types.realtime.realtime_response_create_params import RealtimeResponseCreateParams
@@ -879,6 +890,7 @@ class TestFinishAudioResponse:
         assert st.current_response_id is None
         assert st.current_item_id is None
         assert st.current_response_params is None
+        assert st.audio_output_started is False
 
 
 # ===================================================================
@@ -901,7 +913,7 @@ class TestDispatchPipelineEvent:
         assert evt.item_id.startswith("item_")
 
     def test_speech_started_cancels_active_response(self, service, conn_id):
-        service.response._ensure_response(conn_id)
+        service.encode_audio_chunk(conn_id, _pcm_bytes(256))
         events = service.dispatch_pipeline_event(
             conn_id,
             SpeechStartedEvent(),
@@ -942,7 +954,8 @@ class TestDispatchPipelineEvent:
         assert service._state(conn_id).current_item_id == response_item_id
 
     def test_speech_started_internal_non_interrupt_does_not_cancel(self, service, conn_id):
-        _, response_item_id = service.response._ensure_response(conn_id)
+        audio_events = service.encode_audio_chunk(conn_id, _pcm_bytes(256))
+        response_item_id = audio_events[-1].item_id
         events = service.dispatch_pipeline_event(
             conn_id,
             SpeechStartedEvent(interrupt_response=False),
@@ -1997,7 +2010,7 @@ class TestUsageMetricsTracking:
             TokenUsageEvent(input_tokens=100, output_tokens=50),
         )
         events = service.finish_response(conn_id)
-        done_evt = events[1]
+        done_evt = next(event for event in events if isinstance(event, ResponseDoneEvent))
         assert isinstance(done_evt, ResponseDoneEvent)
         assert done_evt.response.usage.input_tokens == 100
         assert done_evt.response.usage.output_tokens == 50

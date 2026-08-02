@@ -165,6 +165,7 @@ class AudioHandler(RealtimeBaseHandler):
         events: list[ServerEvent] = []
         need_created = st.current_response_id is None
         resp_id, item_id = response._ensure_response(conn_id)
+        st.audio_output_started = True
         if need_created:
             events.append(
                 ResponseCreatedEvent(
