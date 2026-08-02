@@ -1047,34 +1047,43 @@ class TestDispatchPipelineEvent:
         assert service._state(conn_id).last_item_id == service._state(conn_id).current_item_id
         assert service._state(conn_id).last_item_id != "item_old"
 
-    def test_assistant_parts_preserve_tool_text_tool_text_order(self, service, conn_id):
+    def test_audio_text_stays_on_output_zero_when_interleaved_with_tools(self, service, conn_id):
         events = service.dispatch_pipeline_event(
             conn_id,
             AssistantTextEvent(
                 parts=[
+                    AssistantTextPart(text="before"),
                     AssistantToolCallPart(
                         tool={"type": "function_call", "call_id": "c1", "name": "first", "arguments": "{}"}
                     ),
-                    AssistantTextPart(text="between"),
+                    AssistantTextPart(text="after first"),
                     AssistantToolCallPart(
                         tool={"type": "function_call", "call_id": "c2", "name": "second", "arguments": "{}"}
                     ),
-                    AssistantTextPart(text="after"),
                 ]
             ),
         )
 
         assert [event.type for event in events] == [
             "response.created",
-            "response.function_call_arguments.done",
             "response.output_audio_transcript.done",
             "response.function_call_arguments.done",
             "response.output_audio_transcript.done",
+            "response.function_call_arguments.done",
         ]
-        assert [event.output_index for event in events[1:]] == [0, 1, 2, 3]
-        assert len({event.item_id for event in events[1:]}) == 4
+        assert [event.output_index for event in events[1:]] == [0, 1, 0, 2]
+        assert events[1].item_id == events[3].item_id
+        assert len({event.item_id for event in events[1:]}) == 3
 
-    def test_assistant_part_indices_continue_across_pipeline_events(self, service, conn_id):
+        audio_delta = service.encode_audio_chunk(conn_id, _pcm_bytes(256))[0]
+        audio_done = service.finish_response(conn_id)[0]
+
+        assert isinstance(audio_delta, ResponseAudioDeltaEvent)
+        assert isinstance(audio_done, ResponseAudioDoneEvent)
+        assert audio_delta.item_id == audio_done.item_id == events[1].item_id
+        assert audio_delta.output_index == audio_done.output_index == 0
+
+    def test_audio_text_reuses_output_zero_across_pipeline_events(self, service, conn_id):
         first = service.dispatch_pipeline_event(conn_id, AssistantTextEvent(text="before"))
         second = service.dispatch_pipeline_event(
             conn_id,
@@ -1083,8 +1092,9 @@ class TestDispatchPipelineEvent:
         third = service.dispatch_pipeline_event(conn_id, AssistantTextEvent(text="after"))
 
         assert isinstance(first[0], ResponseCreatedEvent)
-        assert [first[1].output_index, second[0].output_index, third[0].output_index] == [0, 1, 2]
-        assert len({first[1].item_id, second[0].item_id, third[0].item_id}) == 3
+        assert [first[1].output_index, second[0].output_index, third[0].output_index] == [0, 1, 0]
+        assert first[1].item_id == third[0].item_id
+        assert second[0].item_id != first[1].item_id
 
     def test_output_indices_restart_after_response_finishes(self, service, conn_id):
         first = service.dispatch_pipeline_event(

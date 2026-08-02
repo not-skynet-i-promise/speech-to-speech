@@ -57,14 +57,20 @@ def _make_stream(events):
     return stream
 
 
-def _make_function_call_done_event(name="camera", arguments="{}"):
+def _make_function_call_done_event(
+    name="camera",
+    arguments="{}",
+    *,
+    call_id="call_original",
+    output_index=1,
+):
     return ResponseOutputItemDoneEvent(
         type="response.output_item.done",
-        output_index=1,
+        output_index=output_index,
         sequence_number=2,
         item=ResponseFunctionToolCall(
             type="function_call",
-            call_id="call_original",
+            call_id=call_id,
             name=name,
             arguments=arguments,
         ),
@@ -265,6 +271,27 @@ def test_process_preserves_streamed_text_after_function_call_order():
     assert outputs[2].text == "This may take a second."
     assert outputs[2].tools == []
     assert isinstance(outputs[3], EndOfResponse)
+
+
+def test_provider_tool_calls_drop_duplicates_and_stop_at_two():
+    handler = _make_handler()
+    streamed_events = [
+        _make_function_call_done_event(name="camera", call_id="call_1", output_index=0),
+        _make_function_call_done_event(name="camera", call_id="call_2", output_index=1),
+        _make_function_call_done_event(name="search", call_id="call_3", output_index=2),
+        _make_function_call_done_event(name="sleep", call_id="call_4", output_index=3),
+    ]
+    handler.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            create=lambda **kwargs: _make_stream(streamed_events),
+        )
+    )
+
+    outputs = list(handler.process(_make_request("Handle this")))
+
+    tool_chunks = [output for output in outputs if isinstance(output, LLMResponseChunk) and output.tools]
+    assert [[tool.name for tool in chunk.tools] for chunk in tool_chunks] == [["camera"], ["search"]]
+    assert isinstance(outputs[-1], EndOfResponse)
 
 
 def test_process_preserves_nonstreaming_text_tool_text_order():

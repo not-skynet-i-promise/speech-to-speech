@@ -128,7 +128,6 @@ class LMOutputProcessor(BaseHandler[LLMOut, TTSIn]):
                 cancel_generation=lm_output.cancel_generation,
             )
             if lm_output.tools:
-                event.tools = lm_output.tools
                 logger.info(f"Sending to clients: text='{lm_output.text}', tools={[t.name for t in lm_output.tools]}")
             else:
                 logger.debug(f"Sending to clients: text='{lm_output.text}' (no tools)")

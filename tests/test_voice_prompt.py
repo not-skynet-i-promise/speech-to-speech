@@ -187,6 +187,35 @@ def test_local_tool_parser_caps_distinct_calls_at_two():
     assert remaining == ""
 
 
+def test_local_tool_parser_cap_and_dedup_hold_across_streaming_invocations():
+    handler = object.__new__(LanguageModelHandler)
+    ctx = StreamContext(
+        function_tools=[
+            FunctionTool(
+                type="function",
+                name=name,
+                description=f"Run {name} once.",
+                parameters={"type": "object", "properties": {}},
+            )
+            for name in ("dance", "camera", "sleep")
+        ],
+        block_regex=build_block_regex(),
+        enter_code=ENTER_CODE,
+        end_code=END_CODE,
+    )
+
+    first, tools, _ = handler._process_printable_text(f"{ENTER_CODE}dance(){END_CODE}", None, [], ctx)
+    duplicate, tools, _ = handler._process_printable_text(f"{ENTER_CODE}dance(){END_CODE}", None, tools, ctx)
+    second, tools, _ = handler._process_printable_text(f"{ENTER_CODE}camera(){END_CODE}", None, tools, ctx)
+    excess, tools, _ = handler._process_printable_text(f"{ENTER_CODE}sleep(){END_CODE}", None, tools, ctx)
+
+    assert [[tool.name for tool in chunk.tools] for chunk in first] == [["dance"]]
+    assert duplicate == []
+    assert [[tool.name for tool in chunk.tools] for chunk in second] == [["camera"]]
+    assert excess == []
+    assert [tool.name for tool in tools] == ["dance", "camera"]
+
+
 def test_local_tool_parser_preserves_interleaved_text_and_tool_calls(monkeypatch):
     monkeypatch.setattr(
         "speech_to_speech.LLM.language_model.sent_tokenize",

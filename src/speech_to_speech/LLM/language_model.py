@@ -43,7 +43,13 @@ from speech_to_speech.LLM.compaction_prompt import CompactGenerateFn, build_comp
 from speech_to_speech.LLM.text_prompt import build_text_system_prompt
 from speech_to_speech.LLM.tool_call.function_call import extract_function_calls_from_text
 from speech_to_speech.LLM.tool_call.function_tool import FunctionTool
-from speech_to_speech.LLM.tool_call.tool_prompt import END_CODE, ENTER_CODE, build_block_regex, build_tool_system_prompt
+from speech_to_speech.LLM.tool_call.tool_prompt import (
+    END_CODE,
+    ENTER_CODE,
+    MAX_TOOL_CALLS_PER_RESPONSE,
+    build_block_regex,
+    build_tool_system_prompt,
+)
 from speech_to_speech.LLM.utils import image_url_to_pil, remove_unspeechable, resolve_auto_language
 from speech_to_speech.LLM.voice_prompt import build_voice_system_prompt
 from speech_to_speech.pipeline.cancel_scope import CancelScope
@@ -79,8 +85,6 @@ except ImportError:
     HAS_MLX_VLM = False
 
 logger = logging.getLogger(__name__)
-
-_MAX_TOOL_CALLS_PER_RESPONSE = 2
 
 
 @runtime_checkable
@@ -352,11 +356,11 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 ):
                     logger.warning("Skipping duplicate tool call '%s'", tool_call.name)
                     continue
-                if len(tools) >= _MAX_TOOL_CALLS_PER_RESPONSE:
+                if len(tools) >= MAX_TOOL_CALLS_PER_RESPONSE:
                     logger.warning(
                         "Skipping extra tool call '%s'; at most %d tool calls are allowed per response",
                         tool_call.name,
-                        _MAX_TOOL_CALLS_PER_RESPONSE,
+                        MAX_TOOL_CALLS_PER_RESPONSE,
                     )
                     continue
                 tools.append(tool_call)

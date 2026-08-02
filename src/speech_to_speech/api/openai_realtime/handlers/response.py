@@ -100,11 +100,21 @@ class ResponseHandler(RealtimeBaseHandler):
     def _output_part_context(self, conn_id: str, kind: str) -> tuple[int, str]:
         """Return a stable output index and item id for an ordered part.
 
-        Consecutive text chunks share one assistant output item. Every tool
-        call starts a new item, and text after a tool starts a new assistant
-        item, preserving order even when parts arrive in separate events.
+        An audio response has one audio item because the TTS queue streams one
+        continuous output without per-text-part metadata. All of its text
+        therefore stays on output zero while tools receive later items. For a
+        text-only response, consecutive text chunks share one assistant item,
+        every tool starts a new item, and text after a tool starts a new item.
         """
         st = self._state(conn_id)
+        if kind == "text" and response_wants_audio(st.current_response_params):
+            item_id = self._current_item_id(conn_id)
+            if st.next_output_index == 0:
+                st.next_output_index = 1
+            st.current_output_index = 0
+            st.current_output_kind = "text"
+            st.current_output_item_id = item_id
+            return 0, item_id
         if (
             kind == "text"
             and st.current_output_kind == "text"
@@ -262,7 +272,7 @@ class ResponseHandler(RealtimeBaseHandler):
                         event_id=self._next_event_id(),
                         content_index=0,
                         item_id=st.last_text_item_id or item_id,
-                        output_index=st.last_text_output_index or 0,
+                        output_index=(st.last_text_output_index if st.last_text_output_index is not None else 0),
                         response_id=resp_id,
                     )
                 )

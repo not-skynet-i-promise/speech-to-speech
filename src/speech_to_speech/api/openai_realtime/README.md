@@ -79,7 +79,7 @@ should begin.
 | `conversation.item.created` | Acknowledges injected `input_text` from `conversation.item.create`. |
 | `conversation.item.input_audio_transcription.delta` | Streaming partial transcript (when live transcription is enabled). |
 | `conversation.item.input_audio_transcription.completed` | Final transcript for the user turn (with duration usage). |
-| `response.created` | Emitted on the first outbound audio chunk (response is `in_progress`). |
+| `response.created` | Emitted before the first assistant output part or outbound audio chunk, whichever arrives first (response is `in_progress`). |
 | `response.output_audio.delta` | Base64 PCM audio chunk from TTS. |
 | `response.output_audio.done` | Audio stream complete for the current output item. |
 | `response.output_audio_transcript.done` | Full assistant text transcript for the turn. |
@@ -150,7 +150,11 @@ Tools are passed natively as the `tools=` parameter to `client.responses.create`
 
 ### Common output path
 
-Both handlers yield `(text, language_code, tools)` tuples. `LMOutputProcessor` forwards clean text to TTS and puts `{"type": "assistant_text", "text": ..., "tools": [...]}` on the `text_output_queue`. The router's `_send_loop` translates these into:
+Both handlers yield ordered `LLMResponseChunk.parts` containing text and tool-call
+parts; the legacy `text` and `tools` fields remain compatibility views.
+`LMOutputProcessor` forwards text parts to TTS and puts an `AssistantTextEvent`
+with the same ordered parts on the `text_output_queue`. The router's `_send_loop`
+translates these into:
 - `response.output_audio_transcript.done` for the text
 - `response.function_call_arguments.done` for each tool call
 
