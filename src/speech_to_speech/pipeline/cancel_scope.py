@@ -76,9 +76,11 @@ class CancelScope:
     def response_admission(self, generation: int | None) -> Iterator[tuple[bool, int]]:
         """Atomically admit one response against the current generation.
 
-        The active count stays set until the handler's generator exits, but the
-        lock is not held during model/provider work. Private activation takes
-        the same lock and refuses readiness while any response is active.
+        The admission lease stays set until the handler's generator exits, but
+        the lock is not held during model/provider work. A local worker that
+        survives its generator holds an additional lease through actual thread
+        exit. Private activation takes the same lock and refuses readiness
+        while any response or worker lease is active.
         """
         with self._lock:
             resolved_generation = self._gen if generation is None else generation
@@ -97,6 +99,18 @@ class CancelScope:
         """Serialize barrier readiness with response admission and cancellation."""
         with self._lock:
             yield self._active_responses == 0
+
+    def response_worker_started(self) -> None:
+        """Keep private activation blocked while an admitted worker is alive."""
+        with self._lock:
+            self._active_responses += 1
+
+    def response_worker_done(self) -> None:
+        """Release one live-worker lease after the worker has actually exited."""
+        with self._lock:
+            if self._active_responses <= 0:
+                raise RuntimeError("Response worker lease underflow")
+            self._active_responses -= 1
 
     def reset(self) -> None:
         """Clear discard state (e.g. on new session connect)."""

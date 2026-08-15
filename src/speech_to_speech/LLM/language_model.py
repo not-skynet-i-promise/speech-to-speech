@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Iterator, Sized
+from collections.abc import Callable, Iterable, Iterator, Sized
 from contextlib import nullcontext
 from queue import Empty
 from threading import Lock, Thread
@@ -243,11 +243,50 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         """Close the MLX generator to release resources immediately."""
         token_iter.close()
 
-    def _finish_transformers_generation(self, thread: Thread) -> None:
-        """Signal the stopping criteria, drain the streamer, and join the thread."""
-        self._cancel_criteria.cancel()
+    def _start_transformers_generation(self, target: Callable[[], None]) -> Thread:
+        """Start a worker whose activation lease lasts through actual thread exit."""
+        cancel_scope = self.cancel_scope
+        if cancel_scope is not None:
+            cancel_scope.response_worker_started()
+
+        def run() -> None:
+            try:
+                target()
+            finally:
+                if cancel_scope is not None:
+                    cancel_scope.response_worker_done()
+
+        thread = Thread(target=run)
         try:
-            for _ in self.streamer:
+            thread.start()
+        except BaseException:
+            if cancel_scope is not None:
+                cancel_scope.response_worker_done()
+            raise
+        return thread
+
+    def _new_transformers_streaming_state(self) -> tuple[TextIteratorStreamer, _CancelCriteria]:
+        """Return per-generation channels that cannot receive an older worker's tokens."""
+        return (
+            TextIteratorStreamer(
+                self.tokenizer,  # type: ignore[arg-type]
+                skip_prompt=True,
+                skip_special_tokens=True,
+                timeout=1.0,
+            ),
+            _CancelCriteria(),
+        )
+
+    def _finish_transformers_generation(
+        self,
+        thread: Thread,
+        streamer: Iterable[str],
+        cancel_criteria: _CancelCriteria,
+    ) -> None:
+        """Signal the stopping criteria, drain the streamer, and join the thread."""
+        cancel_criteria.cancel()
+        try:
+            for _ in streamer:
                 pass
         except Empty:
             pass
@@ -795,17 +834,21 @@ class LanguageModelHandler(BaseLanguageModelHandler):
                 pass
             torch.mps.empty_cache()
         else:
-            self._cancel_criteria.reset()
+            streamer, cancel_criteria = self._new_transformers_streaming_state()
+            generation_kwargs = {
+                **self.gen_kwargs,
+                "streamer": streamer,
+                "stopping_criteria": StoppingCriteriaList([cancel_criteria]),
+            }
             lock = self._transformers_lock
 
             def _locked_pipe() -> None:
                 with lock:
-                    self.pipe(chat_prompt, **self.gen_kwargs)
+                    self.pipe(chat_prompt, **generation_kwargs)
 
-            thread = Thread(target=_locked_pipe)
-            thread.start()
-            yield from self._stream_tokens(self.streamer, gen, language_code, ctx, runtime_config, response)
-            self._finish_transformers_generation(thread)
+            thread = self._start_transformers_generation(_locked_pipe)
+            yield from self._stream_tokens(streamer, gen, language_code, ctx, runtime_config, response)
+            self._finish_transformers_generation(thread, streamer, cancel_criteria)
             if self.device == "mps":
                 torch.mps.empty_cache()
 
@@ -971,12 +1014,12 @@ class VisionLanguageModelHandler(BaseLanguageModelHandler):
             ctx.input_tokens += input_tokens
             logger.debug("VLM prompt token count: %d", ctx.input_tokens)
 
-            self._cancel_criteria.reset()
+            streamer, cancel_criteria = self._new_transformers_streaming_state()
             generate_kwargs = {
                 **inputs,
                 "max_new_tokens": self.gen_kwargs.get("max_new_tokens", 1024),
-                "streamer": self.streamer,
-                "stopping_criteria": StoppingCriteriaList([self._cancel_criteria]),
+                "streamer": streamer,
+                "stopping_criteria": StoppingCriteriaList([cancel_criteria]),
             }
             lock = self._transformers_lock
 
@@ -984,10 +1027,9 @@ class VisionLanguageModelHandler(BaseLanguageModelHandler):
                 with lock:
                     self.model.generate(**generate_kwargs)  # type: ignore[union-attr,operator]
 
-            thread = Thread(target=_locked_generate)
-            thread.start()
-            yield from self._stream_tokens(self.streamer, gen, language_code, ctx, runtime_config, response)
-            self._finish_transformers_generation(thread)
+            thread = self._start_transformers_generation(_locked_generate)
+            yield from self._stream_tokens(streamer, gen, language_code, ctx, runtime_config, response)
+            self._finish_transformers_generation(thread, streamer, cancel_criteria)
             if self.device == "mps":
                 torch.mps.empty_cache()
 

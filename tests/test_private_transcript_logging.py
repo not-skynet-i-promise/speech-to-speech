@@ -2,7 +2,7 @@
 
 import logging
 from collections.abc import Iterator
-from queue import Queue
+from queue import Empty, Queue
 from threading import Event, Thread
 
 import numpy as np
@@ -14,7 +14,11 @@ from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.api.openai_realtime.service import RealtimeService
 from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.LLM.chat import Chat, make_assistant_message, make_user_message
-from speech_to_speech.LLM.language_model import BaseLanguageModelHandler, StreamContext
+from speech_to_speech.LLM.language_model import (
+    BaseLanguageModelHandler,
+    StreamContext,
+    _CancelCriteria,
+)
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.messages import (
     PIPELINE_END,
@@ -405,3 +409,55 @@ def test_local_llm_drops_request_cancelled_before_dequeue():
     handler.cancel_scope.cancel()
 
     assert list(handler.process(request)) == [EndOfResponse(cancel_generation=0)]
+
+
+class _ImmediateTimeoutStreamer:
+    def __iter__(self):
+        raise Empty
+
+
+def test_transformers_worker_outliving_join_keeps_private_activation_blocked(monkeypatch):
+    handler = object.__new__(_NeverCalledLanguageModelHandler)
+    handler.cancel_scope = CancelScope()
+    worker_started = Event()
+    release_worker = Event()
+
+    def blocked_worker() -> None:
+        worker_started.set()
+        assert release_worker.wait(timeout=2.0)
+
+    with handler.cancel_scope.response_admission(0) as (admitted, _generation):
+        assert admitted is True
+        worker = handler._start_transformers_generation(blocked_worker)
+        assert worker_started.wait(timeout=1.0)
+        real_join = worker.join
+        monkeypatch.setattr(worker, "join", lambda timeout=None: real_join(timeout=0.01))
+        handler._finish_transformers_generation(
+            worker,
+            _ImmediateTimeoutStreamer(),
+            _CancelCriteria(),
+        )
+        assert worker.is_alive()
+
+    with handler.cancel_scope.private_activation_guard() as quiescent:
+        assert quiescent is False
+
+    release_worker.set()
+    real_join(timeout=1.0)
+    assert not worker.is_alive()
+    with handler.cancel_scope.private_activation_guard() as quiescent:
+        assert quiescent is True
+
+
+def test_transformers_generations_use_isolated_streamers_and_cancel_criteria():
+    handler = object.__new__(_NeverCalledLanguageModelHandler)
+    handler.tokenizer = object()
+
+    first_streamer, first_criteria = handler._new_transformers_streaming_state()
+    second_streamer, second_criteria = handler._new_transformers_streaming_state()
+    first_criteria.cancel()
+
+    assert first_streamer is not second_streamer
+    assert first_criteria is not second_criteria
+    assert first_criteria(None, None) is True
+    assert second_criteria(None, None) is False
