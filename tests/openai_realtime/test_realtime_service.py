@@ -345,6 +345,80 @@ class TestHandleSessionUpdate:
         assert runtime_config.transcript_barrier_enabled is True
         assert runtime_config.transcript_barrier_operational is False
 
+    def test_barrier_ready_waits_for_cancelled_provider_content_guard(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+        text_prompt_queue,
+    ):
+        created = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(type="response.create", response={"conversation": "none"}),
+        )
+        assert isinstance(created, ResponseCreatedEvent)
+        request = text_prompt_queue.get(timeout=1.0)
+        assert isinstance(request, GenerateResponseRequest)
+
+        provider_entered = Event()
+        release_provider = Event()
+        provider_finished = Event()
+        ordering: list[str] = []
+
+        def cancelled_provider_log() -> None:
+            with request.runtime_config.transcript_barrier_content_guard() as private_content:
+                assert private_content is False
+                provider_entered.set()
+                assert release_provider.wait(timeout=1.0)
+                ordering.append("ordinary_provider_log")
+            provider_finished.set()
+
+        provider_thread = Thread(target=cancelled_provider_log)
+        provider_thread.start()
+        assert provider_entered.wait(timeout=1.0)
+
+        cancelled = service.handle_response_cancel(conn_id)
+        assert any(isinstance(event, ResponseDoneEvent) for event in cancelled)
+        state = service._state(conn_id)
+        assert state.in_response is False
+        assert state.response_pending is False
+        assert state.current_item_id is None
+        assert state.last_item_id is None
+        assert runtime_config.chat.buffer == []
+
+        activation_returned = Event()
+        activation_result: list[object] = []
+
+        def activate_barrier() -> None:
+            activation_result.append(
+                service.handle_session_update(
+                    conn_id,
+                    self._make_update(
+                        reachy_private_transcript_barrier={"version": 1, "nonce": "cd" * 32},
+                    ),
+                )
+            )
+            ordering.append("ready")
+            activation_returned.set()
+
+        activation_thread = Thread(target=activate_barrier)
+        activation_thread.start()
+        assert not activation_returned.wait(timeout=0.05)
+        assert runtime_config.transcript_barrier_enabled is False
+
+        release_provider.set()
+        provider_thread.join(timeout=1.0)
+        activation_thread.join(timeout=1.0)
+
+        assert not provider_thread.is_alive()
+        assert not activation_thread.is_alive()
+        assert provider_finished.is_set()
+        assert activation_returned.is_set()
+        assert ordering == ["ordinary_provider_log", "ready"]
+        assert len(activation_result) == 1
+        assert isinstance(activation_result[0], TranscriptBarrierReadyEvent)
+        assert runtime_config.transcript_barrier_private is True
+
     def test_private_transcript_barrier_must_be_in_first_session_update(
         self,
         service,
