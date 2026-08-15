@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from queue import Empty, Queue
 from threading import Event as ThreadingEvent
@@ -21,7 +21,10 @@ from starlette.websockets import WebSocketState
 
 from speech_to_speech.api.openai_realtime.pipeline_unit import PipelineUnit, SessionState
 from speech_to_speech.api.openai_realtime.service import ServerEvent, build_error_event
-from speech_to_speech.api.openai_realtime.transcript_barrier import TranscriptBarrierResolveEvent
+from speech_to_speech.api.openai_realtime.transcript_barrier import (
+    TRANSCRIPT_BARRIER_FIELD,
+    TranscriptBarrierResolveEvent,
+)
 from speech_to_speech.pipeline.control import SESSION_END, PipelineControlMessage, is_control_message
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
@@ -45,6 +48,22 @@ MAX_AUDIO_BATCH_BYTES = 6400
 # real handler chain.
 SESSION_END_DRAIN_TIMEOUT_S = 10.0
 QItem = TypeVar("QItem")
+_PRIVATE_WEBSOCKET_SCOPE_KEY = "reachy_private_content"
+
+
+def _requests_private_transcript_barrier(raw: object) -> bool:
+    if not isinstance(raw, Mapping) or raw.get("type") != "session.update":
+        return False
+    session = raw.get("session")
+    return isinstance(session, Mapping) and TRANSCRIPT_BARRIER_FIELD in session
+
+
+def _mark_websocket_private(ws: WebSocket) -> None:
+    ws.scope[_PRIVATE_WEBSOCKET_SCOPE_KEY] = True
+
+
+def _websocket_is_private(ws: WebSocket | None) -> bool:
+    return bool(ws is not None and ws.scope.get(_PRIVATE_WEBSOCKET_SCOPE_KEY) is True)
 
 
 async def _send_event(ws: WebSocket, event: ServerEvent) -> None:
@@ -61,13 +80,19 @@ async def _send_event(ws: WebSocket, event: ServerEvent) -> None:
         # Race: ws closed between the state check above and the send. Starlette
         # raises a plain RuntimeError("Unexpected ASGI message 'websocket.send'
         # after sending 'websocket.close' ...") — harmless during shutdown.
+        if _websocket_is_private(ws):
+            logger.error("Failed to send private event to client; content redacted")
+            return
         msg = str(e)
         if "websocket.close" in msg or "websocket.disconnect" in msg or "response already completed" in msg:
             logger.debug(f"Skipped event: ws already closed ({msg})")
         else:
             logger.error(f"Failed to send event to client: {e}")
     except Exception as e:  # noqa: BLE001
-        logger.error(f"Failed to send event to client: {e}")
+        if _websocket_is_private(ws):
+            logger.error("Failed to send private event to client; content redacted")
+        else:
+            logger.error(f"Failed to send event to client: {e}")
 
 
 async def _send_events(ws: WebSocket, events: list[ServerEvent]) -> None:
@@ -339,12 +364,25 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                 except asyncio.TimeoutError:
                     continue
 
-                redact_private_content = unit.service.transcript_barrier_enabled()
+                activation_requested = _requests_private_transcript_barrier(raw)
+                if activation_requested:
+                    _mark_websocket_private(ws)
+                redact_private_content = _websocket_is_private(ws) or unit.service.transcript_barrier_enabled()
                 event = unit.service.parse_client_event(
                     raw,
                     redact_private_content=redact_private_content,
                 )
                 if event is None:
+                    if activation_requested:
+                        await _send_event(
+                            ws,
+                            unit.service.poison_transcript_barrier(
+                                session_id,
+                                "invalid_transcript_barrier",
+                            ),
+                        )
+                        await ws.close(code=1008, reason="Private transcript barrier negotiation failed")
+                        return
                     if raw.get("type") == "reachy.transcript_barrier.resolve":
                         await _send_event(
                             ws,
@@ -432,7 +470,13 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
         except WebSocketDisconnect:
             logger.info(f"Client {session_id} disconnected from pipeline {unit.index}")
         except Exception as e:
-            logger.error(f"Client {session_id} on pipeline {unit.index} error: {type(e).__name__}: {e}", exc_info=True)
+            if _websocket_is_private(ws) or unit.service.transcript_barrier_enabled():
+                logger.error("Private client pipeline error; content redacted")
+            else:
+                logger.error(
+                    f"Client {session_id} on pipeline {unit.index} error: {type(e).__name__}: {e}",
+                    exc_info=True,
+                )
         finally:
             # Hold the session reference: the send loop's snapshot will still resolve
             # to this object until we clear unit.session, so any handler output that
@@ -653,7 +697,14 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Pipeline {unit.index} send loop error: {e}")
+                session = unit.session
+                ws = session.websocket if session is not None else None
+                if _websocket_is_private(ws) or (
+                    session is not None and session.session_id is not None and unit.service.transcript_barrier_enabled()
+                ):
+                    logger.error("Private pipeline send loop error; content redacted")
+                else:
+                    logger.error(f"Pipeline {unit.index} send loop error: {e}")
                 await asyncio.sleep(0.1)
 
     return app

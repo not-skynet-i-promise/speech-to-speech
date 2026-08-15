@@ -406,6 +406,23 @@ def test_apply_session_voice_override_accepts_supported_custom_voice_speaker():
     assert handler.speaker == "vivian"
 
 
+def test_apply_session_voice_override_redacts_private_invalid_value(caplog):
+    handler = object.__new__(Qwen3TTSHandler)
+    canary = "PRIVATE_QWEN_VOICE_CANARY"
+    fake_cfg = SimpleNamespace(
+        session=SimpleNamespace(audio=SimpleNamespace(output=SimpleNamespace(voice=canary))),
+        transcript_barrier_enabled=True,
+    )
+    handler.ref_audio = "TTS/ref_audio.wav"
+    handler.speaker = None
+
+    with caplog.at_level("WARNING"):
+        handler._apply_session_voice_override("base", runtime_config=fake_cfg)
+
+    assert canary not in caplog.text
+    assert "private Qwen3-TTS voice override; content redacted" in caplog.text
+
+
 def test_process_only_reenables_listening_after_end_of_response(monkeypatch):
     handler = object.__new__(Qwen3TTSHandler)
     handler.should_listen = Event()

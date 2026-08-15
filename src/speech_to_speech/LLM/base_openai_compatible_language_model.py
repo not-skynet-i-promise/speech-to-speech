@@ -221,23 +221,44 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         ...
 
     @abstractmethod
-    def _iter_stream_events(self, api_response: Any) -> Iterator[ProviderEvent]:
+    def _iter_stream_events(
+        self,
+        api_response: Any,
+        *,
+        redact_private_content: bool = False,
+    ) -> Iterator[ProviderEvent]:
         """Map a streaming response to normalised :data:`ProviderEvent`s."""
         ...
 
     @abstractmethod
-    def _iter_response_events(self, api_response: Any) -> Iterator[ProviderEvent]:
+    def _iter_response_events(
+        self,
+        api_response: Any,
+        *,
+        redact_private_content: bool = False,
+    ) -> Iterator[ProviderEvent]:
         """Map a non-streaming response to normalised :data:`ProviderEvent`s."""
         ...
 
-    def _iter_events(self, api_response: Any) -> Iterator[ProviderEvent]:
+    def _iter_events(
+        self,
+        api_response: Any,
+        *,
+        redact_private_content: bool = False,
+    ) -> Iterator[ProviderEvent]:
         """Dispatch to the stream/non-stream mapper. ``self.stream`` is the single
         source of truth (it set the request's ``stream=`` flag), so the response
         type always matches it."""
         if self.stream:
-            yield from self._iter_stream_events(api_response)
+            yield from self._iter_stream_events(
+                api_response,
+                redact_private_content=redact_private_content,
+            )
         else:
-            yield from self._iter_response_events(api_response)
+            yield from self._iter_response_events(
+                api_response,
+                redact_private_content=redact_private_content,
+            )
 
     @abstractmethod
     def _build_optional_kwargs(self, req_tools: Any, req_tool_choice: Any) -> dict[str, Any]:
@@ -491,7 +512,10 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             if error_message is None:
                 api_response = self._request(api_input, optional_kwargs)
             if api_response is not None:
-                events = self._iter_events(api_response)
+                events = self._iter_events(
+                    api_response,
+                    redact_private_content=turn.runtime_config.transcript_barrier_enabled,
+                )
                 if self.stream:
                     yield from self._consume_streaming(events, state, turn)
                 else:

@@ -123,18 +123,22 @@ server then inserts that one message and acknowledges it as
 history entry. Empty or whitespace-only STT results produce a content-free
 `reachy.transcript_barrier.discarded` event and require no resolution.
 
-Malformed, duplicate, overlapping, stale, or mismatched barrier events poison
-the session and close the WebSocket. Pending transcript text is scrubbed on
-resolution, failure, and synchronously at disconnect before handler drain.
+Any first `session.update` that contains the barrier field is privacy-sensitive
+even if another field makes the update invalid: it is logged content-free,
+poisons the barrier, and closes before audio is accepted. Malformed, duplicate,
+overlapping, stale, or mismatched later barrier events do the same. Pending
+transcript text is scrubbed on resolution, failure, and synchronously at
+disconnect before handler drain.
 Pending private input also freezes deferred history application and chat
 compaction until exact resolution. Privacy-mode exception and content logging
 remains sticky after poison until the session is unregistered, so draining work
 cannot downgrade into ordinary logging. Parse-time and semantic client-event
 failures use content-free wire errors rather than echoing client-controlled
 values while that mode is active. Rejected multi-item in-band `response.input`
-batches retain no accepted prefix in history, and low-level tool-parser/session
-logs use the same sticky redaction boundary. Clients that do not request this
-extension keep the standard Realtime behavior described above.
+batches retain no accepted prefix in history. Low-level tool-parser, provider,
+session-voice, WebSocket-route, and send-loop failures use the same sticky
+redaction boundary. Clients that do not request this extension keep the
+standard Realtime behavior described above.
 
 ---
 

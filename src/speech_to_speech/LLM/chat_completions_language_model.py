@@ -203,7 +203,12 @@ class ChatCompletionsApiModelHandler(BaseOpenAICompatibleHandler):
             **create_kwargs,
         )
 
-    def _iter_stream_events(self, api_response: Stream[ChatCompletionChunk]) -> Iterator[ProviderEvent]:
+    def _iter_stream_events(
+        self,
+        api_response: Stream[ChatCompletionChunk],
+        *,
+        redact_private_content: bool = False,
+    ) -> Iterator[ProviderEvent]:
         # Accumulate streamed tool-call deltas, keyed by their stream index, and the
         # raw assistant text, then emit assistant message + tool calls + usage once
         # the stream is exhausted.
@@ -242,7 +247,12 @@ class ChatCompletionsApiModelHandler(BaseOpenAICompatibleHandler):
         if usage is not None:
             yield usage
 
-    def _iter_response_events(self, api_response: Any) -> Iterator[ProviderEvent]:
+    def _iter_response_events(
+        self,
+        api_response: Any,
+        *,
+        redact_private_content: bool = False,
+    ) -> Iterator[ProviderEvent]:
         usage = api_response.usage
         if usage:
             yield Usage(input_tokens=usage.prompt_tokens or 0, output_tokens=usage.completion_tokens or 0)

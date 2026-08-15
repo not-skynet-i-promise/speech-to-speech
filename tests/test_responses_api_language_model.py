@@ -365,6 +365,36 @@ def test_responses_api_timing_logs_only_text_chunks():
     assert not handler.should_log_timing(EndOfResponse())
 
 
+def test_private_unsupported_response_item_type_is_redacted(caplog):
+    handler = _make_handler(stream=False)
+    canary = "PRIVATE_RESPONSES_ITEM_TYPE_CANARY"
+    request = _make_request("private request")
+    request.runtime_config.transcript_barrier_version = 1
+    request.runtime_config.transcript_barrier_nonce = "ab" * 32
+    handler.client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **_kwargs: _make_response([SimpleNamespace(type=canary)]))
+    )
+
+    with caplog.at_level(logging.WARNING):
+        list(handler.process(request))
+
+    assert canary not in caplog.text
+    assert "Unsupported private response item; content redacted" in caplog.text
+
+
+def test_ordinary_unsupported_response_item_type_retains_diagnostics(caplog):
+    handler = _make_handler(stream=False)
+    canary = "ORDINARY_RESPONSES_ITEM_TYPE_CANARY"
+    handler.client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **_kwargs: _make_response([SimpleNamespace(type=canary)]))
+    )
+
+    with caplog.at_level(logging.WARNING):
+        list(handler.process(_make_request()))
+
+    assert canary in caplog.text
+
+
 def test_process_read_timeout_ends_response_cleanly():
     handler = _make_handler()
 
