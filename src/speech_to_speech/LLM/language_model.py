@@ -4,6 +4,7 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator, Sized
 from contextlib import nullcontext
+from dataclasses import dataclass
 from queue import Empty
 from threading import Lock, Thread
 from typing import Any, Literal, Optional, Protocol, runtime_checkable
@@ -118,6 +119,13 @@ class _CancelCriteria(StoppingCriteria):
 
     def __call__(self, input_ids: Any, scores: Any, **kwargs: Any) -> bool:
         return self._cancelled
+
+
+@dataclass
+class _TransformersWorkerState:
+    """Content-free completion state shared with one local generation worker."""
+
+    failed: bool = False
 
 
 class StreamContext(BaseModel):
@@ -243,27 +251,55 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         """Close the MLX generator to release resources immediately."""
         token_iter.close()
 
-    def _start_transformers_generation(self, target: Callable[[], None]) -> Thread:
-        """Start a worker whose activation lease lasts through actual thread exit."""
+    def _start_transformers_generation(
+        self,
+        target: Callable[[], None],
+        streamer: TextIteratorStreamer,
+        runtime_config: RuntimeConfig | None,
+    ) -> tuple[Thread, _TransformersWorkerState]:
+        """Start a redacted worker whose activation lease lasts through thread exit."""
         cancel_scope = self.cancel_scope
+        state = _TransformersWorkerState()
         if cancel_scope is not None:
             cancel_scope.response_worker_started()
 
         def run() -> None:
             try:
                 target()
+            except BaseException:
+                # Without this boundary the default threading excepthook writes
+                # the raw exception and traceback to stderr. Serialize the
+                # decision and log with sticky session privacy, retain no
+                # exception object, and wake this generation's consumer.
+                state.failed = True
+                guard = (
+                    runtime_config.transcript_barrier_content_guard()
+                    if runtime_config is not None
+                    else nullcontext(False)
+                )
+                with guard as private_content:
+                    if private_content:
+                        logger.error("Local Transformers generation worker failed; private content redacted")
+                    else:
+                        logger.exception("Local Transformers generation worker failed")
+                try:
+                    streamer.end()
+                except BaseException:
+                    # The content-free state remains authoritative; cleanup must
+                    # never escape to threading.excepthook either.
+                    pass
             finally:
                 if cancel_scope is not None:
                     cancel_scope.response_worker_done()
 
-        thread = Thread(target=run)
         try:
+            thread = Thread(target=run)
             thread.start()
         except BaseException:
             if cancel_scope is not None:
                 cancel_scope.response_worker_done()
             raise
-        return thread
+        return thread, state
 
     def _new_transformers_streaming_state(self) -> tuple[TextIteratorStreamer, _CancelCriteria]:
         """Return per-generation channels that cannot receive an older worker's tokens."""
@@ -282,6 +318,7 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         thread: Thread,
         streamer: Iterable[str],
         cancel_criteria: _CancelCriteria,
+        worker_state: _TransformersWorkerState,
     ) -> None:
         """Signal the stopping criteria, drain the streamer, and join the thread."""
         cancel_criteria.cancel()
@@ -291,6 +328,8 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         except Empty:
             pass
         thread.join(timeout=5.0)
+        if worker_state.failed:
+            raise RuntimeError("Local Transformers generation worker failed")
 
     # ------------------------------------------------------------------
     # Shared helpers
@@ -846,9 +885,9 @@ class LanguageModelHandler(BaseLanguageModelHandler):
                 with lock:
                     self.pipe(chat_prompt, **generation_kwargs)
 
-            thread = self._start_transformers_generation(_locked_pipe)
+            thread, worker_state = self._start_transformers_generation(_locked_pipe, streamer, runtime_config)
             yield from self._stream_tokens(streamer, gen, language_code, ctx, runtime_config, response)
-            self._finish_transformers_generation(thread, streamer, cancel_criteria)
+            self._finish_transformers_generation(thread, streamer, cancel_criteria, worker_state)
             if self.device == "mps":
                 torch.mps.empty_cache()
 
@@ -1027,9 +1066,9 @@ class VisionLanguageModelHandler(BaseLanguageModelHandler):
                 with lock:
                     self.model.generate(**generate_kwargs)  # type: ignore[union-attr,operator]
 
-            thread = self._start_transformers_generation(_locked_generate)
+            thread, worker_state = self._start_transformers_generation(_locked_generate, streamer, runtime_config)
             yield from self._stream_tokens(streamer, gen, language_code, ctx, runtime_config, response)
-            self._finish_transformers_generation(thread, streamer, cancel_criteria)
+            self._finish_transformers_generation(thread, streamer, cancel_criteria, worker_state)
             if self.device == "mps":
                 torch.mps.empty_cache()
 

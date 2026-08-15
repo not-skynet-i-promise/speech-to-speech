@@ -6,6 +6,7 @@ from queue import Empty, Queue
 from threading import Event, Thread
 
 import numpy as np
+import pytest
 from openai.types.realtime import RealtimeSessionCreateRequest
 from openai.types.responses import ResponseFunctionToolCall
 
@@ -412,6 +413,12 @@ def test_local_llm_drops_request_cancelled_before_dequeue():
 
 
 class _ImmediateTimeoutStreamer:
+    def __init__(self):
+        self.ended = False
+
+    def end(self):
+        self.ended = True
+
     def __iter__(self):
         raise Empty
 
@@ -428,14 +435,16 @@ def test_transformers_worker_outliving_join_keeps_private_activation_blocked(mon
 
     with handler.cancel_scope.response_admission(0) as (admitted, _generation):
         assert admitted is True
-        worker = handler._start_transformers_generation(blocked_worker)
+        streamer = _ImmediateTimeoutStreamer()
+        worker, worker_state = handler._start_transformers_generation(blocked_worker, streamer, _private_config())
         assert worker_started.wait(timeout=1.0)
         real_join = worker.join
         monkeypatch.setattr(worker, "join", lambda timeout=None: real_join(timeout=0.01))
         handler._finish_transformers_generation(
             worker,
-            _ImmediateTimeoutStreamer(),
+            streamer,
             _CancelCriteria(),
+            worker_state,
         )
         assert worker.is_alive()
 
@@ -461,3 +470,47 @@ def test_transformers_generations_use_isolated_streamers_and_cancel_criteria():
     assert first_criteria is not second_criteria
     assert first_criteria(None, None) is True
     assert second_criteria(None, None) is False
+
+
+def test_private_transformers_worker_exception_is_redacted_and_unblocks_streamer(caplog, capsys):
+    canary = "PRIVATE_LOCAL_TRANSFORMERS_WORKER_EXCEPTION_CANARY"
+    handler = object.__new__(_NeverCalledLanguageModelHandler)
+    handler.cancel_scope = CancelScope()
+    streamer = _ImmediateTimeoutStreamer()
+
+    def explode() -> None:
+        raise RuntimeError(canary)
+
+    caplog.set_level(logging.DEBUG)
+    worker, worker_state = handler._start_transformers_generation(explode, streamer, _private_config())
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert worker_state.failed is True
+    assert streamer.ended is True
+    assert canary not in caplog.text
+    assert canary not in capsys.readouterr().err
+    assert "private content redacted" in caplog.text
+    with pytest.raises(RuntimeError, match="^Local Transformers generation worker failed$"):
+        handler._finish_transformers_generation(worker, streamer, _CancelCriteria(), worker_state)
+    with handler.cancel_scope.private_activation_guard() as quiescent:
+        assert quiescent is True
+
+
+def test_transformers_thread_constructor_failure_releases_activation_lease(monkeypatch):
+    handler = object.__new__(_NeverCalledLanguageModelHandler)
+    handler.cancel_scope = CancelScope()
+
+    def fail_constructor(*_args, **_kwargs):
+        raise RuntimeError("thread construction failed")
+
+    monkeypatch.setattr("speech_to_speech.LLM.language_model.Thread", fail_constructor)
+    with pytest.raises(RuntimeError, match="^thread construction failed$"):
+        handler._start_transformers_generation(
+            lambda: None,
+            _ImmediateTimeoutStreamer(),
+            _private_config(),
+        )
+
+    with handler.cancel_scope.private_activation_guard() as quiescent:
+        assert quiescent is True
