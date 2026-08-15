@@ -199,6 +199,24 @@ class TestParseClientEvent:
         assert canary not in caplog.text
         assert "Invalid private transcript barrier resolution payload" in caplog.text
 
+    def test_private_mode_redacts_all_invalid_client_event_content(self, service, caplog):
+        canary = "PII_JOSH_PRIVATE_CLIENT_EVENT"
+        raw = {
+            "type": "conversation.item.create",
+            "item": {
+                "id": canary,
+                "type": "message",
+                "role": "invalid",
+                "content": [{"type": "input_text", "text": canary}],
+            },
+        }
+
+        with caplog.at_level(logging.ERROR):
+            assert service.parse_client_event(raw, redact_private_content=True) is None
+
+        assert canary not in caplog.text
+        assert "Invalid private client event payload; content redacted" in caplog.text
+
     @pytest.mark.parametrize(
         "mutation",
         [
@@ -2291,6 +2309,24 @@ class TestDispatchPipelineEvent:
             ResponseFailedEvent(message="too late"),
         )
         assert events == []
+
+    def test_private_response_failure_redacts_pipeline_error(self, service, conn_id, caplog):
+        canary = "PRIVATE_PIPELINE_FAILURE_CANARY"
+        state = service._state(conn_id)
+        state.runtime_config.transcript_barrier_version = 1
+        state.runtime_config.transcript_barrier_nonce = "ab" * 32
+        service.response._ensure_response(conn_id)
+
+        with caplog.at_level(logging.INFO):
+            events = service.dispatch_pipeline_event(
+                conn_id,
+                ResponseFailedEvent(message=canary),
+            )
+
+        error = events[0]
+        assert isinstance(error, RealtimeErrorEvent)
+        assert error.error.message == "Private response failed."
+        assert canary not in caplog.text
 
     # -- unknown --
 

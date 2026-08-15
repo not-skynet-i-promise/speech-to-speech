@@ -290,23 +290,36 @@ class RealtimeService:
     def _next_event_id() -> str:
         return _generate_id("event")
 
-    def parse_client_event(self, raw: Mapping[str, object]) -> Optional[ClientEvent]:
+    def parse_client_event(
+        self,
+        raw: Mapping[str, object],
+        *,
+        redact_private_content: bool = False,
+    ) -> Optional[ClientEvent]:
         raw_type = raw.get("type")
         event_type: Optional[str] = raw_type if isinstance(raw_type, str) else None
         if event_type is None:
-            logger.warning("Client event missing 'type' field")
+            if redact_private_content:
+                logger.warning("Private client event missing type; content redacted")
+            else:
+                logger.warning("Client event missing 'type' field")
             return None
         model_cls = _EVENT_TYPE_TO_MODEL.get(event_type)
         if model_cls is None:
-            logger.warning(f"Unknown client event type: {event_type}")
+            if redact_private_content:
+                logger.warning("Unknown private client event type; content redacted")
+            else:
+                logger.warning("Unknown client event type: %s", event_type)
             return None
         try:
             return model_cls.model_validate(raw)  # type: ignore[return-value]
         except ValidationError as e:
             if event_type == "reachy.transcript_barrier.resolve":
                 logger.error("Invalid private transcript barrier resolution payload")
+            elif redact_private_content:
+                logger.error("Invalid private client event payload; content redacted")
             else:
-                logger.error(f"Invalid {event_type} payload: {e}")
+                logger.error("Invalid %s payload: %s", event_type, e)
             return None
 
     # ── Client event handlers ────────────────────
@@ -736,10 +749,17 @@ class RealtimeService:
         a no-op once the slot is closed, so a later EndOfResponse-driven close does
         nothing.
         """
-        logger.info("Response failed: %s", event.message)
-        if not self._state(conn_id).in_response:
+        state = self._state(conn_id)
+        private_barrier = state.runtime_config.transcript_barrier_enabled
+        if private_barrier:
+            message = "Private response failed."
+            logger.info("Private response failed; content redacted")
+        else:
+            message = event.message
+            logger.info("Response failed: %s", message)
+        if not state.in_response:
             return []
-        events: list[ServerEvent] = [self.make_error(event.message, "response_failed")]
+        events: list[ServerEvent] = [self.make_error(message, "response_failed")]
         events.extend(self.response.finish_response(conn_id, status="failed"))
         return events
 

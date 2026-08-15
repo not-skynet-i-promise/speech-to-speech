@@ -536,8 +536,17 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             try:
                 active_chat = build_active_chat(original_chat, response)
             except ChatItemError as exc:
-                logger.info("Out-of-band response rejected: %s", exc)
-                yield EndOfResponse(turn_id=ctx.turn_id, turn_revision=ctx.turn_revision, error=str(exc))
+                if runtime_config.transcript_barrier_enabled:
+                    error_message = "Private out-of-band response rejected."
+                    logger.info("Out-of-band response rejected; private content redacted")
+                else:
+                    error_message = str(exc)
+                    logger.info("Out-of-band response rejected: %s", error_message)
+                yield EndOfResponse(
+                    turn_id=ctx.turn_id,
+                    turn_revision=ctx.turn_revision,
+                    error=error_message,
+                )
                 return
         else:
             active_chat = original_chat.copy()

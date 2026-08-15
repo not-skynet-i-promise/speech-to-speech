@@ -8,6 +8,7 @@ old tests) so there is no cross-test state.
 
 import asyncio
 import base64
+import logging
 import time
 from queue import Empty, Queue
 from threading import Event as ThreadingEvent
@@ -255,6 +256,43 @@ class TestClientEventDispatch:
                 assert error["error"]["type"] == "invalid_transcript_barrier"
                 cid = service.connection_ids[0]
                 assert service.transcript_barrier_failed(cid) is True
+
+    def test_private_handshake_redacts_malformed_client_event_on_wire(self, setup, caplog):
+        app, _service, *_ = setup
+        nonce = "ce" * 32
+        canary = "PII_JOSH"
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "realtime",
+                            "reachy_private_transcript_barrier": {"version": 1, "nonce": nonce},
+                        },
+                    }
+                )
+                assert ws.receive_json()["type"] == "reachy.transcript_barrier.ready"
+
+                with caplog.at_level(logging.ERROR):
+                    ws.send_json(
+                        {
+                            "type": "conversation.item.create",
+                            "item": {
+                                "id": canary,
+                                "type": "message",
+                                "role": "invalid",
+                                "content": [{"type": "input_text", "text": canary}],
+                            },
+                        }
+                    )
+                    error = ws.receive_json()
+
+        assert error["type"] == "error"
+        assert error["error"]["message"] == "Unknown or invalid private client event."
+        assert canary not in str(error)
+        assert canary not in caplog.text
 
     def test_private_transcript_barrier_exact_resolution_round_trip(self, setup):
         app, service, _, _, text_output_queue, *_ = setup

@@ -339,7 +339,11 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                 except asyncio.TimeoutError:
                     continue
 
-                event = unit.service.parse_client_event(raw)
+                redact_private_content = unit.service.transcript_barrier_enabled()
+                event = unit.service.parse_client_event(
+                    raw,
+                    redact_private_content=redact_private_content,
+                )
                 if event is None:
                     if raw.get("type") == "reachy.transcript_barrier.resolve":
                         await _send_event(
@@ -351,12 +355,12 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                         )
                         await ws.close(code=1008, reason="Private transcript barrier resolution failed")
                         return
-                    await _send_event(
-                        ws,
-                        unit.service.make_error(
-                            f"Unknown or invalid event: {raw.get('type')}", "unknown_or_invalid_event"
-                        ),
+                    message = (
+                        "Unknown or invalid private client event."
+                        if redact_private_content
+                        else f"Unknown or invalid event: {raw.get('type')}"
                     )
+                    await _send_event(ws, unit.service.make_error(message, "unknown_or_invalid_event"))
                     continue
 
                 if isinstance(event, InputAudioBufferAppendEvent):

@@ -622,3 +622,24 @@ def test_out_of_band_invalid_input_emits_failed_end_of_response():
     assert len(outputs) == 1
     assert isinstance(outputs[0], EndOfResponse)
     assert outputs[0].error is not None
+
+
+def test_private_out_of_band_validation_error_is_content_free(caplog):
+    handler = _make_handler()
+    canary = "PRIVATE_OOB_RESPONSES_EXCEPTION_CANARY"
+    orphan = RealtimeConversationItemFunctionCallOutput(
+        type="function_call_output",
+        call_id=canary,
+        output="{}",
+    )
+    req, cfg = _make_oob_request([orphan])
+    cfg.transcript_barrier_version = 1
+    cfg.transcript_barrier_nonce = "ab" * 32
+
+    with caplog.at_level(logging.INFO):
+        outputs = list(handler.process(req))
+
+    assert len(outputs) == 1
+    assert isinstance(outputs[0], EndOfResponse)
+    assert outputs[0].error == "Private out-of-band response rejected."
+    assert canary not in caplog.text

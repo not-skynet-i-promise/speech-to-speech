@@ -601,6 +601,28 @@ def test_out_of_band_does_not_commit_to_default_conversation():
     assert not any(getattr(i, "role", None) == "assistant" for i in chat.buffer)
 
 
+def test_private_out_of_band_validation_error_is_content_free(caplog):
+    handler = _make_handler(stream=True)
+    canary = "PRIVATE_OOB_LLM_EXCEPTION_CANARY"
+    orphan = RealtimeConversationItemFunctionCallOutput(
+        type="function_call_output",
+        call_id=canary,
+        output="{}",
+    )
+    response = RealtimeResponseCreateParams(conversation="none", input=[orphan])
+
+    with caplog.at_level(logging.INFO):
+        _text, _tools, _usage, _chat, end = _drive(
+            handler,
+            response=response,
+            private_barrier=True,
+        )
+
+    assert end is not None
+    assert end.error == "Private out-of-band response rejected."
+    assert canary not in caplog.text
+
+
 # ── Standalone runner (no pytest required) ────────────────────────────────────
 
 if __name__ == "__main__":
