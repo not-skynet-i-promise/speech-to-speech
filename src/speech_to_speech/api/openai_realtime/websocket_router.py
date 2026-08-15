@@ -424,6 +424,23 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
 
                 elif isinstance(event, SessionUpdateEvent):
                     result = unit.service.handle_session_update(session_id, event)
+                    if activation_requested and (
+                        result is None
+                        or result.type != "reachy.transcript_barrier.ready"
+                        or not unit.service.transcript_barrier_enabled()
+                    ):
+                        await _send_event(
+                            ws,
+                            unit.service.poison_transcript_barrier(
+                                session_id,
+                                "invalid_transcript_barrier",
+                            ),
+                        )
+                        await ws.close(
+                            code=1008,
+                            reason="Private transcript barrier negotiation failed",
+                        )
+                        return
                     if result:
                         await _send_event(ws, result)
                     if unit.service.transcript_barrier_failed(session_id):

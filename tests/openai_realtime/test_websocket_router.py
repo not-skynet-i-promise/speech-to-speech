@@ -311,6 +311,41 @@ class TestClientEventDispatch:
         assert canary not in caplog.text
         assert not any(isinstance(item, tuple) for item in tuple(input_queue.queue))
 
+    def test_private_activation_cannot_return_before_ready_and_admit_later_audio(
+        self,
+        setup,
+        caplog,
+    ):
+        app, service, input_queue, *_ = setup
+        canary = "PRIVATE_TRANSCRIPTION_ACTIVATION_MODEL_CANARY"
+        with caplog.at_level(logging.INFO):
+            with TestClient(app) as client:
+                with client.websocket_connect("/v1/realtime") as ws:
+                    ws.receive_json()
+                    ws.send_json(
+                        {
+                            "type": "session.update",
+                            "session": {
+                                "type": "transcription",
+                                "model": canary,
+                                "reachy_private_transcript_barrier": {
+                                    "version": 1,
+                                    "nonce": "c4" * 32,
+                                },
+                            },
+                        }
+                    )
+                    error = ws.receive_json()
+                    conn_id = service.connection_ids[0]
+
+                    assert error["error"]["type"] == "invalid_transcript_barrier"
+                    assert error["error"]["message"] == ("Private transcript barrier protocol violation.")
+                    assert service.transcript_barrier_failed(conn_id)
+
+        assert canary not in caplog.text
+        assert canary not in str(error)
+        assert not any(isinstance(item, tuple) for item in tuple(input_queue.queue))
+
     def test_private_route_and_send_loop_exceptions_are_content_free(
         self,
         setup,
