@@ -574,6 +574,15 @@ def _build_realtime_pipeline_unit(
             h.set_transcript_barrier_failed(service.transcript_barrier_poisoned)
             h.set_transcript_barrier_state_guard(service.transcript_barrier_pipeline_state_guard)
 
+    cancellation_consumers = tuple(
+        getattr(handler, "cancel_scope") for handler in handlers if hasattr(handler, "cancel_scope")
+    )
+    if len(cancellation_consumers) < 2 or not service.verify_cancel_scope_wiring(
+        cancel_scope,
+        *cancellation_consumers,
+    ):
+        raise RuntimeError("Realtime cancellation consumers do not share one CancelScope")
+
     return PipelineUnit(
         index=index,
         service=service,

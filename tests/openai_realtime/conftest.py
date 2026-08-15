@@ -56,6 +56,7 @@ def service(runtime_config, text_prompt_queue, should_listen, cancel_scope):
         should_listen=should_listen,
         cancel_scope=cancel_scope,
     )
+    assert svc.verify_cancel_scope_wiring(cancel_scope, cancel_scope)
     return svc
 
 

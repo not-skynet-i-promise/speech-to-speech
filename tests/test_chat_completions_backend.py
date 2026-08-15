@@ -141,6 +141,7 @@ def test_cancelled_queued_request_cannot_start_after_private_barrier_ready():
     text_prompt_queue: queue.Queue = queue.Queue()
     cancel_scope = CancelScope()
     service = RealtimeService(text_prompt_queue=text_prompt_queue, cancel_scope=cancel_scope)
+    assert service.verify_cancel_scope_wiring(cancel_scope, cancel_scope)
     conn_id = service.register()
 
     created = service.handle_response_create(
@@ -173,6 +174,23 @@ def test_cancelled_queued_request_cannot_start_after_private_barrier_ready():
     assert handler.client.chat.completions.last_kwargs is None
     assert outputs == [EndOfResponse(cancel_generation=0)]
     service.unregister(conn_id)
+
+
+def test_cancel_scope_serializes_response_admission_cancel_and_private_activation():
+    scope = CancelScope()
+
+    with scope.response_admission(0) as (admitted, generation):
+        assert admitted is True
+        assert generation == 0
+        with scope.private_activation_guard() as quiescent:
+            assert quiescent is False
+        scope.cancel()
+
+    with scope.response_admission(0) as (admitted, generation):
+        assert admitted is False
+        assert generation == 0
+    with scope.private_activation_guard() as quiescent:
+        assert quiescent is True
 
 
 def _chunk(content=None, tool_calls=None, usage=None):

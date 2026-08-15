@@ -831,6 +831,16 @@ class TestCopyAndReset:
         chat.reset()
         assert chat.size == 3
 
+    def test_reset_can_atomically_enter_private_suspended_state(self):
+        chat = Chat(size=3)
+        chat.add_item(_user("sensitive"))
+
+        chat.reset(private_content_logging=True, suspend_compaction=True)
+
+        assert chat.buffer == []
+        assert chat._private_content_logging is True
+        assert chat._compaction_suspended is True
+
 
 # ===================================================================
 # 10. TestStripImages

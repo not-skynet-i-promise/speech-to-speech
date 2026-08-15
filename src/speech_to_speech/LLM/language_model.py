@@ -605,7 +605,27 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         consumed_image_ids = active_chat.image_message_ids()
 
         try:
-            yield from self._generate(active_chat, language_code, gen, ctx, runtime_config, response)
+            if self.cancel_scope is None:
+                yield from self._generate(active_chat, language_code, gen, ctx, runtime_config, response)
+            else:
+                with self.cancel_scope.response_admission(gen) as (admitted, admitted_generation):
+                    ctx.cancel_generation = admitted_generation
+                    if not admitted:
+                        logger.info("Skipping cancelled LLM request before model execution")
+                        yield EndOfResponse(
+                            turn_id=ctx.turn_id,
+                            turn_revision=ctx.turn_revision,
+                            cancel_generation=admitted_generation,
+                        )
+                        return
+                    yield from self._generate(
+                        active_chat,
+                        language_code,
+                        admitted_generation,
+                        ctx,
+                        runtime_config,
+                        response,
+                    )
 
             if ctx.stopped:
                 return

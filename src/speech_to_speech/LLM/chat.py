@@ -485,13 +485,18 @@ class Chat:
             clone._private_content_logging = self._private_content_logging
             return clone
 
-    def reset(self) -> None:
-        """Clear all conversation state. Cancels any in-flight compaction splice."""
+    def reset(
+        self,
+        *,
+        private_content_logging: bool = False,
+        suspend_compaction: bool = False,
+    ) -> None:
+        """Clear conversation state and atomically select post-reset privacy."""
         with self._lock:
             self._gen_counter += 1
             self._compact_in_flight = False
-            self._compaction_suspended = False
-            self._private_content_logging = False
+            self._compaction_suspended = suspend_compaction
+            self._private_content_logging = private_content_logging
             self.buffer = []
             self.init_chat_message = None
             self._pending_tool_calls = {}

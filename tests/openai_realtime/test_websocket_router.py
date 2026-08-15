@@ -67,6 +67,7 @@ def setup():
         should_listen=should_listen,
         cancel_scope=cancel_scope,
     )
+    assert service.verify_cancel_scope_wiring(cancel_scope, cancel_scope)
     input_queue: Queue = Queue()
     output_queue: Queue = Queue()
     text_output_queue: Queue = Queue()
@@ -1238,13 +1239,15 @@ def _make_unit(index: int) -> PipelineUnit:
     should_listen = ThreadingEvent()
     should_listen.set()
     cancel_scope = CancelScope()
+    service = RealtimeService(
+        text_prompt_queue=text_prompt_queue,
+        should_listen=should_listen,
+        cancel_scope=cancel_scope,
+    )
+    assert service.verify_cancel_scope_wiring(cancel_scope, cancel_scope)
     return PipelineUnit(
         index=index,
-        service=RealtimeService(
-            text_prompt_queue=text_prompt_queue,
-            should_listen=should_listen,
-            cancel_scope=cancel_scope,
-        ),
+        service=service,
         cancel_scope=cancel_scope,
         should_listen=should_listen,
         response_playing=ThreadingEvent(),

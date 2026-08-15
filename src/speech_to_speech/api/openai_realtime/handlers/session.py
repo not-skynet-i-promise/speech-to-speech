@@ -56,12 +56,14 @@ class SessionHandler(RealtimeBaseHandler):
             barrier_nonce = parse_transcript_barrier_request(extra.get(TRANSCRIPT_BARRIER_FIELD))
             extra.pop(TRANSCRIPT_BARRIER_FIELD, None)
             s.model_fields_set.discard(TRANSCRIPT_BARRIER_FIELD)
+            cancel_scope = self._service.cancel_scope
             with cfg.transcript_barrier_state_guard():
                 if (
                     barrier_nonce is None
                     or cfg.transcript_barrier_version is not None
                     or cfg.transcript_barrier_session_updates != 1
                     or state.audio_buffer_has_data
+                    or state.audio_append_seen
                     or bool(state.audio_remainder)
                     or state.input_audio_duration_s != 0.0
                     or state.current_item_id is not None
@@ -69,26 +71,33 @@ class SessionHandler(RealtimeBaseHandler):
                     or state.in_response
                     or state.response_pending
                     or bool(cfg.chat.buffer)
-                    or self._service.cancel_scope is None
+                    or cancel_scope is None
+                    or not self._service.cancel_scope_wiring_verified
                 ):
                     return self._service.poison_transcript_barrier(conn_id, "invalid_transcript_barrier")
 
-                model = getattr(s, "model", None)
-                if model is not None:
-                    logger.info("Private session model updated; content redacted")
-                current = cfg.session
-                if current is None:
-                    cfg.session = s
-                else:
-                    cfg.apply_session_update(s)
-                cfg.transcript_barrier_version = TRANSCRIPT_BARRIER_VERSION
-                cfg.transcript_barrier_nonce = barrier_nonce
-                cfg.chat.enable_private_content_logging()
-                logger.info("Session configuration updated")
-                return TranscriptBarrierReadyEvent(
-                    event_id=self._next_event_id(),
-                    nonce=barrier_nonce,
-                )
+                with cancel_scope.private_activation_guard() as quiescent:
+                    if not quiescent:
+                        return self._service.poison_transcript_barrier(
+                            conn_id,
+                            "invalid_transcript_barrier",
+                        )
+                    model = getattr(s, "model", None)
+                    if model is not None:
+                        logger.info("Private session model updated; content redacted")
+                    current = cfg.session
+                    if current is None:
+                        cfg.session = s
+                    else:
+                        cfg.apply_session_update(s)
+                    cfg.transcript_barrier_version = TRANSCRIPT_BARRIER_VERSION
+                    cfg.transcript_barrier_nonce = barrier_nonce
+                    cfg.chat.enable_private_content_logging()
+                    logger.info("Session configuration updated")
+                    return TranscriptBarrierReadyEvent(
+                        event_id=self._next_event_id(),
+                        nonce=barrier_nonce,
+                    )
 
         model = getattr(s, "model", None)
         if model is not None:

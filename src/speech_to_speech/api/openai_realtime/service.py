@@ -177,6 +177,7 @@ class ConnState(BaseModel):
     in_response: bool = False
     response_pending: bool = False
     audio_buffer_has_data: bool = False
+    audio_append_seen: bool = False
     audio_remainder: bytes = b""
     current_response_id: Optional[str] = None
     current_item_id: Optional[str] = None
@@ -234,6 +235,7 @@ class RealtimeService:
         self._chat_size = chat_size
         self.speculative_turns = speculative_turns
         self.cancel_scope = cancel_scope
+        self._cancel_scope_wiring_verified = False
         self._conns: dict[str, ConnState] = {}
         self.total_usage = GlobalUsageMetrics()
 
@@ -252,6 +254,18 @@ class RealtimeService:
             TranscriptBarrierDiscardedEvent: self._on_transcript_barrier_discarded,
             ResponseFailedEvent: self._on_response_failed,
         }
+
+    def verify_cancel_scope_wiring(self, *consumer_scopes: CancelScope | None) -> bool:
+        """Latch whether every cancellation consumer shares the service scope."""
+        scope = self.cancel_scope
+        self._cancel_scope_wiring_verified = bool(
+            scope is not None and consumer_scopes and all(consumer_scope is scope for consumer_scope in consumer_scopes)
+        )
+        return self._cancel_scope_wiring_verified
+
+    @property
+    def cancel_scope_wiring_verified(self) -> bool:
+        return self._cancel_scope_wiring_verified
 
     # ── Connection lifecycle ─────────────────────
 
@@ -379,9 +393,13 @@ class RealtimeService:
             cfg.clear_transcript_barrier_pending()
             cfg.transcript_barrier_failed = True
             if not handshake_completed:
-                cfg.chat.reset()
-            cfg.chat.enable_private_content_logging()
-            cfg.chat.suspend_compaction()
+                cfg.chat.reset(
+                    private_content_logging=True,
+                    suspend_compaction=True,
+                )
+            else:
+                cfg.chat.enable_private_content_logging()
+                cfg.chat.suspend_compaction()
             st.deferred_items.clear()
         return self.make_error("Private transcript barrier protocol violation.", error_type)
 
@@ -398,15 +416,20 @@ class RealtimeService:
             cfg.clear_transcript_barrier_pending()
             cfg.transcript_barrier_failed = True
             if not handshake_completed:
-                cfg.chat.reset()
-            cfg.chat.enable_private_content_logging()
-            cfg.chat.suspend_compaction()
+                cfg.chat.reset(
+                    private_content_logging=True,
+                    suspend_compaction=True,
+                )
+            else:
+                cfg.chat.enable_private_content_logging()
+                cfg.chat.suspend_compaction()
             st.deferred_items.clear()
 
     def handle_audio_append(self, conn_id: str, event: InputAudioBufferAppendEvent) -> list[bytes]:
         if not self.transcript_barrier_audio_allowed(conn_id):
             self.poison_transcript_barrier(conn_id, "transcript_barrier_pending")
             return []
+        self._state(conn_id).audio_append_seen = True
         return self.audio.handle_audio_append(conn_id, event)
 
     def handle_audio_commit(self, conn_id: str) -> RealtimeErrorEvent | None:
@@ -555,9 +578,16 @@ class RealtimeService:
         wait_for_pending_reopen: bool,
     ) -> list[ServerEvent] | None:
         cfg = self._state(conn_id).runtime_config
-        if cfg.transcript_barrier_failed:
-            logger.debug("Dropping pipeline event after private barrier failure")
-            return []
+        with cfg.transcript_barrier_state_guard():
+            if cfg.transcript_barrier_failed:
+                logger.debug("Dropping pipeline event after private barrier failure")
+                return []
+            if cfg.transcript_barrier_enabled and isinstance(
+                event,
+                (PartialTranscriptionEvent, TranscriptionCompletedEvent),
+            ):
+                logger.info("Rejecting ordinary transcription event after private barrier activation")
+                return [self.poison_transcript_barrier(conn_id, "invalid_transcript_barrier_event")]
         is_stale = self._is_stale_turn_event(event, wait_for_pending_reopen=wait_for_pending_reopen)
         if is_stale is None:
             return None

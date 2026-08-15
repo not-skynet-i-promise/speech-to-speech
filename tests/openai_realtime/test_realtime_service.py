@@ -48,6 +48,7 @@ from speech_to_speech.api.openai_realtime.transcript_barrier import (
     TranscriptBarrierResolvedServerEvent,
     TranscriptBarrierResolveEvent,
 )
+from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
     PartialTranscriptionEvent,
@@ -364,6 +365,49 @@ class TestHandleSessionUpdate:
         finally:
             service.unregister(conn_id)
 
+    def test_private_transcript_barrier_rejects_miswired_cancel_scopes(self, runtime_config):
+        service_scope = CancelScope()
+        service = RealtimeService(text_prompt_queue=Queue(), cancel_scope=service_scope)
+        assert not service.verify_cancel_scope_wiring(service_scope, CancelScope())
+        conn_id = service.register()
+        service._state(conn_id).runtime_config = runtime_config
+        try:
+            result = service.handle_session_update(
+                conn_id,
+                self._make_update(
+                    reachy_private_transcript_barrier={"version": 1, "nonce": "fe" * 32},
+                ),
+            )
+
+            assert isinstance(result, RealtimeErrorEvent)
+            assert result.error.type == "invalid_transcript_barrier"
+            assert runtime_config.transcript_barrier_failed is True
+            assert runtime_config.transcript_barrier_enabled is False
+        finally:
+            service.unregister(conn_id)
+
+    def test_private_transcript_barrier_rejects_active_response_admission(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+        cancel_scope,
+    ):
+        with cancel_scope.response_admission(cancel_scope.generation) as (admitted, generation):
+            assert admitted is True
+            assert generation == cancel_scope.generation
+            result = service.handle_session_update(
+                conn_id,
+                self._make_update(
+                    reachy_private_transcript_barrier={"version": 1, "nonce": "fa" * 32},
+                ),
+            )
+
+        assert isinstance(result, RealtimeErrorEvent)
+        assert result.error.type == "invalid_transcript_barrier"
+        assert runtime_config.transcript_barrier_failed is True
+        assert runtime_config.transcript_barrier_enabled is False
+
     def test_barrier_ready_waits_for_cancelled_provider_content_guard(
         self,
         service,
@@ -467,6 +511,9 @@ class TestHandleSessionUpdate:
         caplog,
     ):
         assert service.handle_audio_append(conn_id, _make_audio_append(_b64_pcm(512)))
+        assert service.handle_audio_commit(conn_id) is None
+        assert service._state(conn_id).audio_buffer_has_data is False
+        assert service._state(conn_id).audio_append_seen is True
 
         result = service.handle_session_update(
             conn_id,
@@ -497,6 +544,39 @@ class TestHandleSessionUpdate:
         assert ordinary_events == []
         assert text_prompt_queue.empty()
         assert runtime_config.chat.buffer == []
+        assert transcript not in caplog.text
+
+    def test_private_transcript_barrier_poison_drops_ordinary_final_after_ready(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+        text_prompt_queue,
+        caplog,
+    ):
+        ready = service.handle_session_update(
+            conn_id,
+            self._make_update(
+                reachy_private_transcript_barrier={"version": 1, "nonce": "db" * 32},
+            ),
+        )
+        assert isinstance(ready, TranscriptBarrierReadyEvent)
+
+        transcript = "LATE_ORDINARY_FINAL_AFTER_READY"
+        with caplog.at_level(logging.DEBUG):
+            events = service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(transcript=transcript),
+            )
+
+        assert events is not None
+        assert len(events) == 1
+        assert isinstance(events[0], RealtimeErrorEvent)
+        assert events[0].error.type == "invalid_transcript_barrier_event"
+        assert runtime_config.transcript_barrier_failed is True
+        assert runtime_config.transcript_barrier_pending_transcript is None
+        assert runtime_config.chat.buffer == []
+        assert text_prompt_queue.empty()
         assert transcript not in caplog.text
 
     @pytest.mark.parametrize(

@@ -68,6 +68,7 @@ class _ServerEnv:
             should_listen=self.should_listen,
             cancel_scope=self.cancel_scope,
         )
+        assert self.service.verify_cancel_scope_wiring(self.cancel_scope, self.cancel_scope)
         self.input_queue: Queue = Queue()
         self.output_queue: Queue = Queue()
         self.text_output_queue: Queue = Queue()

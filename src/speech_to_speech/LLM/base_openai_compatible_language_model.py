@@ -691,7 +691,21 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             speech_stopped_at_s=speech_stopped_at_s,
             wants_audio=wants_audio,
         )
-        yield from self._generate(active_chat, original_chat, turn, optional_kwargs)
+        if self.cancel_scope is None:
+            yield from self._generate(active_chat, original_chat, turn, optional_kwargs)
+            return
+
+        with self.cancel_scope.response_admission(gen) as (admitted, admitted_generation):
+            turn.gen = admitted_generation
+            if not admitted:
+                logger.info("Skipping cancelled LLM request before provider execution")
+                yield EndOfResponse(
+                    turn_id=turn_id,
+                    turn_revision=turn_revision,
+                    cancel_generation=admitted_generation,
+                )
+                return
+            yield from self._generate(active_chat, original_chat, turn, optional_kwargs)
 
     @property
     def timing_log_level(self) -> int:
