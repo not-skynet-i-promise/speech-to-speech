@@ -5,10 +5,12 @@ from collections.abc import Iterator
 from queue import Queue
 from threading import Event, Thread
 
+import numpy as np
 from openai.types.realtime import RealtimeSessionCreateRequest
 from openai.types.responses import ResponseFunctionToolCall
 
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
+from speech_to_speech.api.openai_realtime.service import RealtimeService
 from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.LLM.chat import Chat, make_assistant_message, make_user_message
 from speech_to_speech.LLM.language_model import BaseLanguageModelHandler, StreamContext
@@ -16,8 +18,11 @@ from speech_to_speech.pipeline.messages import (
     PIPELINE_END,
     GenerateResponseRequest,
     LLMResponseChunk,
+    Transcription,
     TTSInput,
+    VADAudio,
 )
+from speech_to_speech.STT.base_stt_handler import BaseSTTHandler
 from speech_to_speech.TTS.facebookmms_handler import FacebookMMSTTSHandler
 
 
@@ -69,6 +74,19 @@ class _BlockingCleanupHandler(BaseHandler[TTSInput, bytes]):
 
     def cleanup(self) -> None:
         raise RuntimeError("PRIVATE_INFLIGHT_CLEANUP_CANARY")
+
+
+class _BlockingExplodingSTTHandler(BaseSTTHandler):
+    def __init__(self, stop_event, queue_in, queue_out, started: Event, release: Event):
+        self.started = started
+        self.release = release
+        super().__init__(stop_event, queue_in, queue_out)
+
+    def process(self, _input) -> Iterator[Transcription]:
+        self.started.set()
+        assert self.release.wait(timeout=2.0)
+        raise RuntimeError("PRIVATE_STT_HANDLER_EXCEPTION_CANARY")
+        yield Transcription(text="unreachable")
 
 
 class _PoisoningLanguageModelHandler(BaseLanguageModelHandler):
@@ -183,6 +201,33 @@ def test_generic_handler_latches_poison_before_final_cleanup(caplog):
     assert worker.is_alive() is False
     assert "PRIVATE_INFLIGHT_CLEANUP_CANARY" not in caplog.text
     assert "final cleanup failed; private content redacted" in caplog.text
+
+
+def test_stt_exception_uses_live_barrier_guard_after_concurrent_poison(caplog):
+    queue_in: Queue = Queue()
+    queue_out: Queue = Queue()
+    started = Event()
+    release = Event()
+    service = RealtimeService()
+    connection_id = service.register()
+    handler = _BlockingExplodingSTTHandler(Event(), queue_in, queue_out, started, release)
+    handler.set_transcript_barrier_enabled(service.transcript_barrier_private)
+    handler.set_transcript_barrier_failed(service.transcript_barrier_poisoned)
+    handler.set_transcript_barrier_state_guard(service.transcript_barrier_pipeline_state_guard)
+    worker = Thread(target=handler.run)
+
+    with caplog.at_level(logging.ERROR, logger="speech_to_speech.baseHandler"):
+        worker.start()
+        queue_in.put(VADAudio(audio=np.zeros(160, dtype=np.float32)))
+        assert started.wait(timeout=2.0)
+        service.poison_transcript_barrier(connection_id, "test_failure")
+        release.set()
+        queue_in.put(PIPELINE_END)
+        worker.join(timeout=2.0)
+
+    assert worker.is_alive() is False
+    assert "PRIVATE_STT_HANDLER_EXCEPTION_CANARY" not in caplog.text
+    assert "private content redacted" in caplog.text
 
 
 def test_facebook_mms_exception_has_no_private_traceback(caplog):

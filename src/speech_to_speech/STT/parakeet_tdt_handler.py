@@ -289,10 +289,11 @@ class ParakeetTDTSTTHandler(BaseSTTHandler):
                             )
                             return
                     except Exception as e:
-                        if self.transcript_barrier_enabled:
-                            logger.debug("Progressive transcription failed; private content redacted")
-                        else:
-                            logger.debug(f"Progressive transcription failed: {e}")
+                        with self.transcript_content_allowed() as content_allowed:
+                            if content_allowed:
+                                logger.debug(f"Progressive transcription failed: {e}")
+                            else:
+                                logger.debug("Progressive transcription failed; private content redacted")
                 else:
                     logger.debug("Skipping progressive update (compute busy)")
             return
@@ -336,10 +337,11 @@ class ParakeetTDTSTTHandler(BaseSTTHandler):
                 language_code = self.last_language
 
         except Exception as e:
-            if self.transcript_barrier_enabled:
-                logger.error("Parakeet TDT inference failed; private content redacted")
-            else:
-                logger.error(f"Parakeet TDT inference failed: {e}")
+            with self.transcript_content_allowed() as content_allowed:
+                if content_allowed:
+                    logger.error(f"Parakeet TDT inference failed: {e}")
+                else:
+                    logger.error("Parakeet TDT inference failed; private content redacted")
             pred_text = ""
             language_code = self.last_language
 
@@ -355,10 +357,12 @@ class ParakeetTDTSTTHandler(BaseSTTHandler):
         )
         logger.debug("Finished Parakeet TDT inference")
         self._clear_live_transcription_line()
-        if pred_text.strip() and not self.transcript_barrier_enabled:
-            console.print(f"[yellow]USER: {pred_text.strip()}")
-            if language_code:
-                console.print(f"[dim]Language: {language_code}[/dim]")
+        if pred_text.strip():
+            with self.transcript_content_allowed() as content_allowed:
+                if content_allowed:
+                    console.print(f"[yellow]USER: {pred_text.strip()}")
+                    if language_code:
+                        console.print(f"[dim]Language: {language_code}[/dim]")
 
         # Reset per-utterance live transcription state only after final STT
         # completes. The streaming handler carries fixed sentence timing within
@@ -455,8 +459,10 @@ class ParakeetTDTSTTHandler(BaseSTTHandler):
             rich_text.append(result.active_text, style="cyan dim")
 
         progressive_text = self._build_progressive_text(result)
-        if progressive_text and not self.transcript_barrier_enabled:
-            self._print_live_transcription(rich_text, progressive_text)
+        if progressive_text:
+            with self.transcript_content_allowed() as content_allowed:
+                if content_allowed:
+                    self._print_live_transcription(rich_text, progressive_text)
 
         return progressive_text
 

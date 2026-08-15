@@ -88,8 +88,9 @@ class LightningWhisperSTTHandler(BaseSTTHandler):
         torch.mps.empty_cache()
 
         logger.debug("finished whisper inference")
-        if not self.transcript_barrier_enabled:
-            console.print(f"[yellow]USER: {pred_text}")
+        with self.transcript_content_allowed() as content_allowed:
+            if content_allowed:
+                console.print(f"[yellow]USER: {pred_text}")
         logger.debug(f"Language Code Whisper: {language_code}")
 
         if self.start_language == "auto":

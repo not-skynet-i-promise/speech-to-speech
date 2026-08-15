@@ -571,6 +571,7 @@ def _build_realtime_pipeline_unit(
         if isinstance(h, BaseSTTHandler):
             h.set_transcript_barrier_enabled(service.transcript_barrier_private)
             h.set_transcript_barrier_failed(service.transcript_barrier_poisoned)
+            h.set_transcript_barrier_state_guard(service.transcript_barrier_pipeline_state_guard)
 
     return PipelineUnit(
         index=index,
