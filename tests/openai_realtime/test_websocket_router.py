@@ -22,7 +22,12 @@ from speech_to_speech.api.openai_realtime.service import CHUNK_SIZE_BYTES, Realt
 from speech_to_speech.api.openai_realtime.websocket_router import create_app
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.control import SESSION_END, PipelineControlMessage, is_control_message
-from speech_to_speech.pipeline.events import AssistantTextEvent, SpeechStartedEvent, TokenUsageEvent
+from speech_to_speech.pipeline.events import (
+    AssistantTextEvent,
+    SpeechStartedEvent,
+    TokenUsageEvent,
+    TranscriptBarrierCompletedEvent,
+)
 from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, PIPELINE_END, AudioOutput
 
 # ---------------------------------------------------------------------------
@@ -193,6 +198,154 @@ class TestClientEventDispatch:
                 time.sleep(0.1)
                 cid = service.connection_ids[0]
                 assert service._state(cid).runtime_config.session.audio.output.voice == "coral"
+
+    def test_private_transcript_barrier_handshake_is_exact_and_acknowledged(self, setup):
+        app, service, *_ = setup
+        nonce = "ab" * 32
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "realtime",
+                            "reachy_private_transcript_barrier": {"version": 1, "nonce": nonce},
+                        },
+                    }
+                )
+
+                ready = ws.receive_json()
+                assert ready == {
+                    "type": "reachy.transcript_barrier.ready",
+                    "event_id": ready["event_id"],
+                    "version": 1,
+                    "nonce": nonce,
+                }
+                assert service.transcript_barrier_enabled() is True
+
+    def test_private_transcript_barrier_malformed_or_duplicate_handshake_fails_closed(self, setup):
+        app, service, *_ = setup
+        nonce = "cd" * 32
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "realtime",
+                            "reachy_private_transcript_barrier": {"version": 1, "nonce": nonce},
+                        },
+                    }
+                )
+                assert ws.receive_json()["type"] == "reachy.transcript_barrier.ready"
+
+                ws.send_json(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "realtime",
+                            "reachy_private_transcript_barrier": {"version": 1, "nonce": nonce},
+                        },
+                    }
+                )
+                error = ws.receive_json()
+                assert error["type"] == "error"
+                assert error["error"]["type"] == "invalid_transcript_barrier"
+                cid = service.connection_ids[0]
+                assert service.transcript_barrier_failed(cid) is True
+
+    def test_private_transcript_barrier_exact_resolution_round_trip(self, setup):
+        app, service, _, _, text_output_queue, *_ = setup
+        nonce = "ef" * 32
+        transcript = "Who am I?"
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "realtime",
+                            "reachy_private_transcript_barrier": {"version": 1, "nonce": nonce},
+                        },
+                    }
+                )
+                assert ws.receive_json()["type"] == "reachy.transcript_barrier.ready"
+
+                text_output_queue.put(TranscriptBarrierCompletedEvent(transcript=transcript))
+                completed = ws.receive_json()
+                assert completed["type"] == "reachy.transcript_barrier.completed"
+                assert completed["transcript"] == transcript
+
+                ws.send_json(
+                    {
+                        "type": "reachy.transcript_barrier.resolve",
+                        "version": 1,
+                        "nonce": nonce,
+                        "sequence": completed["sequence"],
+                        "input_item_id": completed["item_id"],
+                        "action": "accept",
+                        "item": {
+                            "id": "msg_barrier_1",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": transcript}],
+                        },
+                    }
+                )
+                assert ws.receive_json()["type"] == "conversation.item.created"
+                resolved = ws.receive_json()
+                assert resolved["type"] == "reachy.transcript_barrier.resolved"
+                assert resolved["action"] == "accepted"
+                assert resolved["replacement_item_id"] == "msg_barrier_1"
+                cid = service.connection_ids[0]
+                assert service._state(cid).runtime_config.chat.buffer[-1].content[0].text == transcript
+
+    def test_private_transcript_barrier_invalid_resolution_closes_without_echo(self, setup):
+        app, service, _, _, text_output_queue, *_ = setup
+        nonce = "01" * 32
+        canary = "PRIVATE_TRANSCRIPT_CANARY"
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "realtime",
+                            "reachy_private_transcript_barrier": {"version": 1, "nonce": nonce},
+                        },
+                    }
+                )
+                ws.receive_json()
+                text_output_queue.put(TranscriptBarrierCompletedEvent(transcript=canary))
+                completed = ws.receive_json()
+
+                ws.send_json(
+                    {
+                        "type": "reachy.transcript_barrier.resolve",
+                        "version": 1,
+                        "nonce": nonce,
+                        "sequence": completed["sequence"],
+                        "input_item_id": completed["item_id"],
+                        "action": "accept",
+                        "item": {
+                            "id": "invalid-id",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": canary}],
+                        },
+                    }
+                )
+                error = ws.receive_json()
+                assert error["type"] == "error"
+                assert canary not in str(error)
+                cid = service.connection_ids[0]
+                cfg = service._state(cid).runtime_config
+                assert cfg.transcript_barrier_failed is True
+                assert cfg.transcript_barrier_pending_transcript is None
 
     def test_conversation_item_create_returns_events(self, setup):
         app, *_ = setup

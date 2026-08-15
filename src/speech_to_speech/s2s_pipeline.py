@@ -544,6 +544,7 @@ def _build_realtime_pipeline_unit(
         transcription_notifier_setup={
             "text_output_queue": text_output_queue,
             "should_listen": should_listen,
+            "transcript_barrier_enabled": service.transcript_barrier_enabled,
         },
         module_kwargs=module_kwargs,
         vad_handler_kwargs=vad_kw,
@@ -561,8 +562,12 @@ def _build_realtime_pipeline_unit(
         qwen3_tts_handler_kwargs=qwen3_tts_kw,
         speculative_turns=speculative_turns,
     )
+    from speech_to_speech.STT.base_stt_handler import BaseSTTHandler
+
     for h in handlers:
         h.pipeline_index = index
+        if isinstance(h, BaseSTTHandler):
+            h.set_transcript_barrier_enabled(service.transcript_barrier_enabled)
 
     return PipelineUnit(
         index=index,

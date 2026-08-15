@@ -38,6 +38,15 @@ from speech_to_speech.api.openai_realtime.handlers import (
     SessionHandler,
 )
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
+from speech_to_speech.api.openai_realtime.transcript_barrier import (
+    TRANSCRIPT_BARRIER_MAX_CHARS,
+    TranscriptBarrierCompletedServerEvent,
+    TranscriptBarrierDiscardedServerEvent,
+    TranscriptBarrierFailedServerEvent,
+    TranscriptBarrierReadyEvent,
+    TranscriptBarrierResolvedServerEvent,
+    TranscriptBarrierResolveEvent,
+)
 from speech_to_speech.LLM.chat import Chat, make_user_message
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
@@ -47,6 +56,8 @@ from speech_to_speech.pipeline.events import (
     SpeechStartedEvent,
     SpeechStoppedEvent,
     TokenUsageEvent,
+    TranscriptBarrierCompletedEvent,
+    TranscriptBarrierDiscardedEvent,
     TranscriptionCompletedEvent,
 )
 from speech_to_speech.pipeline.messages import GenerateResponseRequest
@@ -70,6 +81,7 @@ _EVENT_TYPE_TO_MODEL: dict[str, type[BaseModel]] = {
     "conversation.item.create": ConversationItemCreateEvent,
     "response.create": ResponseCreateEvent,
     "response.cancel": ResponseCancelEvent,
+    "reachy.transcript_barrier.resolve": TranscriptBarrierResolveEvent,
 }
 
 ClientEvent = Union[
@@ -78,6 +90,7 @@ ClientEvent = Union[
     ConversationItemCreateEvent,
     ResponseCreateEvent,
     ResponseCancelEvent,
+    TranscriptBarrierResolveEvent,
 ]
 
 ServerEvent = Union[
@@ -96,6 +109,11 @@ ServerEvent = Union[
     ResponseFunctionCallArgumentsDoneEvent,
     ResponseTextDeltaEvent,
     ResponseTextDoneEvent,
+    TranscriptBarrierReadyEvent,
+    TranscriptBarrierCompletedServerEvent,
+    TranscriptBarrierDiscardedServerEvent,
+    TranscriptBarrierFailedServerEvent,
+    TranscriptBarrierResolvedServerEvent,
 ]
 
 RealtimeEvent = Union[ClientEvent, ServerEvent]
@@ -225,6 +243,8 @@ class RealtimeService:
             TokenUsageEvent: self._on_token_usage,
             PartialTranscriptionEvent: self.conversation.on_partial_transcription,
             TranscriptionCompletedEvent: self._on_transcription_completed,
+            TranscriptBarrierCompletedEvent: self._on_transcript_barrier_completed,
+            TranscriptBarrierDiscardedEvent: self._on_transcript_barrier_discarded,
             ResponseFailedEvent: self._on_response_failed,
         }
 
@@ -242,6 +262,7 @@ class RealtimeService:
     def unregister(self, conn_id: str) -> None:
         st = self._conns.pop(conn_id, None)
         if st is not None:
+            st.runtime_config.clear_transcript_barrier_pending()
             # Suppress any in-flight compaction splice so a daemon worker can't
             # mutate a Chat tied to a closed session, and don't make further
             # billable LLM calls on its behalf once the splice is suppressed.
@@ -281,7 +302,10 @@ class RealtimeService:
         try:
             return model_cls.model_validate(raw)  # type: ignore[return-value]
         except ValidationError as e:
-            logger.error(f"Invalid {event_type} payload: {e}")
+            if event_type == "reachy.transcript_barrier.resolve":
+                logger.error("Invalid private transcript barrier resolution payload")
+            else:
+                logger.error(f"Invalid {event_type} payload: {e}")
             return None
 
     # ── Client event handlers ────────────────────
@@ -289,10 +313,32 @@ class RealtimeService:
     def build_session_created(self, conn_id: str) -> SessionCreatedEvent:
         return self.session.build_session_created(conn_id)
 
-    def handle_session_update(self, conn_id: str, event: SessionUpdateEvent) -> Optional[RealtimeErrorEvent]:
+    def handle_session_update(self, conn_id: str, event: SessionUpdateEvent) -> ServerEvent | None:
         return self.session.handle_session_update(conn_id, event)
 
+    def transcript_barrier_enabled(self) -> bool:
+        """Return the barrier state for this single-session pipeline unit."""
+        if len(self._conns) != 1:
+            return False
+        return next(iter(self._conns.values())).runtime_config.transcript_barrier_enabled
+
+    def transcript_barrier_failed(self, conn_id: str) -> bool:
+        return self._state(conn_id).runtime_config.transcript_barrier_failed
+
+    def transcript_barrier_audio_allowed(self, conn_id: str) -> bool:
+        cfg = self._state(conn_id).runtime_config
+        return not cfg.transcript_barrier_failed and not cfg.transcript_barrier_pending
+
+    def poison_transcript_barrier(self, conn_id: str, error_type: str) -> RealtimeErrorEvent:
+        cfg = self._state(conn_id).runtime_config
+        cfg.clear_transcript_barrier_pending()
+        cfg.transcript_barrier_failed = True
+        return self.make_error("Private transcript barrier protocol violation.", error_type)
+
     def handle_audio_append(self, conn_id: str, event: InputAudioBufferAppendEvent) -> list[bytes]:
+        if not self.transcript_barrier_audio_allowed(conn_id):
+            self.poison_transcript_barrier(conn_id, "transcript_barrier_pending")
+            return []
         return self.audio.handle_audio_append(conn_id, event)
 
     def handle_audio_commit(self, conn_id: str) -> RealtimeErrorEvent | None:
@@ -302,6 +348,9 @@ class RealtimeService:
         return self.audio.encode_audio_chunk(conn_id, audio)
 
     def handle_response_create(self, conn_id: str, event: ResponseCreateEvent) -> ServerEvent | None:
+        cfg = self._state(conn_id).runtime_config
+        if cfg.transcript_barrier_pending:
+            return self.poison_transcript_barrier(conn_id, "transcript_barrier_pending")
         return self.response.handle_response_create(conn_id, event)
 
     def handle_response_cancel(self, conn_id: str) -> list[ServerEvent]:
@@ -316,7 +365,75 @@ class RealtimeService:
         return self.response.finish_response(conn_id, status, reason)
 
     def handle_conversation_item_create(self, conn_id: str, event: ConversationItemCreateEvent) -> list[ServerEvent]:
+        cfg = self._state(conn_id).runtime_config
+        if cfg.transcript_barrier_pending:
+            return [self.poison_transcript_barrier(conn_id, "transcript_barrier_pending")]
         return self.conversation.handle_conversation_item_create(conn_id, event)
+
+    def handle_transcript_barrier_resolve(
+        self,
+        conn_id: str,
+        event: TranscriptBarrierResolveEvent,
+    ) -> list[ServerEvent]:
+        """Resolve exactly one pending final without exposing it to ordinary sinks."""
+        cfg = self._state(conn_id).runtime_config
+        expected_transcript = cfg.transcript_barrier_pending_transcript
+        valid_context = (
+            cfg.transcript_barrier_enabled
+            and cfg.transcript_barrier_pending
+            and event.nonce == cfg.transcript_barrier_nonce
+            and event.sequence == cfg.transcript_barrier_pending_sequence
+            and event.input_item_id == cfg.transcript_barrier_pending_item_id
+        )
+        if not valid_context or expected_transcript is None:
+            return [self.poison_transcript_barrier(conn_id, "invalid_transcript_barrier_resolution")]
+
+        item_id: str | None = None
+        created: list[ServerEvent] = []
+        if event.action == "accept":
+            item = event.item
+            expected_item = (
+                {
+                    "content": [{"text": expected_transcript, "type": "input_text"}],
+                    "id": item.id,
+                    "role": "user",
+                    "type": "message",
+                }
+                if item is not None
+                else None
+            )
+            valid_item = (
+                item is not None
+                and len(item.content) == 1
+                and item.content[0].type == "input_text"
+                and item.content[0].text == expected_transcript
+                and item.model_dump(exclude_none=True) == expected_item
+            )
+            if not valid_item or item is None:
+                return [self.poison_transcript_barrier(conn_id, "invalid_transcript_barrier_resolution")]
+            item_id = item.id
+            assert item_id is not None
+            cfg.clear_transcript_barrier_pending()
+            created = self.conversation._apply_item(conn_id, item)
+            if not created or created[0].type == "error":
+                cfg.transcript_barrier_failed = True
+                return created
+            action: Literal["accepted", "discarded"] = "accepted"
+        else:
+            cfg.clear_transcript_barrier_pending()
+            action = "discarded"
+
+        return [
+            *created,
+            TranscriptBarrierResolvedServerEvent(
+                event_id=self._next_event_id(),
+                nonce=event.nonce,
+                sequence=event.sequence,
+                input_item_id=event.input_item_id,
+                replacement_item_id=item_id,
+                action=action,
+            ),
+        ]
 
     def dispatch_pipeline_event(self, conn_id: str, event: PipelineEvent) -> list[ServerEvent]:
         """Route a pipeline text_output_queue event to the appropriate handler."""
@@ -376,7 +493,14 @@ class RealtimeService:
             return False
         if not isinstance(
             event,
-            (PartialTranscriptionEvent, TranscriptionCompletedEvent, AssistantTextEvent, TokenUsageEvent),
+            (
+                PartialTranscriptionEvent,
+                TranscriptionCompletedEvent,
+                TranscriptBarrierCompletedEvent,
+                TranscriptBarrierDiscardedEvent,
+                AssistantTextEvent,
+                TokenUsageEvent,
+            ),
         ):
             return False
         turn_id = getattr(event, "turn_id", None)
@@ -451,6 +575,90 @@ class RealtimeService:
             )
 
         return events
+
+    def _transcript_barrier_context(self, conn_id: str) -> tuple[RuntimeConfig, str, int, str]:
+        st = self._state(conn_id)
+        cfg = st.runtime_config
+        nonce = cfg.transcript_barrier_nonce
+        if not cfg.transcript_barrier_enabled or nonce is None:
+            raise RuntimeError("private transcript barrier event arrived without an active handshake")
+        sequence = cfg.next_transcript_barrier_sequence()
+        item_id = self.conversation._input_item_id(conn_id)
+        st.response_usage.audio_duration_s += st.input_audio_duration_s
+        return cfg, nonce, sequence, item_id
+
+    def _on_transcript_barrier_completed(
+        self,
+        conn_id: str,
+        event: TranscriptBarrierCompletedEvent,
+    ) -> list[ServerEvent]:
+        """Emit one private final without storing it or triggering generation."""
+        cfg, nonce, sequence, item_id = self._transcript_barrier_context(conn_id)
+        if cfg.transcript_barrier_pending:
+            cfg.clear_transcript_barrier_pending()
+            cfg.transcript_barrier_failed = True
+            return [
+                TranscriptBarrierFailedServerEvent(
+                    event_id=self._next_event_id(),
+                    nonce=nonce,
+                    sequence=sequence,
+                    item_id=item_id,
+                    reason="overlapping_transcript",
+                )
+            ]
+        if not event.transcript.strip() or len(event.transcript) > TRANSCRIPT_BARRIER_MAX_CHARS:
+            cfg.transcript_barrier_failed = True
+            return [
+                TranscriptBarrierFailedServerEvent(
+                    event_id=self._next_event_id(),
+                    nonce=nonce,
+                    sequence=sequence,
+                    item_id=item_id,
+                    reason="transcript_too_large",
+                )
+            ]
+        cfg.chat.suppress_inflight_compaction()
+        cfg.transcript_barrier_pending_sequence = sequence
+        cfg.transcript_barrier_pending_item_id = item_id
+        cfg.transcript_barrier_pending_transcript = event.transcript
+        return [
+            TranscriptBarrierCompletedServerEvent(
+                event_id=self._next_event_id(),
+                nonce=nonce,
+                sequence=sequence,
+                item_id=item_id,
+                transcript=event.transcript,
+                language_code=event.language_code,
+            )
+        ]
+
+    def _on_transcript_barrier_discarded(
+        self,
+        conn_id: str,
+        event: TranscriptBarrierDiscardedEvent,
+    ) -> list[ServerEvent]:
+        """Emit a content-free empty-final acknowledgement."""
+        cfg, nonce, sequence, item_id = self._transcript_barrier_context(conn_id)
+        if cfg.transcript_barrier_pending:
+            cfg.clear_transcript_barrier_pending()
+            cfg.transcript_barrier_failed = True
+            return [
+                TranscriptBarrierFailedServerEvent(
+                    event_id=self._next_event_id(),
+                    nonce=nonce,
+                    sequence=sequence,
+                    item_id=item_id,
+                    reason="overlapping_transcript",
+                )
+            ]
+        return [
+            TranscriptBarrierDiscardedServerEvent(
+                event_id=self._next_event_id(),
+                nonce=nonce,
+                sequence=sequence,
+                item_id=item_id,
+            )
+        ]
 
     # ── Metrics ────────────────────────────────────
 

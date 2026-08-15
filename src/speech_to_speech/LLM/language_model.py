@@ -584,8 +584,12 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             if commit_allowed:
                 original_chat.strip_images(consumed_image_ids)
                 original_chat.trim_if_needed(self.compactor)
-            logger.debug("Clean text: %s", ctx.generated_text)
-            logger.info(f"Tools: {ctx.tools}")
+            if runtime_config.transcript_barrier_enabled:
+                logger.debug("Generated text redacted (characters=%d)", len(ctx.generated_text))
+                logger.info("Generated tools redacted (count=%d)", len(ctx.tools))
+            else:
+                logger.debug("Clean text: %s", ctx.generated_text)
+                logger.info("Tools: %s", ctx.tools)
 
             if turn_output_allowed and ctx.printable_text.strip():
                 yield LLMResponseChunk(
@@ -611,12 +615,19 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             # Any generation failure must still terminate the response. Without this
             # the exception would escape process() and no EndOfResponse would be
             # emitted, leaving st.in_response stuck and locking every later response.
-            logger.exception("LLM generation failed; ending the current response")
+            if runtime_config.transcript_barrier_enabled:
+                logger.error("LLM generation failed; private content redacted")
+            else:
+                logger.exception("LLM generation failed; ending the current response")
             yield EndOfResponse(
                 turn_id=ctx.turn_id,
                 turn_revision=ctx.turn_revision,
                 cancel_generation=ctx.cancel_generation,
-                error=f"Language model generation failed: {exc}",
+                error=(
+                    "Language model generation failed in private transcript mode."
+                    if runtime_config.transcript_barrier_enabled
+                    else f"Language model generation failed: {exc}"
+                ),
             )
             return
         yield EndOfResponse(

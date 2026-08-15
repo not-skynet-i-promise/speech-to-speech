@@ -6,6 +6,7 @@ validated for correct type, attributes, and state transitions.
 
 import base64
 import json
+import logging
 from queue import Queue
 from threading import Event, Thread
 from time import sleep
@@ -38,6 +39,15 @@ from speech_to_speech.api.openai_realtime.service import (
     CHUNK_SIZE_BYTES,
     RealtimeService,
 )
+from speech_to_speech.api.openai_realtime.transcript_barrier import (
+    TRANSCRIPT_BARRIER_MAX_CHARS,
+    TranscriptBarrierCompletedServerEvent,
+    TranscriptBarrierDiscardedServerEvent,
+    TranscriptBarrierFailedServerEvent,
+    TranscriptBarrierReadyEvent,
+    TranscriptBarrierResolvedServerEvent,
+    TranscriptBarrierResolveEvent,
+)
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
     PartialTranscriptionEvent,
@@ -45,6 +55,8 @@ from speech_to_speech.pipeline.events import (
     SpeechStartedEvent,
     SpeechStoppedEvent,
     TokenUsageEvent,
+    TranscriptBarrierCompletedEvent,
+    TranscriptBarrierDiscardedEvent,
     TranscriptionCompletedEvent,
 )
 from speech_to_speech.pipeline.messages import AssistantTextPart, AssistantToolCallPart, GenerateResponseRequest
@@ -164,6 +176,29 @@ class TestParseClientEvent:
         raw = {"type": "input_audio_buffer.append"}  # missing required 'audio'
         assert service.parse_client_event(raw) is None
 
+    def test_parse_invalid_private_resolution_never_logs_payload(self, service, caplog):
+        canary = "PRIVATE_RESOLUTION_CANARY"
+        raw = {
+            "type": "reachy.transcript_barrier.resolve",
+            "version": 1,
+            "nonce": "ab" * 32,
+            "sequence": 1,
+            "input_item_id": "item_1",
+            "action": "accept",
+            "item": {
+                "id": "invalid-id",
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": canary}],
+            },
+        }
+
+        with caplog.at_level(logging.ERROR):
+            assert service.parse_client_event(raw) is None
+
+        assert canary not in caplog.text
+        assert "Invalid private transcript barrier resolution payload" in caplog.text
+
 
 # ===================================================================
 # Audio append
@@ -211,6 +246,104 @@ class TestHandleSessionUpdate:
     def test_session_update_instructions(self, service, conn_id, runtime_config):
         service.handle_session_update(conn_id, self._make_update(instructions="Be concise"))
         assert runtime_config.session.instructions == "Be concise"
+
+    def test_private_transcript_barrier_requires_one_exact_handshake(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+    ):
+        nonce = "ab" * 32
+        result = service.handle_session_update(
+            conn_id,
+            self._make_update(
+                reachy_private_transcript_barrier={"version": 1, "nonce": nonce},
+            ),
+        )
+
+        assert isinstance(result, TranscriptBarrierReadyEvent)
+        assert result.nonce == nonce
+        assert runtime_config.transcript_barrier_enabled is True
+        assert "reachy_private_transcript_barrier" not in (runtime_config.session.model_extra or {})
+
+        duplicate = service.handle_session_update(
+            conn_id,
+            self._make_update(
+                reachy_private_transcript_barrier={"version": 1, "nonce": nonce},
+            ),
+        )
+        assert isinstance(duplicate, RealtimeErrorEvent)
+        assert duplicate.error.type == "invalid_transcript_barrier"
+        assert runtime_config.transcript_barrier_failed is True
+
+    def test_private_transcript_barrier_must_be_in_first_session_update(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+    ):
+        service.handle_session_update(conn_id, self._make_update(instructions="ordinary session"))
+
+        result = service.handle_session_update(
+            conn_id,
+            self._make_update(
+                reachy_private_transcript_barrier={"version": 1, "nonce": "bc" * 32},
+            ),
+        )
+
+        assert isinstance(result, RealtimeErrorEvent)
+        assert result.error.type == "invalid_transcript_barrier"
+        assert runtime_config.transcript_barrier_enabled is False
+        assert runtime_config.transcript_barrier_failed is True
+
+    def test_private_transcript_barrier_rejects_audio_before_handshake(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+    ):
+        assert service.handle_audio_append(conn_id, _make_audio_append(_b64_pcm(512)))
+
+        result = service.handle_session_update(
+            conn_id,
+            self._make_update(
+                reachy_private_transcript_barrier={"version": 1, "nonce": "de" * 32},
+            ),
+        )
+
+        assert isinstance(result, RealtimeErrorEvent)
+        assert result.error.type == "invalid_transcript_barrier"
+        assert runtime_config.transcript_barrier_enabled is False
+        assert runtime_config.transcript_barrier_failed is True
+
+    @pytest.mark.parametrize(
+        "barrier_request",
+        [
+            None,
+            {},
+            {"version": True, "nonce": "ab" * 32},
+            {"version": 2, "nonce": "ab" * 32},
+            {"version": 1, "nonce": "AB" * 32},
+            {"version": 1, "nonce": "ab" * 31},
+            {"version": 1, "nonce": "ab" * 32, "extra": "forbidden"},
+        ],
+    )
+    def test_private_transcript_barrier_rejects_malformed_activation(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+        barrier_request,
+    ):
+        result = service.handle_session_update(
+            conn_id,
+            self._make_update(reachy_private_transcript_barrier=barrier_request),
+        )
+
+        assert isinstance(result, RealtimeErrorEvent)
+        assert result.error.type == "invalid_transcript_barrier"
+        assert runtime_config.transcript_barrier_enabled is False
+        assert runtime_config.transcript_barrier_failed is True
 
     def test_session_update_tools_and_tool_choice(self, service, conn_id, runtime_config):
         tools = [{"type": "function", "name": "f1"}]
@@ -1498,6 +1631,214 @@ class TestDispatchPipelineEvent:
         assert text_prompt_queue.empty()
         assert runtime_config.chat.buffer == []
         assert service._state(conn_id).response_pending is False
+
+    def test_private_barrier_final_never_enters_chat_or_generation(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+        text_prompt_queue,
+    ):
+        nonce = "cd" * 32
+        runtime_config.transcript_barrier_version = 1
+        runtime_config.transcript_barrier_nonce = nonce
+        service.dispatch_pipeline_event(conn_id, SpeechStartedEvent())
+        service.dispatch_pipeline_event(conn_id, SpeechStoppedEvent(duration_s=1.2))
+
+        events = service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptBarrierCompletedEvent(transcript="Do you recognize me?", language_code="en"),
+        )
+
+        assert len(events) == 1
+        assert isinstance(events[0], TranscriptBarrierCompletedServerEvent)
+        assert events[0].nonce == nonce
+        assert events[0].sequence == 1
+        assert events[0].transcript == "Do you recognize me?"
+        assert runtime_config.chat.buffer == []
+        assert text_prompt_queue.empty()
+        assert service._state(conn_id).response_pending is False
+        assert runtime_config.transcript_barrier_pending is True
+        assert runtime_config.transcript_barrier_pending_transcript == "Do you recognize me?"
+
+    def test_private_barrier_exact_accept_is_the_only_history_entry(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+        text_prompt_queue,
+    ):
+        nonce = "34" * 32
+        transcript = "Do you recognize me?"
+        runtime_config.transcript_barrier_version = 1
+        runtime_config.transcript_barrier_nonce = nonce
+        completed = service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptBarrierCompletedEvent(transcript=transcript),
+        )[0]
+        assert isinstance(completed, TranscriptBarrierCompletedServerEvent)
+
+        resolved = service.handle_transcript_barrier_resolve(
+            conn_id,
+            TranscriptBarrierResolveEvent.model_validate(
+                {
+                    "type": "reachy.transcript_barrier.resolve",
+                    "version": 1,
+                    "nonce": nonce,
+                    "sequence": completed.sequence,
+                    "input_item_id": completed.item_id,
+                    "action": "accept",
+                    "item": {
+                        "id": "msg_identity_1",
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": transcript}],
+                    },
+                }
+            ),
+        )
+
+        assert [event.type for event in resolved] == [
+            "conversation.item.created",
+            "reachy.transcript_barrier.resolved",
+        ]
+        assert isinstance(resolved[-1], TranscriptBarrierResolvedServerEvent)
+        assert resolved[-1].action == "accepted"
+        assert resolved[-1].replacement_item_id == "msg_identity_1"
+        assert runtime_config.transcript_barrier_pending is False
+        assert runtime_config.transcript_barrier_pending_transcript is None
+        assert runtime_config.chat.buffer[-1].content[0].text == transcript
+        assert text_prompt_queue.empty()
+
+    def test_private_barrier_discard_scrubs_without_history(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+    ):
+        nonce = "56" * 32
+        runtime_config.transcript_barrier_version = 1
+        runtime_config.transcript_barrier_nonce = nonce
+        completed = service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptBarrierCompletedEvent(transcript="ordinary non-identity turn"),
+        )[0]
+        assert isinstance(completed, TranscriptBarrierCompletedServerEvent)
+
+        resolved = service.handle_transcript_barrier_resolve(
+            conn_id,
+            TranscriptBarrierResolveEvent(
+                nonce=nonce,
+                sequence=completed.sequence,
+                input_item_id=completed.item_id,
+                action="discard",
+            ),
+        )
+
+        assert len(resolved) == 1
+        assert isinstance(resolved[0], TranscriptBarrierResolvedServerEvent)
+        assert resolved[0].action == "discarded"
+        assert resolved[0].replacement_item_id is None
+        assert runtime_config.transcript_barrier_pending is False
+        assert runtime_config.transcript_barrier_pending_transcript is None
+        assert runtime_config.chat.buffer == []
+
+    @pytest.mark.parametrize("violation", ["wrong_text", "response_create", "second_final"])
+    def test_private_barrier_pending_protocol_violations_poison_and_scrub(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+        violation,
+    ):
+        nonce = "78" * 32
+        transcript = "private canary transcript"
+        runtime_config.transcript_barrier_version = 1
+        runtime_config.transcript_barrier_nonce = nonce
+        completed = service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptBarrierCompletedEvent(transcript=transcript),
+        )[0]
+        assert isinstance(completed, TranscriptBarrierCompletedServerEvent)
+
+        if violation == "wrong_text":
+            events = service.handle_transcript_barrier_resolve(
+                conn_id,
+                TranscriptBarrierResolveEvent.model_validate(
+                    {
+                        "type": "reachy.transcript_barrier.resolve",
+                        "version": 1,
+                        "nonce": nonce,
+                        "sequence": completed.sequence,
+                        "input_item_id": completed.item_id,
+                        "action": "accept",
+                        "item": {
+                            "id": "msg_wrong",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "different"}],
+                        },
+                    }
+                ),
+            )
+        elif violation == "response_create":
+            result = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+            assert result is not None
+            events = [result]
+        else:
+            events = service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptBarrierCompletedEvent(transcript="second final"),
+            )
+
+        assert events[0].type in {"error", "reachy.transcript_barrier.failed"}
+        assert runtime_config.transcript_barrier_failed is True
+        assert runtime_config.transcript_barrier_pending is False
+        assert runtime_config.transcript_barrier_pending_transcript is None
+        assert runtime_config.chat.buffer == []
+
+    def test_private_barrier_whitespace_final_is_content_free_and_inert(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+        text_prompt_queue,
+    ):
+        runtime_config.transcript_barrier_version = 1
+        runtime_config.transcript_barrier_nonce = "ef" * 32
+        service.dispatch_pipeline_event(conn_id, SpeechStartedEvent())
+
+        events = service.dispatch_pipeline_event(conn_id, TranscriptBarrierDiscardedEvent())
+
+        assert len(events) == 1
+        assert isinstance(events[0], TranscriptBarrierDiscardedServerEvent)
+        assert events[0].sequence == 1
+        assert not hasattr(events[0], "transcript")
+        assert runtime_config.chat.buffer == []
+        assert text_prompt_queue.empty()
+
+    def test_private_barrier_oversize_final_poisoned_without_echoing_content(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+        text_prompt_queue,
+    ):
+        runtime_config.transcript_barrier_version = 1
+        runtime_config.transcript_barrier_nonce = "12" * 32
+        service.dispatch_pipeline_event(conn_id, SpeechStartedEvent())
+
+        events = service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptBarrierCompletedEvent(transcript="x" * (TRANSCRIPT_BARRIER_MAX_CHARS + 1)),
+        )
+
+        assert len(events) == 1
+        assert isinstance(events[0], TranscriptBarrierFailedServerEvent)
+        assert events[0].reason == "transcript_too_large"
+        assert runtime_config.transcript_barrier_failed is True
+        assert runtime_config.chat.buffer == []
+        assert text_prompt_queue.empty()
 
     def test_create_response_false_stores_transcript_for_explicit_response(
         self,

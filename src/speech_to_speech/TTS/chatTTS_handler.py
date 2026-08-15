@@ -77,7 +77,10 @@ class ChatTTSHandler(BaseHandler[TTSIn, TTSOut]):
         text = tts_input.text
 
         _cancel_gen = self.cancel_scope.generation if self.cancel_scope else None
-        console.print(f"[green]ASSISTANT: {text}")
+        if tts_input.runtime_config and tts_input.runtime_config.transcript_barrier_enabled:
+            console.print("[green]ASSISTANT: [private content redacted]")
+        else:
+            console.print(f"[green]ASSISTANT: {text}")
         if self.device == "mps":
             import time
 

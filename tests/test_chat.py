@@ -1154,6 +1154,26 @@ class TestCompaction:
         # Buffer was not spliced.
         assert chat.buffer == before
 
+    def test_suppress_inflight_compaction_preserves_buffer_and_allows_future_work(self):
+        chat = Chat(size=2)
+        gate = threading.Event()
+        started = threading.Event()
+        compactor = _make_stub_compactor(gate=gate, started=started)
+        for i in range(3):
+            chat.add_item(_user(f"u{i}"))
+            chat.add_item(_assistant(f"a{i}"))
+        chat.add_item(_user("u3"))
+        chat.trim_if_needed(compactor)
+        assert started.wait(timeout=2.0)
+
+        before = list(chat.buffer)
+        chat.suppress_inflight_compaction()
+        gate.set()
+        _wait_thread(chat)
+
+        assert chat.buffer == before
+        assert chat._shutdown.is_set() is False
+
     def test_compactor_exception_leaves_buffer_unchanged(self):
         chat = Chat(size=2)
 

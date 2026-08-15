@@ -62,7 +62,8 @@ class ParaformerSTTHandler(BaseSTTHandler):
         torch.mps.empty_cache()
 
         logger.debug("finished paraformer inference")
-        console.print(f"[yellow]USER: {pred_text}")
+        if not self.transcript_barrier_enabled:
+            console.print(f"[yellow]USER: {pred_text}")
 
         if vad_audio.mode == "progressive":
             yield PartialTranscription(

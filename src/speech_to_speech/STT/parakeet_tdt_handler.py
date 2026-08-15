@@ -349,7 +349,7 @@ class ParakeetTDTSTTHandler(BaseSTTHandler):
         )
         logger.debug("Finished Parakeet TDT inference")
         self._clear_live_transcription_line()
-        if pred_text.strip():
+        if pred_text.strip() and not self.transcript_barrier_enabled:
             console.print(f"[yellow]USER: {pred_text.strip()}")
             if language_code:
                 console.print(f"[dim]Language: {language_code}[/dim]")
@@ -449,7 +449,7 @@ class ParakeetTDTSTTHandler(BaseSTTHandler):
             rich_text.append(result.active_text, style="cyan dim")
 
         progressive_text = self._build_progressive_text(result)
-        if progressive_text:
+        if progressive_text and not self.transcript_barrier_enabled:
             self._print_live_transcription(rich_text, progressive_text)
 
         return progressive_text

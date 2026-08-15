@@ -3,12 +3,17 @@ from __future__ import annotations
 import logging
 from queue import Queue
 from threading import Event
-from typing import Iterator, Union
+from typing import Callable, Iterator, Union
 
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.LLM.chat import make_user_message
-from speech_to_speech.pipeline.events import PartialTranscriptionEvent, TranscriptionCompletedEvent
+from speech_to_speech.pipeline.events import (
+    PartialTranscriptionEvent,
+    TranscriptBarrierCompletedEvent,
+    TranscriptBarrierDiscardedEvent,
+    TranscriptionCompletedEvent,
+)
 from speech_to_speech.pipeline.handler_types import LLMIn, STTOut
 from speech_to_speech.pipeline.messages import GenerateResponseRequest, PartialTranscription, Transcription
 from speech_to_speech.pipeline.queue_types import TextEventItem
@@ -34,13 +39,18 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
         text_output_queue: Queue[TextEventItem] | None = None,
         runtime_config: RuntimeConfig | None = None,
         should_listen: Event | None = None,
+        transcript_barrier_enabled: Callable[[], bool] | None = None,
     ) -> None:
         self.text_output_queue = text_output_queue
         self.runtime_config = runtime_config
         self.should_listen = should_listen
+        self.transcript_barrier_enabled = transcript_barrier_enabled or (lambda: False)
 
     def process(self, transcription: STTOut) -> Iterator[Union[STTOut, LLMIn]]:
         if isinstance(transcription, PartialTranscription):
+            if self.transcript_barrier_enabled():
+                logger.debug("Private transcript barrier suppressed a partial transcription")
+                return
             if self.text_output_queue and transcription.text:
                 self.text_output_queue.put(
                     PartialTranscriptionEvent(
@@ -66,6 +76,31 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
             speech_stopped_at_s = None
 
         transcript = str(text)
+        if self.transcript_barrier_enabled():
+            if self.text_output_queue is not None:
+                if transcript.strip():
+                    self.text_output_queue.put(
+                        TranscriptBarrierCompletedEvent(
+                            transcript=transcript,
+                            language_code=language_code,
+                            turn_id=turn_id,
+                            turn_revision=turn_revision,
+                            speech_stopped_at_s=speech_stopped_at_s,
+                        )
+                    )
+                    logger.debug("Private transcript barrier completed one transcription")
+                else:
+                    self.text_output_queue.put(
+                        TranscriptBarrierDiscardedEvent(
+                            turn_id=turn_id,
+                            turn_revision=turn_revision,
+                        )
+                    )
+                    logger.debug("Private transcript barrier discarded an empty transcription")
+            if not transcript.strip() and self.should_listen is not None:
+                self.should_listen.set()
+            return
+
         # Always close the client-visible transcription item. Empty final STT
         # results should not trigger the LLM, but clients may already have
         # received partial deltas and still need a completed event.

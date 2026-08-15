@@ -10,6 +10,7 @@ Run with pytest, or standalone:  python tests/test_chat_completions_backend.py
 from __future__ import annotations
 
 import json
+import logging
 import queue
 import threading
 from types import SimpleNamespace
@@ -139,6 +140,7 @@ def _drive(
     chat=None,
     response=None,
     instructions="Du bist ein Roboter.",
+    private_barrier=False,
 ):
     chat = chat or Chat(10)
     if user:
@@ -148,7 +150,12 @@ def _drive(
         session.tools = tools
     if tool_choice is not None:
         session.tool_choice = tool_choice
-    rc = RuntimeConfig(chat=chat, session=session)
+    rc = RuntimeConfig(
+        chat=chat,
+        session=session,
+        transcript_barrier_version=1 if private_barrier else None,
+        transcript_barrier_nonce="ab" * 32 if private_barrier else None,
+    )
     req = GenerateResponseRequest(
         runtime_config=rc, response=response, language_code="de", turn_id="t", turn_revision=0
     )
@@ -558,6 +565,22 @@ def test_generation_error_emits_failed_end_of_response():
     text, tools, usage, chat, end = _drive(h)
     assert end is not None and end.error is not None
     assert "kaboom" in end.error
+
+
+def test_private_barrier_generation_error_scrubs_exception_content(caplog):
+    h = _make_handler(stream=True)
+    canary = "PRIVATE_GENERATION_CANARY"
+
+    def boom(**kwargs):
+        raise RuntimeError(canary)
+
+    h.client.chat.completions.create = boom
+    with caplog.at_level(logging.DEBUG):
+        _text, _tools, _usage, _chat, end = _drive(h, private_barrier=True)
+
+    assert end is not None
+    assert end.error == "Language model generation failed in private transcript mode."
+    assert canary not in caplog.text
 
 
 # ── Out-of-band (conversation="none") responses ───────────────────────────────

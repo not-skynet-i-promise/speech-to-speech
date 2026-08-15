@@ -21,6 +21,7 @@ from starlette.websockets import WebSocketState
 
 from speech_to_speech.api.openai_realtime.pipeline_unit import PipelineUnit, SessionState
 from speech_to_speech.api.openai_realtime.service import ServerEvent, build_error_event
+from speech_to_speech.api.openai_realtime.transcript_barrier import TranscriptBarrierResolveEvent
 from speech_to_speech.pipeline.control import SESSION_END, PipelineControlMessage, is_control_message
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
@@ -29,6 +30,8 @@ from speech_to_speech.pipeline.events import (
     SpeechStartedEvent,
     SpeechStoppedEvent,
     TokenUsageEvent,
+    TranscriptBarrierCompletedEvent,
+    TranscriptBarrierDiscardedEvent,
     TranscriptionCompletedEvent,
 )
 from speech_to_speech.pipeline.log_context import pipeline_log_ctx
@@ -79,7 +82,14 @@ def _keep_audio_sentinel(item: Any) -> bool:
 def _keep_user_text_event(item: Any) -> bool:
     return isinstance(
         item,
-        (SpeechStoppedEvent, PartialTranscriptionEvent, TranscriptionCompletedEvent, TokenUsageEvent),
+        (
+            SpeechStoppedEvent,
+            PartialTranscriptionEvent,
+            TranscriptionCompletedEvent,
+            TranscriptBarrierCompletedEvent,
+            TranscriptBarrierDiscardedEvent,
+            TokenUsageEvent,
+        ),
     )
 
 
@@ -331,6 +341,16 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
 
                 event = unit.service.parse_client_event(raw)
                 if event is None:
+                    if raw.get("type") == "reachy.transcript_barrier.resolve":
+                        await _send_event(
+                            ws,
+                            unit.service.poison_transcript_barrier(
+                                session_id,
+                                "invalid_transcript_barrier_resolution",
+                            ),
+                        )
+                        await ws.close(code=1008, reason="Private transcript barrier resolution failed")
+                        return
                     await _send_event(
                         ws,
                         unit.service.make_error(
@@ -340,6 +360,16 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                     continue
 
                 if isinstance(event, InputAudioBufferAppendEvent):
+                    if not unit.service.transcript_barrier_audio_allowed(session_id):
+                        await _send_event(
+                            ws,
+                            unit.service.poison_transcript_barrier(
+                                session_id,
+                                "transcript_barrier_pending",
+                            ),
+                        )
+                        await ws.close(code=1008, reason="Private transcript barrier pending")
+                        return
                     chunks = unit.service.handle_audio_append(session_id, event)
                     rt_cfg = unit.service._state(session_id).runtime_config
                     for chunk in chunks:
@@ -351,14 +381,20 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                         await _send_event(ws, err)
 
                 elif isinstance(event, SessionUpdateEvent):
-                    err = unit.service.handle_session_update(session_id, event)
-                    if err:
-                        await _send_event(ws, err)
+                    result = unit.service.handle_session_update(session_id, event)
+                    if result:
+                        await _send_event(ws, result)
+                    if unit.service.transcript_barrier_failed(session_id):
+                        await ws.close(code=1008, reason="Private transcript barrier negotiation failed")
+                        return
 
                 elif isinstance(event, ConversationItemCreateEvent):
                     events = unit.service.handle_conversation_item_create(session_id, event)
                     if events:
                         await _send_events(ws, events)
+                    if unit.service.transcript_barrier_failed(session_id):
+                        await ws.close(code=1008, reason="Private transcript barrier pending")
+                        return
 
                 elif isinstance(event, ResponseCreateEvent):
                     result = unit.service.handle_response_create(session_id, event)
@@ -366,6 +402,17 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                         if result.type != "error":
                             unit.cancel_scope.new_response()
                         await _send_event(ws, result)
+                    if unit.service.transcript_barrier_failed(session_id):
+                        await ws.close(code=1008, reason="Private transcript barrier pending")
+                        return
+
+                elif isinstance(event, TranscriptBarrierResolveEvent):
+                    events = unit.service.handle_transcript_barrier_resolve(session_id, event)
+                    if events:
+                        await _send_events(ws, events)
+                    if unit.service.transcript_barrier_failed(session_id):
+                        await ws.close(code=1008, reason="Private transcript barrier resolution failed")
+                        return
 
                 elif isinstance(event, ResponseCancelEvent):
                     was_active = unit.service._state(session_id).in_response
@@ -483,6 +530,8 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                         events = unit.service.dispatch_pipeline_event(session_id, text_msg)
                         if events:
                             await _send_events(ws, events)
+                        if unit.service.transcript_barrier_failed(session_id):
+                            await ws.close(code=1008, reason="Private transcript barrier failed")
 
                     if is_speech_start and (was_in_response or was_response_pending):
                         active_cfg = unit.service._state(session_id).runtime_config if session_id else None

@@ -118,7 +118,11 @@ class LMOutputProcessor(BaseHandler[LLMOut, TTSIn]):
             logger.debug("Dropping stale LLM chunk for turn=%s rev=%s", lm_output.turn_id, lm_output.turn_revision)
             return
 
-        logger.debug("LM processor: parts=%s", lm_output.parts)
+        private_barrier = bool(lm_output.runtime_config and lm_output.runtime_config.transcript_barrier_enabled)
+        if private_barrier:
+            logger.debug("LM processor content redacted (parts=%d)", len(lm_output.parts))
+        else:
+            logger.debug("LM processor: parts=%s", lm_output.parts)
 
         if self.text_output_queue is not None:
             event = AssistantTextEvent(
@@ -127,7 +131,13 @@ class LMOutputProcessor(BaseHandler[LLMOut, TTSIn]):
                 turn_revision=lm_output.turn_revision,
                 cancel_generation=lm_output.cancel_generation,
             )
-            if lm_output.tools:
+            if private_barrier:
+                logger.debug(
+                    "Sending redacted content to client (parts=%d, tools=%d)",
+                    len(lm_output.parts),
+                    len(lm_output.tools),
+                )
+            elif lm_output.tools:
                 logger.info(f"Sending to clients: text='{lm_output.text}', tools={[t.name for t in lm_output.tools]}")
             else:
                 logger.debug(f"Sending to clients: text='{lm_output.text}' (no tools)")
@@ -137,7 +147,10 @@ class LMOutputProcessor(BaseHandler[LLMOut, TTSIn]):
             for part in lm_output.parts:
                 if not isinstance(part, AssistantTextPart) or not part.text:
                     continue
-                logger.debug("Forwarding to TTS: '%s'", part.text)
+                if private_barrier:
+                    logger.debug("Forwarding redacted content to TTS (characters=%d)", len(part.text))
+                else:
+                    logger.debug("Forwarding to TTS: '%s'", part.text)
                 yield TTSInput(
                     text=part.text,
                     language_code=lm_output.language_code,

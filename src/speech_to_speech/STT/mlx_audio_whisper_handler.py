@@ -140,7 +140,8 @@ class MLXAudioWhisperSTTHandler(BaseSTTHandler):
             language_code = self.last_language if self.last_language else "en"
 
         logger.debug("finished mlx-audio whisper inference")
-        console.print(f"[yellow]USER: {pred_text}")
+        if not self.transcript_barrier_enabled:
+            console.print(f"[yellow]USER: {pred_text}")
         logger.debug(f"Language Code: {language_code}")
 
         if self.start_language == "auto":

@@ -42,6 +42,14 @@ class RuntimeConfig(BaseModel):
         default_factory=lambda: RealtimeSessionCreateRequest(type="realtime"),
         validate_default=True,
     )
+    transcript_barrier_version: int | None = Field(default=None, exclude=True)
+    transcript_barrier_nonce: str | None = Field(default=None, exclude=True)
+    transcript_barrier_failed: bool = Field(default=False, exclude=True)
+    transcript_barrier_session_updates: int = Field(default=0, exclude=True)
+    transcript_barrier_sequence: int = Field(default=0, exclude=True)
+    transcript_barrier_pending_sequence: int | None = Field(default=None, exclude=True)
+    transcript_barrier_pending_item_id: str | None = Field(default=None, exclude=True)
+    transcript_barrier_pending_transcript: str | None = Field(default=None, exclude=True, repr=False)
 
     @field_validator("session", mode="after")
     @classmethod
@@ -99,3 +107,27 @@ class RuntimeConfig(BaseModel):
         """Merge non-None, explicitly-set fields from 'update' into the
         current 'session', preserving any fields not present in the update."""
         _apply_update(self.session, update)
+
+    @property
+    def transcript_barrier_enabled(self) -> bool:
+        """Whether the exact opt-in handshake is active for this session."""
+        return (
+            not self.transcript_barrier_failed
+            and self.transcript_barrier_version == 1
+            and self.transcript_barrier_nonce is not None
+        )
+
+    def next_transcript_barrier_sequence(self) -> int:
+        """Allocate one monotonic event sequence within the current session."""
+        self.transcript_barrier_sequence += 1
+        return self.transcript_barrier_sequence
+
+    @property
+    def transcript_barrier_pending(self) -> bool:
+        return self.transcript_barrier_pending_sequence is not None
+
+    def clear_transcript_barrier_pending(self) -> None:
+        """Scrub the only short-lived raw transcript retained by the barrier."""
+        self.transcript_barrier_pending_sequence = None
+        self.transcript_barrier_pending_item_id = None
+        self.transcript_barrier_pending_transcript = None

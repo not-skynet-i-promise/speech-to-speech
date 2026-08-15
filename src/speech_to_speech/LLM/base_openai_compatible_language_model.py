@@ -415,9 +415,15 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 if self._generation_is_stale(turn.gen):
                     logger.info("LLM generation cancelled (interruption)")
                 else:
-                    logger.debug(f"Clean text: {state.clean_text}")
+                    if turn.runtime_config.transcript_barrier_enabled:
+                        logger.debug("Generated text redacted (characters=%d)", len(state.clean_text))
+                    else:
+                        logger.debug("Clean text: %s", state.clean_text)
                     yield from _flush(sentence_batch)
-            logger.info(f"Tools: {state.tools}")
+            if turn.runtime_config.transcript_barrier_enabled:
+                logger.info("Generated tools redacted (count=%d)", len(state.tools))
+            else:
+                logger.info("Tools: %s", state.tools)
 
     def _consume_nonstreaming(self, events: Iterator[ProviderEvent], state: _GenState, turn: _Turn) -> Iterator[LLMOut]:
         if self._generation_is_stale(turn.gen) or not self._turn_is_latest(turn.turn_id, turn.turn_revision):
@@ -445,8 +451,12 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     and self._turn_output_allowed(turn.turn_id, turn.turn_revision)
                 ):
                     yield self._chunk(turn, text=out)
-        logger.debug(f"Clean text: {state.clean_text}")
-        logger.info(f"Tools: {state.tools}")
+        if turn.runtime_config.transcript_barrier_enabled:
+            logger.debug("Generated text redacted (characters=%d)", len(state.clean_text))
+            logger.info("Generated tools redacted (count=%d)", len(state.tools))
+        else:
+            logger.debug("Clean text: %s", state.clean_text)
+            logger.info("Tools: %s", state.tools)
 
     # ── orchestration ─────────────────────────────────────────────────────────
 
@@ -501,9 +511,16 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             # the error and fall through to the EndOfResponse below. Without this the
             # exception would escape process() and no EndOfResponse would be emitted,
             # leaving st.in_response stuck and locking every subsequent response.
-            logger.exception("LLM generation failed; ending the current response")
+            if turn.runtime_config.transcript_barrier_enabled:
+                logger.error("LLM generation failed; private content redacted")
+            else:
+                logger.exception("LLM generation failed; ending the current response")
             if error_message is None:
-                error_message = f"Language model generation failed: {exc}"
+                error_message = (
+                    "Language model generation failed in private transcript mode."
+                    if turn.runtime_config.transcript_barrier_enabled
+                    else f"Language model generation failed: {exc}"
+                )
         finally:
             if api_response is not None and hasattr(api_response, "close"):
                 try:

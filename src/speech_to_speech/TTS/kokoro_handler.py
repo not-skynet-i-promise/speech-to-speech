@@ -272,6 +272,11 @@ class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
         if voice:
             self.voice = voice
 
+        if runtime_config is not None and runtime_config.transcript_barrier_enabled:
+            console.print("[green]ASSISTANT: [private content redacted]")
+        else:
+            console.print(f"[green]ASSISTANT: {text}")
+
         if self.backend == "mlx":
             yield from self._process_mlx(text, language_code)
         else:
@@ -301,8 +306,6 @@ class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
                         logger.warning(
                             f"Failed to switch language/voice: {e}. Keeping current language: {self.lang_code}"
                         )
-
-            console.print(f"[green]ASSISTANT: {llm_sentence}")
 
             # Generate audio using the preloaded pipeline directly
             # This avoids the voice reload that happens in model.generate()
@@ -368,8 +371,6 @@ class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
                 from kokoro import KPipeline
 
                 self.pipeline = KPipeline(lang_code=self.lang_code)
-
-        console.print(f"[green]ASSISTANT: {llm_sentence}")
 
         # Generate audio using Kokoro
         # The pipeline yields tuples of (graphemes, phonemes, audio)

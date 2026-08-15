@@ -105,13 +105,16 @@ class FacebookMMSTTSHandler(BaseHandler[TTSIn, TTSOut]):
         logger.info(f"Warming up {self.__class__.__name__}")
         self.generate_audio("Hello, this is a test")
 
-    def generate_audio(self, text: str) -> torch.Tensor | None:
+    def generate_audio(self, text: str, *, redact_content: bool = False) -> torch.Tensor | None:
         if not text:
             logger.warning("Received empty text input")
             return None
 
         try:
-            logger.debug(f"Tokenizing text: {text}")
+            if redact_content:
+                logger.debug("Tokenizing redacted text (characters=%d)", len(text))
+            else:
+                logger.debug("Tokenizing text: %s", text)
             logger.debug(f"Current language: {self.language}")
             logger.debug(f"Tokenizer: {self.tokenizer}")
 
@@ -132,7 +135,10 @@ class FacebookMMSTTSHandler(BaseHandler[TTSIn, TTSOut]):
             logger.debug(f"Output waveform shape: {output.waveform.shape}")
             return output.waveform
         except Exception as e:
-            logger.error(f"Error in generate_audio: {str(e)}")
+            if redact_content:
+                logger.error("Facebook MMS generation failed; private content redacted")
+            else:
+                logger.error("Error in generate_audio: %s", e)
             logger.exception("Full traceback:")
             return None
 
@@ -160,8 +166,13 @@ class FacebookMMSTTSHandler(BaseHandler[TTSIn, TTSOut]):
         language_code = tts_input.language_code
         text = tts_input.text
 
-        console.print(f"[green]ASSISTANT: {text}")
-        logger.debug(f"Processing text: {text}")
+        private_barrier = bool(tts_input.runtime_config and tts_input.runtime_config.transcript_barrier_enabled)
+        if private_barrier:
+            console.print("[green]ASSISTANT: [private content redacted]")
+            logger.debug("Processing redacted text (characters=%d)", len(text))
+        else:
+            console.print(f"[green]ASSISTANT: {text}")
+            logger.debug("Processing text: %s", text)
         logger.debug(f"Language code: {language_code}")
 
         if language_code is not None and self.language != language_code:
@@ -174,7 +185,7 @@ class FacebookMMSTTSHandler(BaseHandler[TTSIn, TTSOut]):
                 )
                 logger.warning(f"Unsupported language: {language_code}")
 
-        audio_output = self.generate_audio(text)
+        audio_output = self.generate_audio(text, redact_content=private_barrier)
 
         if audio_output is None or audio_output.numel() == 0:
             logger.warning("No audio output generated")

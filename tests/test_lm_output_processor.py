@@ -1,9 +1,11 @@
+import logging
 from queue import Queue
 from threading import Event, Thread
 
 from openai.types.realtime.realtime_response_create_params import RealtimeResponseCreateParams
 from openai.types.responses import ResponseFunctionToolCall
 
+from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.LLM.lm_output_processor import LMOutputProcessor
 from speech_to_speech.pipeline.messages import (
     AssistantTextPart,
@@ -104,6 +106,34 @@ def test_audio_chunk_is_forwarded_to_tts():
     assert len(outputs) == 1
     assert isinstance(outputs[0], TTSInput)
     assert outputs[0].text == "hello"
+
+
+def test_private_barrier_redacts_generated_content_from_processor_logs(caplog):
+    tracker = SpeculativeTurnTracker()
+    tracker.observe("turn_1", 0)
+    processor = _processor(tracker)
+    runtime_config = RuntimeConfig(
+        transcript_barrier_version=1,
+        transcript_barrier_nonce="ab" * 32,
+    )
+    canary = "PRIVATE DISPLAY NAME CANARY"
+
+    with caplog.at_level(logging.DEBUG, logger="speech_to_speech.LLM.lm_output_processor"):
+        outputs = list(
+            processor.process(
+                LLMResponseChunk(
+                    text=canary,
+                    runtime_config=runtime_config,
+                    turn_id="turn_1",
+                    turn_revision=0,
+                    response=RealtimeResponseCreateParams(output_modalities=["audio"]),
+                )
+            )
+        )
+
+    assert outputs[0].text == canary
+    assert canary not in caplog.text
+    assert "redacted" in caplog.text
 
 
 def test_ordered_parts_reach_clients_and_only_text_reaches_tts():

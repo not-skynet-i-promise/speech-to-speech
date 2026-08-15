@@ -458,6 +458,12 @@ class Chat:
             self._gen_counter += 1
             self._compact_in_flight = False
 
+    def suppress_inflight_compaction(self) -> None:
+        """Prevent an older background summary from splicing into current state."""
+        with self._lock:
+            self._gen_counter += 1
+            self._compact_in_flight = False
+
     def image_message_ids(self) -> set[str]:
         """IDs of user messages currently carrying ``input_image`` content."""
         with self._lock:

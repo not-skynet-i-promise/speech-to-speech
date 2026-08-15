@@ -132,7 +132,8 @@ class WhisperSTTHandler(BaseSTTHandler):
         language_code = self.processor.tokenizer.decode(pred_ids[0, 1])[2:-2]  # remove "<|" and "|>"
 
         logger.debug("finished whisper inference")
-        console.print(f"[yellow]USER: {pred_text}")
+        if not self.transcript_barrier_enabled:
+            console.print(f"[yellow]USER: {pred_text}")
         logger.debug(f"Language Code Whisper: {language_code}")
 
         if self.start_language == "auto":

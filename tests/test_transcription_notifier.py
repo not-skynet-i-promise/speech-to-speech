@@ -3,7 +3,12 @@ from queue import Queue
 from threading import Event
 
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
-from speech_to_speech.pipeline.events import PartialTranscriptionEvent, TranscriptionCompletedEvent
+from speech_to_speech.pipeline.events import (
+    PartialTranscriptionEvent,
+    TranscriptBarrierCompletedEvent,
+    TranscriptBarrierDiscardedEvent,
+    TranscriptionCompletedEvent,
+)
 from speech_to_speech.pipeline.messages import GenerateResponseRequest, PartialTranscription, Transcription
 from speech_to_speech.STT.transcription_notifier import TranscriptionNotifier
 
@@ -12,9 +17,15 @@ def _notifier(
     text_output_queue: Queue | None = None,
     runtime_config: RuntimeConfig | None = None,
     should_listen: Event | None = None,
+    barrier_enabled: bool = False,
 ) -> TranscriptionNotifier:
     notifier = object.__new__(TranscriptionNotifier)
-    notifier.setup(text_output_queue=text_output_queue, runtime_config=runtime_config, should_listen=should_listen)
+    notifier.setup(
+        text_output_queue=text_output_queue,
+        runtime_config=runtime_config,
+        should_listen=should_listen,
+        transcript_barrier_enabled=lambda: barrier_enabled,
+    )
     return notifier
 
 
@@ -77,4 +88,36 @@ def test_empty_final_transcription_reenables_listening_without_runtime_config():
 
     assert list(notifier.process(Transcription(text="", language_code="en"))) == []
 
+    assert should_listen.is_set()
+
+
+def test_private_barrier_suppresses_partials_and_reserves_the_final_without_logging(caplog):
+    text_output_queue = Queue()
+    notifier = _notifier(text_output_queue=text_output_queue, barrier_enabled=True)
+    canary = "Josh private transcript canary"
+
+    with caplog.at_level(logging.DEBUG, logger="speech_to_speech.STT.transcription_notifier"):
+        assert list(notifier.process(PartialTranscription(text=canary))) == []
+        assert list(notifier.process(Transcription(text=canary, language_code="en"))) == []
+
+    event = text_output_queue.get_nowait()
+    assert isinstance(event, TranscriptBarrierCompletedEvent)
+    assert event.transcript == canary
+    assert text_output_queue.empty()
+    assert canary not in caplog.text
+
+
+def test_private_barrier_discards_whitespace_without_a_placeholder_or_response():
+    text_output_queue = Queue()
+    should_listen = Event()
+    notifier = _notifier(
+        text_output_queue=text_output_queue,
+        should_listen=should_listen,
+        barrier_enabled=True,
+    )
+
+    assert list(notifier.process(Transcription(text=" \t\n", language_code="en"))) == []
+
+    assert isinstance(text_output_queue.get_nowait(), TranscriptBarrierDiscardedEvent)
+    assert text_output_queue.empty()
     assert should_listen.is_set()

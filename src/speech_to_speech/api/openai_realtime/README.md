@@ -86,6 +86,46 @@ should begin.
 | `response.function_call_arguments.done` | Tool call with `call_id`, `name`, and JSON `arguments`. |
 | `response.done` | Response finished (`completed`, `cancelled` with reason `turn_detected` or `client_cancelled`). |
 
+### Opt-in private transcript barrier
+
+Trusted local clients that must route a completed transcript before it enters
+ordinary model history can request the versioned `reachy` extension in their
+first `session.update`:
+
+```json
+{
+  "type": "session.update",
+  "session": {
+    "type": "realtime",
+    "reachy_private_transcript_barrier": {
+      "version": 1,
+      "nonce": "<64 lowercase hexadecimal characters>"
+    }
+  }
+}
+```
+
+The client must wait for an exact `reachy.transcript_barrier.ready` event with
+the same version and nonce before sending microphone audio. In this mode the
+server suppresses partial transcript events and transcript-content logs. A
+non-empty final is emitted only as `reachy.transcript_barrier.completed` and is
+held outside model history. While that final is pending, new audio,
+`conversation.item.create`, and `response.create` fail closed.
+
+The client must answer once with `reachy.transcript_barrier.resolve`, matching
+the nonce, sequence, and input item ID. `action="accept"` must include exactly
+one `msg_` user message whose sole `input_text` is byte-for-byte equal to the
+pending final; the server then inserts that one message and acknowledges it as
+`accepted`. `action="discard"` includes no item and scrubs the final without a
+history entry. Empty or whitespace-only STT results produce a content-free
+`reachy.transcript_barrier.discarded` event and require no resolution.
+
+Malformed, duplicate, overlapping, stale, or mismatched barrier events poison
+the session and close the WebSocket. Pending transcript text is scrubbed on
+resolution, failure, and disconnect. Assistant content logs are also redacted
+for a barrier-enabled session. Clients that do not request this extension keep
+the standard Realtime behavior described above.
+
 ---
 
 ## Tool Calling Design

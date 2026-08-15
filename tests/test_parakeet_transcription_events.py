@@ -27,6 +27,24 @@ def test_show_progressive_transcription_returns_combined_text(monkeypatch):
     assert result == "I just wanted to check in"
 
 
+def test_private_barrier_suppresses_progressive_console_content(monkeypatch):
+    calls = []
+    handler = object.__new__(ParakeetTDTSTTHandler)
+    handler.set_transcript_barrier_enabled(lambda: True)
+    handler.streaming_handler = SimpleNamespace(
+        transcribe_incremental=lambda audio: SimpleNamespace(
+            fixed_text="PRIVATE NAME CANARY",
+            active_text="PRIVATE TRANSCRIPT CANARY",
+        )
+    )
+    monkeypatch.setattr(parakeet_tdt_handler.console, "print", lambda *args, **kwargs: calls.append(args))
+
+    result = handler._show_progressive_transcription(np.zeros(16000, dtype=np.float32))
+
+    assert result == "PRIVATE NAME CANARY PRIVATE TRANSCRIPT CANARY"
+    assert calls == []
+
+
 def test_live_transcription_clears_terminal_line_before_each_update(monkeypatch):
     calls = []
 
@@ -139,6 +157,29 @@ def test_process_yields_final_transcript(monkeypatch):
     assert isinstance(result[0], Transcription)
     assert result[0].text == "I am here."
     assert result[0].language_code == "en"
+
+
+def test_private_barrier_suppresses_final_console_content(monkeypatch):
+    calls = []
+    handler = object.__new__(ParakeetTDTSTTHandler)
+    handler.set_transcript_barrier_enabled(lambda: True)
+    handler.enable_live_transcription = False
+    handler.backend = "nano_parakeet"
+    handler.last_language = "en"
+    handler.start_language = None
+
+    @contextmanager
+    def fake_lock(*args, **kwargs):
+        yield True
+
+    handler._compute_lock_context = fake_lock
+    handler._process_nano_parakeet = lambda audio_input: ("PRIVATE FINAL CANARY", "en")
+    monkeypatch.setattr(parakeet_tdt_handler.console, "print", lambda *args, **kwargs: calls.append(args))
+
+    result = list(handler.process(VADAudio(audio=np.zeros(16000, dtype=np.float32), mode="final")))
+
+    assert result[0].text == "PRIVATE FINAL CANARY"
+    assert calls == []
 
 
 def test_parakeet_timing_logs_only_final_transcriptions():
