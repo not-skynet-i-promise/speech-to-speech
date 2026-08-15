@@ -131,8 +131,10 @@ compaction until exact resolution. Privacy-mode exception and content logging
 remains sticky after poison until the session is unregistered, so draining work
 cannot downgrade into ordinary logging. Parse-time and semantic client-event
 failures use content-free wire errors rather than echoing client-controlled
-values while that mode is active. Clients that do not request this extension
-keep the standard Realtime behavior described above.
+values while that mode is active. Rejected multi-item in-band `response.input`
+batches retain no accepted prefix in history, and low-level tool-parser/session
+logs use the same sticky redaction boundary. Clients that do not request this
+extension keep the standard Realtime behavior described above.
 
 ---
 

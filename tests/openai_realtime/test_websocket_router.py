@@ -357,6 +357,85 @@ class TestClientEventDispatch:
         }
         assert "CANARY" not in str(error)
 
+    def test_private_response_input_semantic_failure_is_atomic(self, setup):
+        app, service, *_ = setup
+        nonce = "d0" * 32
+        canary = "PRIVATE_REJECTED_PREFIX_CANARY"
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "realtime",
+                            "reachy_private_transcript_barrier": {"version": 1, "nonce": nonce},
+                        },
+                    }
+                )
+                assert ws.receive_json()["type"] == "reachy.transcript_barrier.ready"
+
+                ws.send_json(
+                    {
+                        "type": "response.create",
+                        "response": {
+                            "input": [
+                                {
+                                    "id": "msg_private_prefix",
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [{"type": "input_text", "text": canary}],
+                                },
+                                {
+                                    "id": "PRIVATE_INVALID_SECOND_ITEM",
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [{"type": "input_text", "text": "invalid"}],
+                                },
+                            ]
+                        },
+                    }
+                )
+                error = ws.receive_json()
+                state = service._state(service.connection_ids[0])
+
+                assert error["error"]["message"] == "Invalid private client event."
+                assert "CANARY" not in str(error)
+                assert state.runtime_config.chat.buffer == []
+                assert canary not in str(state.runtime_config.chat.to_responses_api_chat())
+
+    def test_private_session_updates_redact_model_values(self, setup, caplog):
+        app, _service, *_ = setup
+        nonce = "d1" * 32
+        activation_canary = "PRIVATE_ACTIVATION_MODEL_CANARY"
+        update_canary = "PRIVATE_POST_HANDSHAKE_MODEL_CANARY"
+        with caplog.at_level(logging.INFO):
+            with TestClient(app) as client:
+                with client.websocket_connect("/v1/realtime") as ws:
+                    ws.receive_json()
+                    ws.send_json(
+                        {
+                            "type": "session.update",
+                            "session": {
+                                "type": "realtime",
+                                "model": activation_canary,
+                                "reachy_private_transcript_barrier": {"version": 1, "nonce": nonce},
+                            },
+                        }
+                    )
+                    assert ws.receive_json()["type"] == "reachy.transcript_barrier.ready"
+                    ws.send_json(
+                        {
+                            "type": "session.update",
+                            "session": {"type": "realtime", "model": update_canary},
+                        }
+                    )
+                    time.sleep(0.01)
+
+        assert activation_canary not in caplog.text
+        assert update_canary not in caplog.text
+        assert caplog.text.count("Private session model updated; content redacted") == 2
+
     def test_private_transcript_barrier_exact_resolution_round_trip(self, setup):
         app, service, _, _, text_output_queue, *_ = setup
         nonce = "ef" * 32

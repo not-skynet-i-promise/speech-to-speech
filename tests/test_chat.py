@@ -8,6 +8,7 @@ functions (make_user_message, make_assistant_message, make_system_message).
 
 from __future__ import annotations
 
+import logging
 import threading
 
 import pytest
@@ -216,6 +217,32 @@ class TestAddItemEviction:
         chat.add_item(fc)
         assert fc.call_id is not None
         assert fc.call_id.startswith("call_")
+
+    def test_private_function_call_logs_hide_client_ids(self, caplog):
+        chat = Chat(size=5)
+        chat.enable_private_content_logging()
+        call_id = "call_PRIVATE_CHAT_LOG_CANARY"
+
+        with caplog.at_level(logging.DEBUG, logger="speech_to_speech.LLM.chat"):
+            chat.add_item(_fc(call_id))
+            chat.append_tool_output(call_id, _fco(call_id))
+
+        assert "PRIVATE_CHAT_LOG_CANARY" not in caplog.text
+        assert "content redacted" in caplog.text
+
+    def test_atomic_batch_restores_function_status_and_history_on_failure(self):
+        chat = Chat(size=5)
+        function_call = _fc("atomic")
+        chat.add_item(function_call)
+        invalid = _user("invalid")
+        invalid.id = "PRIVATE_INVALID_BATCH_ID"
+
+        with pytest.raises(ChatItemError):
+            chat.add_items_atomically([_fco("atomic"), invalid])
+
+        assert function_call.status is None
+        assert chat.buffer == []
+        assert chat._pending_tool_calls == {"call_atomic": function_call}
 
     def test_eviction_when_exceeding_size(self):
         chat = Chat(size=1)

@@ -106,6 +106,7 @@ def _parse_function_exprs(
     pattern_to_match: list[str],
     *,
     lenient_fallback: bool = False,
+    redact_private_content: bool = False,
 ) -> List["FunctionToolCall"]:
     """Parse *expressions* into calls, optionally with the lenient fallback rules.
 
@@ -123,10 +124,13 @@ def _parse_function_exprs(
                 continue
             raise
         if lenient_fallback and any(_POSITIONAL_RE.match(key) for key in call.parameters):
-            logger.warning(
-                "Dropping recovered call '%s' with positional arguments from malformed output",
-                call.function_name,
-            )
+            if redact_private_content:
+                logger.warning("Dropping malformed private recovered call; content redacted")
+            else:
+                logger.warning(
+                    "Dropping recovered call '%s' with positional arguments from malformed output",
+                    call.function_name,
+                )
             continue
         if pattern_to_match and all(pattern not in call.function_name for pattern in pattern_to_match):
             continue
@@ -233,14 +237,22 @@ def _is_json_safe(value: Any) -> bool:
     return _json_fingerprint(value) is not None
 
 
-def _log_dropped_positionals(function_name: str, positional: list[tuple[str, Any]]) -> None:
+def _log_dropped_positionals(
+    function_name: str,
+    positional: list[tuple[str, Any]],
+    *,
+    redact_private_content: bool = False,
+) -> None:
     """Log positional parameter keys without logging their values."""
     if positional:
-        logger.warning(
-            "Dropping positional arguments for '%s': %s",
-            function_name,
-            {key for key, _value in positional},
-        )
+        if redact_private_content:
+            logger.warning("Dropping private positional arguments; content redacted")
+        else:
+            logger.warning(
+                "Dropping positional arguments for '%s': %s",
+                function_name,
+                {key for key, _value in positional},
+            )
 
 
 def _call_from_ast(parsed: ast.Call, expr: str) -> "FunctionToolCall":
@@ -435,6 +447,8 @@ class FunctionToolCall(BaseModel):
     def to_realtime_function_tool_call(
         self,
         function_tools: list[FunctionTool] | None = None,
+        *,
+        redact_private_content: bool = False,
     ) -> ResponseFunctionToolCall:
         positional = [(k, v) for k, v in self.parameters.items() if _POSITIONAL_RE.match(k)]
         arguments = {k: v for k, v in self.parameters.items() if not _POSITIONAL_RE.match(k)}
@@ -467,11 +481,14 @@ class FunctionToolCall(BaseModel):
 
             undeclared = {k for k in arguments if k not in properties}
             if undeclared:
-                logger.warning(
-                    "Dropping undeclared parameters for '%s': %s",
-                    self.function_name,
-                    undeclared,
-                )
+                if redact_private_content:
+                    logger.warning("Dropping private undeclared parameters; content redacted")
+                else:
+                    logger.warning(
+                        "Dropping undeclared parameters for '%s': %s",
+                        self.function_name,
+                        undeclared,
+                    )
                 arguments = {k: v for k, v in arguments.items() if k in properties}
 
             missing = set(required_names) - set(arguments.keys())
@@ -497,17 +514,31 @@ class FunctionToolCall(BaseModel):
                             arguments.update(zip(fields, values, strict=True))
                             positional = []
                             missing = set(required_names) - set(arguments)
-                            logger.warning(
-                                "Mapped %d positional arguments for '%s' to declared fields %s",
-                                len(fields),
-                                self.function_name,
-                                fields,
-                            )
+                            if redact_private_content:
+                                logger.warning(
+                                    "Mapped %d private positional arguments; content redacted",
+                                    len(fields),
+                                )
+                            else:
+                                logger.warning(
+                                    "Mapped %d positional arguments for '%s' to declared fields %s",
+                                    len(fields),
+                                    self.function_name,
+                                    fields,
+                                )
             if missing:
-                _log_dropped_positionals(self.function_name, positional)
+                _log_dropped_positionals(
+                    self.function_name,
+                    positional,
+                    redact_private_content=redact_private_content,
+                )
                 raise ValueError(f"Missing required parameters for '{self.function_name}': {missing}")
 
-        _log_dropped_positionals(self.function_name, positional)
+        _log_dropped_positionals(
+            self.function_name,
+            positional,
+            redact_private_content=redact_private_content,
+        )
 
         try:
             serialized_arguments = json.dumps(arguments, allow_nan=False)
@@ -527,7 +558,12 @@ class FunctionToolCall(BaseModel):
 # ── Public API ───────────────────────────────────────────────────────
 
 
-def parse_function_call(function_string: str, pattern_to_match: list[str] = []) -> List[FunctionToolCall]:
+def parse_function_call(
+    function_string: str,
+    pattern_to_match: list[str] = [],
+    *,
+    redact_private_content: bool = False,
+) -> List[FunctionToolCall]:
     """Parse a function call string and extract all function calls found.
 
     Args:
@@ -549,9 +585,14 @@ def parse_function_call(function_string: str, pattern_to_match: list[str] = []) 
             _split_simple_calls_with_regex(function_string),
             pattern_to_match,
             lenient_fallback=True,
+            redact_private_content=redact_private_content,
         )
 
-    return _parse_function_exprs(expressions, pattern_to_match)
+    return _parse_function_exprs(
+        expressions,
+        pattern_to_match,
+        redact_private_content=redact_private_content,
+    )
 
 
 def parse_multiple_functions(function_strings: List[str]) -> List[FunctionToolCall]:
@@ -572,7 +613,12 @@ def parse_multiple_functions(function_strings: List[str]) -> List[FunctionToolCa
     return results
 
 
-def extract_function_calls_from_text(text: str, block_regex: str = ".*") -> Tuple[str, List[FunctionToolCall]]:
+def extract_function_calls_from_text(
+    text: str,
+    block_regex: str = ".*",
+    *,
+    redact_private_content: bool = False,
+) -> Tuple[str, List[FunctionToolCall]]:
     """Extract function calls from delimited code blocks inside *text*.
 
     The LLM is prompted to wrap tool calls inside code-block delimiters
@@ -603,6 +649,6 @@ def extract_function_calls_from_text(text: str, block_regex: str = ".*") -> Tupl
         return outside, []
 
     try:
-        return outside, parse_function_call(inside)
+        return outside, parse_function_call(inside, redact_private_content=redact_private_content)
     except Exception:
         return outside, []

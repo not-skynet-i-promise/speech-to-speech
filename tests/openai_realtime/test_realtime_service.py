@@ -814,6 +814,39 @@ class TestHandleResponseCreate:
         assert "call_bogus" in result.error.message
         assert service._state(conn_id).in_response is False
 
+    def test_private_response_input_rejection_retains_no_valid_prefix(self, service, conn_id):
+        state = service._state(conn_id)
+        state.runtime_config.transcript_barrier_version = 1
+        state.runtime_config.transcript_barrier_nonce = "ac" * 32
+        canary = "PRIVATE_REJECTED_PREFIX_CANARY"
+        event = ResponseCreateEvent(
+            type="response.create",
+            response={
+                "input": [
+                    {
+                        "id": "msg_private_prefix",
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": canary}],
+                    },
+                    {
+                        "id": "PRIVATE_INVALID_SECOND_ITEM",
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "invalid"}],
+                    },
+                ]
+            },
+        )
+
+        result = service.handle_response_create(conn_id, event)
+
+        assert isinstance(result, RealtimeErrorEvent)
+        assert result.error.message == "Invalid private client event."
+        assert state.in_response is False
+        assert state.runtime_config.chat.buffer == []
+        assert canary not in str(state.runtime_config.chat.to_responses_api_chat())
+
     def test_double_response_create_rejected(self, service, conn_id, text_prompt_queue):
         """Second response.create is rejected because in_response is set immediately."""
         evt = ResponseCreateEvent(type="response.create")

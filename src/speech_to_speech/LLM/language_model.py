@@ -342,11 +342,19 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             block_end = code_and_after.index(ctx.end_code) + len(ctx.end_code)
             complete_block = code_and_after[:block_end]
             printable_text = code_and_after[block_end:]
-            _, func_calls = extract_function_calls_from_text(complete_block, ctx.block_regex)
+            private_content = runtime_config is not None and runtime_config.transcript_barrier_enabled
+            _, func_calls = extract_function_calls_from_text(
+                complete_block,
+                ctx.block_regex,
+                redact_private_content=private_content,
+            )
             parsed_tools: list[ResponseFunctionToolCall] = []
             for fc in func_calls:
                 try:
-                    tool_call = fc.to_realtime_function_tool_call(ctx.function_tools)
+                    tool_call = fc.to_realtime_function_tool_call(
+                        ctx.function_tools,
+                        redact_private_content=private_content,
+                    )
                 except ValueError as e:
                     if runtime_config is not None and runtime_config.transcript_barrier_enabled:
                         logger.warning("Skipping invalid private tool call; content redacted")

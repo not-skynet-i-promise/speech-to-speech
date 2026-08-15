@@ -19,7 +19,7 @@ from openai.types.realtime.realtime_response_status import RealtimeResponseStatu
 from openai.types.realtime.realtime_response_usage import RealtimeResponseUsage
 
 from speech_to_speech.api.openai_realtime.handlers.base import RealtimeBaseHandler
-from speech_to_speech.LLM.chat import ChatItemError
+from speech_to_speech.LLM.chat import ChatItemError, add_supported_items_atomically
 from speech_to_speech.pipeline.events import AssistantTextEvent
 from speech_to_speech.pipeline.messages import AssistantTextPart, AssistantToolCallPart, GenerateResponseRequest
 from speech_to_speech.utils.utils import _generate_id, is_out_of_band, response_wants_audio
@@ -208,11 +208,10 @@ class ResponseHandler(RealtimeBaseHandler):
         # they appear in history. Out-of-band: leave the default conversation untouched —
         # the input rides along on the request and seeds a throwaway chat in the LM.
         if not out_of_band and event.response and event.response.input:
-            for input_item in event.response.input:
-                try:
-                    self._service.conversation._append_item(conn_id, input_item)
-                except ChatItemError as exc:
-                    return self.make_client_content_error(conn_id, str(exc), "invalid_input_item")
+            try:
+                add_supported_items_atomically(st.runtime_config.chat, list(event.response.input))
+            except ChatItemError as exc:
+                return self.make_client_content_error(conn_id, str(exc), "invalid_input_item")
 
         st.in_response = True
         st.response_pending = False

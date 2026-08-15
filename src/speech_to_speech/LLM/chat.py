@@ -160,7 +160,10 @@ class Chat:
             return
 
         if call_id in self._pending_tool_calls:
-            logger.info("Re-injecting evicted function_call for call_id=%s", call_id)
+            if self._private_content_logging:
+                logger.info("Re-injecting private evicted function_call; content redacted")
+            else:
+                logger.info("Re-injecting evicted function_call for call_id=%s", call_id)
             fc = self._pending_tool_calls.pop(call_id)
             fc.status = "completed" if output_item.status is None else output_item.status
             self.buffer.append(fc)
@@ -185,58 +188,91 @@ class Chat:
         Raises :class:`ChatItemError` if the item fails validation.
         """
         with self._lock:
-            if isinstance(item, RealtimeConversationItemSystemMessage):
-                item.id = _ensure_id(item.id, "sys")
-                self.init_chat_message = item
-                logger.debug("Set system message via conversation item")
+            return self._add_item_locked(item)
 
-            elif isinstance(item, RealtimeConversationItemUserMessage):
-                item.id = _ensure_id(item.id, "msg")
-                item.content = [
-                    p
-                    for p in item.content
-                    if (p.type == "input_text" and p.text) or (p.type == "input_image" and p.image_url)
-                ]
-                if not item.content:
-                    raise ChatItemError(
-                        "Message has no supported content. Supported modalities: input_text, input_image."
-                    )
-                self.buffer.append(item)
-                self._user_turn_count += 1
-                logger.debug("Added user message to chat (%d parts)", len(item.content))
+    def add_items_atomically(self, items: list[SupportedItem]) -> None:
+        """Add a client-supplied batch completely or restore the prior chat state."""
+        with self._lock:
+            buffer_before = list(self.buffer)
+            pending_before = dict(self._pending_tool_calls)
+            turns_before = self._user_turn_count
+            init_before = self.init_chat_message
+            function_calls = {
+                id(item): item
+                for item in (*buffer_before, *pending_before.values())
+                if isinstance(item, RealtimeConversationItemFunctionCall)
+            }
+            statuses_before = [(item, item.status) for item in function_calls.values()]
+            try:
+                for item in items:
+                    self._add_item_locked(item)
+            except ChatItemError:
+                self.buffer = buffer_before
+                self._pending_tool_calls = pending_before
+                self._user_turn_count = turns_before
+                self.init_chat_message = init_before
+                for function_call, status in statuses_before:
+                    function_call.status = status
+                raise
 
-            elif isinstance(item, RealtimeConversationItemAssistantMessage):
-                item.id = _ensure_id(item.id, "msg")
-                item.content = [p for p in item.content if p.type == "output_text" and p.text]
-                if not item.content:
-                    return item
-                self.buffer.append(item)
-                logger.debug("Added assistant message to chat (%d parts)", len(item.content))
+    def _add_item_locked(self, item: SupportedItem) -> SupportedItem:
+        """Body of :meth:`add_item`; caller must hold ``_lock``."""
+        if isinstance(item, RealtimeConversationItemSystemMessage):
+            item.id = _ensure_id(item.id, "sys")
+            self.init_chat_message = item
+            logger.debug("Set system message via conversation item")
 
-            elif isinstance(item, RealtimeConversationItemFunctionCall):
-                item.id = _ensure_id(item.id, "fc")
-                item.call_id = _ensure_id(item.call_id, "call")
-                self._pending_tool_calls[item.call_id] = item
+        elif isinstance(item, RealtimeConversationItemUserMessage):
+            item.id = _ensure_id(item.id, "msg")
+            item.content = [
+                p
+                for p in item.content
+                if (p.type == "input_text" and p.text) or (p.type == "input_image" and p.image_url)
+            ]
+            if not item.content:
+                raise ChatItemError("Message has no supported content. Supported modalities: input_text, input_image.")
+            self.buffer.append(item)
+            self._user_turn_count += 1
+            logger.debug("Added user message to chat (%d parts)", len(item.content))
+
+        elif isinstance(item, RealtimeConversationItemAssistantMessage):
+            item.id = _ensure_id(item.id, "msg")
+            item.content = [p for p in item.content if p.type == "output_text" and p.text]
+            if not item.content:
+                return item
+            self.buffer.append(item)
+            logger.debug("Added assistant message to chat (%d parts)", len(item.content))
+
+        elif isinstance(item, RealtimeConversationItemFunctionCall):
+            item.id = _ensure_id(item.id, "fc")
+            item.call_id = _ensure_id(item.call_id, "call")
+            self._pending_tool_calls[item.call_id] = item
+            if self._private_content_logging:
+                logger.debug("Added private function_call; content redacted")
+            else:
                 logger.debug("Added function_call to chat (call_id=%s)", item.call_id)
 
-            elif isinstance(item, RealtimeConversationItemFunctionCallOutput):
-                item.id = _ensure_id(item.id, "fco")
-                self._append_tool_output_locked(item.call_id, item)
+        elif isinstance(item, RealtimeConversationItemFunctionCallOutput):
+            item.id = _ensure_id(item.id, "fco")
+            self._append_tool_output_locked(item.call_id, item)
+            if self._private_content_logging:
+                logger.debug("Added private function_call_output; content redacted")
+            else:
                 logger.debug("Added function_call_output to chat (call_id=%s)", item.call_id)
 
-            else:
-                raise ChatItemError(f"Unsupported item type: {getattr(item, 'type', None)}")
+        else:
+            raise ChatItemError(f"Unsupported item type: {getattr(item, 'type', None)}")
 
-            if self.size > 0 and self._user_turn_count > 2 * self.size:
-                logger.warning(
-                    "Chat buffer exceeded hard cap (%d > 2 * size=%d); evicting oldest turn",
-                    self._user_turn_count,
-                    self.size,
-                )
-                while self._user_turn_count > 2 * self.size:
-                    self._evict_oldest_turn()
+        if self.size > 0 and self._user_turn_count > 2 * self.size:
+            logger.warning(
+                "Chat buffer exceeded hard cap (%d > 2 * size=%d); evicting oldest turn",
+                self._user_turn_count,
+                self.size,
+            )
+            while self._user_turn_count > 2 * self.size:
+                self._evict_oldest_turn()
 
-            return item
+        return item
 
     def trim_if_needed(self, compactor: CompactFn | None = None) -> None:
         """Enforce the size limit after a generation completes. Fires when
@@ -271,7 +307,10 @@ class Chat:
                 if not isinstance(item, RealtimeConversationItemUserMessage) or item.id != item_id:
                     continue
                 item.content = [UserContent(type="input_text", text=text)]
-                logger.debug("Replaced speculative user message %s", item_id)
+                if self._private_content_logging:
+                    logger.debug("Replaced private speculative user message; content redacted")
+                else:
+                    logger.debug("Replaced speculative user message %s", item_id)
                 return True
         return False
 
@@ -284,7 +323,10 @@ class Chat:
                     continue
                 del self.buffer[index]
                 self._user_turn_count -= 1
-                logger.debug("Removed speculative user message %s", item_id)
+                if self._private_content_logging:
+                    logger.debug("Removed private speculative user message; content redacted")
+                else:
+                    logger.debug("Removed speculative user message %s", item_id)
                 return True
         return False
 
@@ -744,13 +786,8 @@ def make_system_message(text: str) -> RealtimeConversationItemSystemMessage:
     )
 
 
-def add_supported_item(chat: Chat, item: ConversationItem) -> None:
-    """Narrow a protocol ``ConversationItem`` to a :data:`SupportedItem` and add it to *chat*.
-
-    Raises :class:`ChatItemError` on validation failure or unsupported type. Shared
-    by the conversation handler (in-band item injection) and the language-model
-    handlers (seeding an out-of-band response's throwaway chat from ``response.input``).
-    """
+def _require_supported_item(item: ConversationItem) -> SupportedItem:
+    """Narrow one protocol item without mutating chat state."""
     # call_id on function_call items must be client-supplied: it is referenced later by
     # function_call_output items, so we cannot silently generate one here.
     if isinstance(item, RealtimeConversationItemFunctionCall) and (
@@ -768,10 +805,19 @@ def add_supported_item(chat: Chat, item: ConversationItem) -> None:
             RealtimeConversationItemFunctionCallOutput,
         ),
     ):
-        chat.add_item(item)
-        return
+        return item
 
     raise ChatItemError(f"Unsupported item type: {getattr(item, 'type', None)}")
+
+
+def add_supported_item(chat: Chat, item: ConversationItem) -> None:
+    """Narrow a protocol ``ConversationItem`` and add it to *chat*."""
+    chat.add_item(_require_supported_item(item))
+
+
+def add_supported_items_atomically(chat: Chat, items: list[ConversationItem]) -> None:
+    """Validate and add a protocol-item batch without retaining a rejected prefix."""
+    chat.add_items_atomically([_require_supported_item(item) for item in items])
 
 
 def build_active_chat(original_chat: Chat, response: RealtimeResponseCreateParams | None) -> Chat:
