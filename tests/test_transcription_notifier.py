@@ -110,13 +110,11 @@ def test_private_barrier_suppresses_partials_and_reserves_the_final_without_logg
 def test_poisoned_private_session_keeps_stt_redaction_sticky_while_work_drains(caplog):
     text_output_queue = Queue()
     runtime_config = RuntimeConfig()
-    runtime_config.transcript_barrier_version = 1
-    runtime_config.transcript_barrier_nonce = "ab" * 32
     runtime_config.transcript_barrier_failed = True
     notifier = object.__new__(TranscriptionNotifier)
     notifier.setup(
         text_output_queue=text_output_queue,
-        transcript_barrier_enabled=lambda: runtime_config.transcript_barrier_enabled,
+        transcript_barrier_enabled=lambda: runtime_config.transcript_barrier_private,
     )
     canary = "PRIVATE_STT_AFTER_POISON_CANARY"
 

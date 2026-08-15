@@ -72,7 +72,7 @@ class SessionHandler(RealtimeBaseHandler):
 
         model = getattr(s, "model", None)
         if model is not None:
-            if cfg.transcript_barrier_enabled or barrier_nonce is not None:
+            if cfg.transcript_barrier_private or barrier_nonce is not None:
                 logger.info("Private session model updated; content redacted")
             else:
                 logger.info("Session model set to: %s", model)

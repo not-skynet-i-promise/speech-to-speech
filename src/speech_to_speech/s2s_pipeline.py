@@ -544,7 +544,7 @@ def _build_realtime_pipeline_unit(
         transcription_notifier_setup={
             "text_output_queue": text_output_queue,
             "should_listen": should_listen,
-            "transcript_barrier_enabled": service.transcript_barrier_enabled,
+            "transcript_barrier_enabled": service.transcript_barrier_private,
         },
         module_kwargs=module_kwargs,
         vad_handler_kwargs=vad_kw,
@@ -567,7 +567,7 @@ def _build_realtime_pipeline_unit(
     for h in handlers:
         h.pipeline_index = index
         if isinstance(h, BaseSTTHandler):
-            h.set_transcript_barrier_enabled(service.transcript_barrier_enabled)
+            h.set_transcript_barrier_enabled(service.transcript_barrier_private)
 
     return PipelineUnit(
         index=index,

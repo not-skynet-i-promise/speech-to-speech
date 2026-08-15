@@ -342,7 +342,7 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             block_end = code_and_after.index(ctx.end_code) + len(ctx.end_code)
             complete_block = code_and_after[:block_end]
             printable_text = code_and_after[block_end:]
-            private_content = runtime_config is not None and runtime_config.transcript_barrier_enabled
+            private_content = runtime_config is not None and runtime_config.transcript_barrier_private
             _, func_calls = extract_function_calls_from_text(
                 complete_block,
                 ctx.block_regex,
@@ -356,7 +356,7 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                         redact_private_content=private_content,
                     )
                 except ValueError as e:
-                    if runtime_config is not None and runtime_config.transcript_barrier_enabled:
+                    if runtime_config is not None and runtime_config.transcript_barrier_private:
                         logger.warning("Skipping invalid private tool call; content redacted")
                     else:
                         logger.warning("Skipping invalid tool call: %s", e)
@@ -364,13 +364,13 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 if any(
                     previous.name == tool_call.name and previous.arguments == tool_call.arguments for previous in tools
                 ):
-                    if runtime_config is not None and runtime_config.transcript_barrier_enabled:
+                    if runtime_config is not None and runtime_config.transcript_barrier_private:
                         logger.warning("Skipping duplicate private tool call; content redacted")
                     else:
                         logger.warning("Skipping duplicate tool call '%s'", tool_call.name)
                     continue
                 if len(tools) >= MAX_TOOL_CALLS_PER_RESPONSE:
-                    if runtime_config is not None and runtime_config.transcript_barrier_enabled:
+                    if runtime_config is not None and runtime_config.transcript_barrier_private:
                         logger.warning("Skipping extra private tool call; content redacted")
                     else:
                         logger.warning(
@@ -544,7 +544,7 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             try:
                 active_chat = build_active_chat(original_chat, response)
             except ChatItemError as exc:
-                if runtime_config.transcript_barrier_enabled:
+                if runtime_config.transcript_barrier_private:
                     error_message = "Private out-of-band response rejected."
                     logger.info("Out-of-band response rejected; private content redacted")
                 else:
@@ -610,7 +610,7 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             if commit_allowed:
                 original_chat.strip_images(consumed_image_ids)
                 original_chat.trim_if_needed(self.compactor)
-            if runtime_config.transcript_barrier_enabled:
+            if runtime_config.transcript_barrier_private:
                 logger.debug("Generated text redacted (characters=%d)", len(ctx.generated_text))
                 logger.info("Generated tools redacted (count=%d)", len(ctx.tools))
             else:
@@ -641,7 +641,7 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             # Any generation failure must still terminate the response. Without this
             # the exception would escape process() and no EndOfResponse would be
             # emitted, leaving st.in_response stuck and locking every later response.
-            if runtime_config.transcript_barrier_enabled:
+            if runtime_config.transcript_barrier_private:
                 logger.error("LLM generation failed; private content redacted")
             else:
                 logger.exception("LLM generation failed; ending the current response")
@@ -651,7 +651,7 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 cancel_generation=ctx.cancel_generation,
                 error=(
                     "Language model generation failed in private transcript mode."
-                    if runtime_config.transcript_barrier_enabled
+                    if runtime_config.transcript_barrier_private
                     else f"Language model generation failed: {exc}"
                 ),
             )

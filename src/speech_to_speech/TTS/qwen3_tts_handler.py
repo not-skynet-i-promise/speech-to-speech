@@ -423,7 +423,12 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         if not session_voice:
             return
         private_content = bool(
-            runtime_config is not None and getattr(runtime_config, "transcript_barrier_enabled", False)
+            runtime_config is not None
+            and getattr(
+                runtime_config,
+                "transcript_barrier_private",
+                getattr(runtime_config, "transcript_barrier_enabled", False),
+            )
         )
 
         if model_type == "custom_voice":
@@ -723,7 +728,7 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         model_type = self._model_type()
         self._apply_session_voice_override(model_type, runtime_config, response)
 
-        if runtime_config is not None and runtime_config.transcript_barrier_enabled:
+        if runtime_config is not None and runtime_config.transcript_barrier_private:
             console.print("[green]ASSISTANT: [private content redacted]")
         else:
             console.print(f"[green]ASSISTANT: {text}")
@@ -747,7 +752,7 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                     first_audio = False
                 yield audio_chunk
         except Exception as e:
-            if runtime_config is not None and runtime_config.transcript_barrier_enabled:
+            if runtime_config is not None and runtime_config.transcript_barrier_private:
                 logger.error("Qwen3-TTS generation failed; private content redacted")
             else:
                 logger.error("Error during Qwen3-TTS generation: %s", e, exc_info=True)

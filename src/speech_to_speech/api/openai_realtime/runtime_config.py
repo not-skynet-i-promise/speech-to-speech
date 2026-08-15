@@ -112,12 +112,22 @@ class RuntimeConfig(BaseModel):
     def transcript_barrier_enabled(self) -> bool:
         """Whether this session ever completed the exact opt-in handshake.
 
-        This is deliberately sticky after a protocol failure.  Pipeline
-        handlers use it as the privacy/redaction boundary while stale work
-        drains; treating a poisoned session as ordinary would expose the very
-        transcript or generated content that caused the failure.
+        Protocol authority is granted only by a completed handshake.  Content
+        privacy while rejected or poisoned work drains is represented
+        separately by :attr:`transcript_barrier_private`.
         """
         return self.transcript_barrier_version == 1 and self.transcript_barrier_nonce is not None
+
+    @property
+    def transcript_barrier_private(self) -> bool:
+        """Whether pipeline content must be treated as private while draining.
+
+        A rejected activation never gains protocol authority, but it still
+        makes the session private before the socket closes.  Audio may already
+        be inside worker queues at that point, so every content/log/output gate
+        must remain redacted and fail closed until the session is fully reset.
+        """
+        return self.transcript_barrier_enabled or self.transcript_barrier_failed
 
     @property
     def transcript_barrier_operational(self) -> bool:

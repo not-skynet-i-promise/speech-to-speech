@@ -53,6 +53,12 @@ class BaseHandler(Generic[InT, OutT]):
         raise NotImplementedError
 
     def should_process_input(self, item: InT) -> bool:
+        candidates = item if isinstance(item, tuple) else (item,)
+        for candidate in candidates:
+            runtime_config = getattr(candidate, "runtime_config", None)
+            if runtime_config is not None and bool(getattr(runtime_config, "transcript_barrier_failed", False)):
+                logger.debug("%s: dropping input after private barrier failure", self.__class__.__name__)
+                return False
         cancel_scope = getattr(self, "cancel_scope", None)
         cancel_generation = getattr(item, "cancel_generation", None)
         if (
@@ -87,7 +93,7 @@ class BaseHandler(Generic[InT, OutT]):
         candidates = item if isinstance(item, tuple) else (item,)
         for candidate in candidates:
             runtime_config = getattr(candidate, "runtime_config", None)
-            if runtime_config is not None and bool(getattr(runtime_config, "transcript_barrier_enabled", False)):
+            if runtime_config is not None and bool(getattr(runtime_config, "transcript_barrier_private", False)):
                 return True
         barrier_state = getattr(self, "transcript_barrier_enabled", False)
         try:

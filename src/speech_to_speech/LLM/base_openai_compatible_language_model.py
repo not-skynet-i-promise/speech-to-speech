@@ -325,13 +325,13 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         Out-of-band turns never touch the default conversation, and a stale turn
         records nothing (it is not forwarded to the client either)."""
         if any(previous.name == item.name and previous.arguments == item.arguments for previous in state.tools):
-            if turn.runtime_config.transcript_barrier_enabled:
+            if turn.runtime_config.transcript_barrier_private:
                 logger.warning("Skipping duplicate private tool call; content redacted")
             else:
                 logger.warning("Skipping duplicate tool call '%s'", item.name)
             return
         if len(state.tools) >= MAX_TOOL_CALLS_PER_RESPONSE:
-            if turn.runtime_config.transcript_barrier_enabled:
+            if turn.runtime_config.transcript_barrier_private:
                 logger.warning("Skipping extra private tool call; content redacted")
             else:
                 logger.warning(
@@ -442,12 +442,12 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 if self._generation_is_stale(turn.gen):
                     logger.info("LLM generation cancelled (interruption)")
                 else:
-                    if turn.runtime_config.transcript_barrier_enabled:
+                    if turn.runtime_config.transcript_barrier_private:
                         logger.debug("Generated text redacted (characters=%d)", len(state.clean_text))
                     else:
                         logger.debug("Clean text: %s", state.clean_text)
                     yield from _flush(sentence_batch)
-            if turn.runtime_config.transcript_barrier_enabled:
+            if turn.runtime_config.transcript_barrier_private:
                 logger.info("Generated tools redacted (count=%d)", len(state.tools))
             else:
                 logger.info("Tools: %s", state.tools)
@@ -478,7 +478,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     and self._turn_output_allowed(turn.turn_id, turn.turn_revision)
                 ):
                     yield self._chunk(turn, text=out)
-        if turn.runtime_config.transcript_barrier_enabled:
+        if turn.runtime_config.transcript_barrier_private:
             logger.debug("Generated text redacted (characters=%d)", len(state.clean_text))
             logger.info("Generated tools redacted (count=%d)", len(state.tools))
         else:
@@ -514,7 +514,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             if api_response is not None:
                 events = self._iter_events(
                     api_response,
-                    redact_private_content=turn.runtime_config.transcript_barrier_enabled,
+                    redact_private_content=turn.runtime_config.transcript_barrier_private,
                 )
                 if self.stream:
                     yield from self._consume_streaming(events, state, turn)
@@ -541,14 +541,14 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             # the error and fall through to the EndOfResponse below. Without this the
             # exception would escape process() and no EndOfResponse would be emitted,
             # leaving st.in_response stuck and locking every subsequent response.
-            if turn.runtime_config.transcript_barrier_enabled:
+            if turn.runtime_config.transcript_barrier_private:
                 logger.error("LLM generation failed; private content redacted")
             else:
                 logger.exception("LLM generation failed; ending the current response")
             if error_message is None:
                 error_message = (
                     "Language model generation failed in private transcript mode."
-                    if turn.runtime_config.transcript_barrier_enabled
+                    if turn.runtime_config.transcript_barrier_private
                     else f"Language model generation failed: {exc}"
                 )
         finally:
@@ -600,7 +600,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             try:
                 active_chat = build_active_chat(original_chat, response)
             except ChatItemError as exc:
-                if runtime_config.transcript_barrier_enabled:
+                if runtime_config.transcript_barrier_private:
                     error_message = "Private out-of-band response rejected."
                     logger.info("Out-of-band response rejected; private content redacted")
                 else:

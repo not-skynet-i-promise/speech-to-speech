@@ -19,6 +19,13 @@ def _private_config() -> RuntimeConfig:
     return config
 
 
+def _rejected_private_config() -> RuntimeConfig:
+    config = RuntimeConfig()
+    config.transcript_barrier_failed = True
+    config.chat.enable_private_content_logging()
+    return config
+
+
 class _ExplodingHandler(BaseHandler[TTSInput, bytes]):
     def process(self, _input: TTSInput):
         raise RuntimeError("PRIVATE_BASE_HANDLER_EXCEPTION_CANARY")
@@ -40,6 +47,23 @@ def test_generic_handler_exception_is_content_free_in_private_mode(caplog):
     assert worker.is_alive() is False
     assert "PRIVATE_BASE_HANDLER_EXCEPTION_CANARY" not in caplog.text
     assert "private content redacted" in caplog.text
+
+
+def test_generic_handler_drops_work_after_rejected_private_activation(caplog):
+    queue_in: Queue = Queue()
+    queue_out: Queue = Queue()
+    handler = _ExplodingHandler(Event(), queue_in, queue_out)
+    worker = Thread(target=handler.run)
+
+    with caplog.at_level(logging.DEBUG, logger="speech_to_speech.baseHandler"):
+        worker.start()
+        queue_in.put(TTSInput(text="private", runtime_config=_rejected_private_config()))
+        queue_in.put(PIPELINE_END)
+        worker.join(timeout=2.0)
+
+    assert worker.is_alive() is False
+    assert "PRIVATE_BASE_HANDLER_EXCEPTION_CANARY" not in caplog.text
+    assert "dropping input after private barrier failure" in caplog.text
 
 
 def test_facebook_mms_exception_has_no_private_traceback(caplog):

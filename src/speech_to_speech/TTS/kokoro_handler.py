@@ -272,7 +272,7 @@ class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
         if voice:
             self.voice = voice
 
-        if runtime_config is not None and runtime_config.transcript_barrier_enabled:
+        if runtime_config is not None and runtime_config.transcript_barrier_private:
             console.print("[green]ASSISTANT: [private content redacted]")
         else:
             console.print(f"[green]ASSISTANT: {text}")

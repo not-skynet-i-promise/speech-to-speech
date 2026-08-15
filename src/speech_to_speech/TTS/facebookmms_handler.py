@@ -168,7 +168,7 @@ class FacebookMMSTTSHandler(BaseHandler[TTSIn, TTSOut]):
         language_code = tts_input.language_code
         text = tts_input.text
 
-        private_barrier = bool(tts_input.runtime_config and tts_input.runtime_config.transcript_barrier_enabled)
+        private_barrier = bool(tts_input.runtime_config and tts_input.runtime_config.transcript_barrier_private)
         if private_barrier:
             console.print("[green]ASSISTANT: [private content redacted]")
             logger.debug("Processing redacted text (characters=%d)", len(text))

@@ -367,7 +367,7 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                 activation_requested = _requests_private_transcript_barrier(raw)
                 if activation_requested:
                     _mark_websocket_private(ws)
-                redact_private_content = _websocket_is_private(ws) or unit.service.transcript_barrier_enabled()
+                redact_private_content = _websocket_is_private(ws) or unit.service.transcript_barrier_private()
                 event = unit.service.parse_client_event(
                     raw,
                     redact_private_content=redact_private_content,
@@ -487,7 +487,7 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
         except WebSocketDisconnect:
             logger.info(f"Client {session_id} disconnected from pipeline {unit.index}")
         except Exception as e:
-            if _websocket_is_private(ws) or unit.service.transcript_barrier_enabled():
+            if _websocket_is_private(ws) or unit.service.transcript_barrier_private():
                 logger.error("Private client pipeline error; content redacted")
             else:
                 logger.error(
@@ -668,6 +668,9 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                     if is_control_message(audio_chunk):
                         continue
 
+                    if session_id and unit.service.transcript_barrier_failed(session_id):
+                        continue
+
                     if _should_discard_audio(unit, audio_chunk):
                         continue
 
@@ -717,7 +720,7 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                 session = unit.session
                 ws = session.websocket if session is not None else None
                 if _websocket_is_private(ws) or (
-                    session is not None and session.session_id is not None and unit.service.transcript_barrier_enabled()
+                    session is not None and session.session_id is not None and unit.service.transcript_barrier_private()
                 ):
                     logger.error("Private pipeline send loop error; content redacted")
                 else:

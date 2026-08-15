@@ -118,7 +118,7 @@ class LMOutputProcessor(BaseHandler[LLMOut, TTSIn]):
             logger.debug("Dropping stale LLM chunk for turn=%s rev=%s", lm_output.turn_id, lm_output.turn_revision)
             return
 
-        private_barrier = bool(lm_output.runtime_config and lm_output.runtime_config.transcript_barrier_enabled)
+        private_barrier = bool(lm_output.runtime_config and lm_output.runtime_config.transcript_barrier_private)
         if private_barrier:
             logger.debug("LM processor content redacted (parts=%d)", len(lm_output.parts))
         else:

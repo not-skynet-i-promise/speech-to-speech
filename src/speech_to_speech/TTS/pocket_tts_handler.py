@@ -120,7 +120,7 @@ class PocketTTSHandler(BaseHandler[TTSIn, TTSOut]):
         text = tts_input.text
         logger.debug(f"Received language code: {language_code}")
 
-        private_barrier = bool(tts_input.runtime_config and tts_input.runtime_config.transcript_barrier_enabled)
+        private_barrier = bool(tts_input.runtime_config and tts_input.runtime_config.transcript_barrier_private)
         if private_barrier:
             console.print("[green]ASSISTANT: [private content redacted]")
             logger.debug("Generating audio for redacted content (characters=%d)", len(text))

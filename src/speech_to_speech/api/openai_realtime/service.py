@@ -336,6 +336,12 @@ class RealtimeService:
             return False
         return next(iter(self._conns.values())).runtime_config.transcript_barrier_enabled
 
+    def transcript_barrier_private(self) -> bool:
+        """Return the sticky privacy state for this single-session unit."""
+        if len(self._conns) != 1:
+            return False
+        return next(iter(self._conns.values())).runtime_config.transcript_barrier_private
+
     def transcript_barrier_failed(self, conn_id: str) -> bool:
         return self._state(conn_id).runtime_config.transcript_barrier_failed
 
@@ -346,8 +352,12 @@ class RealtimeService:
     def poison_transcript_barrier(self, conn_id: str, error_type: str) -> RealtimeErrorEvent:
         st = self._state(conn_id)
         cfg = st.runtime_config
+        handshake_completed = cfg.transcript_barrier_enabled
         cfg.clear_transcript_barrier_pending()
         cfg.transcript_barrier_failed = True
+        if not handshake_completed:
+            cfg.chat.reset()
+        cfg.chat.enable_private_content_logging()
         cfg.chat.suspend_compaction()
         st.deferred_items.clear()
         return self.make_error("Private transcript barrier protocol violation.", error_type)
@@ -358,10 +368,14 @@ class RealtimeService:
         if st is None:
             return
         cfg = st.runtime_config
-        if not cfg.transcript_barrier_enabled and not cfg.transcript_barrier_pending:
+        if not cfg.transcript_barrier_private and not cfg.transcript_barrier_pending:
             return
+        handshake_completed = cfg.transcript_barrier_enabled
         cfg.clear_transcript_barrier_pending()
         cfg.transcript_barrier_failed = True
+        if not handshake_completed:
+            cfg.chat.reset()
+        cfg.chat.enable_private_content_logging()
         cfg.chat.suspend_compaction()
         st.deferred_items.clear()
 
@@ -516,6 +530,10 @@ class RealtimeService:
         *,
         wait_for_pending_reopen: bool,
     ) -> list[ServerEvent] | None:
+        cfg = self._state(conn_id).runtime_config
+        if cfg.transcript_barrier_failed and not cfg.transcript_barrier_enabled:
+            logger.debug("Dropping pipeline event after rejected private activation")
+            return []
         is_stale = self._is_stale_turn_event(event, wait_for_pending_reopen=wait_for_pending_reopen)
         if is_stale is None:
             return None
@@ -750,7 +768,7 @@ class RealtimeService:
         nothing.
         """
         state = self._state(conn_id)
-        private_barrier = state.runtime_config.transcript_barrier_enabled
+        private_barrier = state.runtime_config.transcript_barrier_private
         if private_barrier:
             message = "Private response failed."
             logger.info("Private response failed; content redacted")

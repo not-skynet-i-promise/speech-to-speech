@@ -132,7 +132,10 @@ disconnect before handler drain.
 Pending private input also freezes deferred history application and chat
 compaction until exact resolution. Privacy-mode exception and content logging
 remains sticky after poison until the session is unregistered, so draining work
-cannot downgrade into ordinary logging. Parse-time and semantic client-event
+cannot downgrade into ordinary logging. This includes an activation rejected
+before `ready`: already queued audio and every later pipeline output remain
+private, are scrubbed or dropped, and cannot enter history or trigger a
+response while the connection closes. Parse-time and semantic client-event
 failures use content-free wire errors rather than echoing client-controlled
 values while that mode is active. Rejected multi-item in-band `response.input`
 batches retain no accepted prefix in history. Low-level tool-parser, provider,

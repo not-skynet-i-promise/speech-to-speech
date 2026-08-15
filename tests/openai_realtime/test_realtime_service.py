@@ -370,6 +370,8 @@ class TestHandleSessionUpdate:
         service,
         conn_id,
         runtime_config,
+        text_prompt_queue,
+        caplog,
     ):
         assert service.handle_audio_append(conn_id, _make_audio_append(_b64_pcm(512)))
 
@@ -384,6 +386,25 @@ class TestHandleSessionUpdate:
         assert result.error.type == "invalid_transcript_barrier"
         assert runtime_config.transcript_barrier_enabled is False
         assert runtime_config.transcript_barrier_failed is True
+        assert runtime_config.transcript_barrier_private is True
+        assert runtime_config.chat._private_content_logging is True
+
+        transcript = "REJECTED_ACTIVATION_DRAIN_CONTENT"
+        with caplog.at_level(logging.DEBUG):
+            events = service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptBarrierCompletedEvent(transcript=transcript),
+            )
+            ordinary_events = service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(transcript=transcript),
+            )
+
+        assert events == []
+        assert ordinary_events == []
+        assert text_prompt_queue.empty()
+        assert runtime_config.chat.buffer == []
+        assert transcript not in caplog.text
 
     @pytest.mark.parametrize(
         "barrier_request",
