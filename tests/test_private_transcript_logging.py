@@ -138,6 +138,19 @@ class _NeverCalledLanguageModelHandler(BaseLanguageModelHandler):
         yield LLMResponseChunk()
 
 
+class _ExplodingLanguageModelHandler(BaseLanguageModelHandler):
+    """Provider-free handler used to exercise the terminal failure boundary."""
+
+    failure: BaseException
+
+    def _load_model(self, model_name, device, torch_dtype, gen_kwargs):
+        raise AssertionError("test bypasses setup")
+
+    def _generate(self, *args, **kwargs):
+        raise self.failure
+        yield LLMResponseChunk()
+
+
 def test_generic_handler_exception_is_content_free_in_private_mode(caplog):
     queue_in: Queue = Queue()
     queue_out: Queue = Queue()
@@ -420,7 +433,16 @@ class _ImmediateTimeoutStreamer:
         self.ended = True
 
     def __iter__(self):
+        return self
+
+    def __next__(self):
         raise Empty
+
+
+class _FailingEndStreamer(_ImmediateTimeoutStreamer):
+    def end(self):
+        self.ended = True
+        raise RuntimeError("PRIVATE_STREAMER_END_FAILURE_CANARY")
 
 
 def test_transformers_worker_outliving_join_keeps_private_activation_blocked(monkeypatch):
@@ -516,6 +538,44 @@ def test_transformers_thread_constructor_failure_releases_activation_lease(monke
         assert quiescent is True
 
 
+@pytest.mark.parametrize("failure_site", ["constructor", "start"])
+def test_private_transformers_thread_base_exception_is_normalized(monkeypatch, failure_site, capsys):
+    canary = f"PRIVATE_THREAD_{failure_site.upper()}_BASE_EXCEPTION_CANARY"
+    handler = object.__new__(_NeverCalledLanguageModelHandler)
+    handler.cancel_scope = CancelScope()
+
+    class ThreadFault(BaseException):
+        pass
+
+    if failure_site == "constructor":
+
+        def fail_thread(*_args, **_kwargs):
+            raise ThreadFault(canary)
+
+        monkeypatch.setattr("speech_to_speech.LLM.language_model.Thread", fail_thread)
+    else:
+
+        class FailStartThread:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def start(self):
+                raise ThreadFault(canary)
+
+        monkeypatch.setattr("speech_to_speech.LLM.language_model.Thread", FailStartThread)
+
+    with pytest.raises(RuntimeError, match="^Local Transformers generation worker could not start$"):
+        handler._start_transformers_generation(
+            lambda: None,
+            _ImmediateTimeoutStreamer(),
+            _private_config(),
+        )
+
+    assert canary not in capsys.readouterr().err
+    with handler.cancel_scope.private_activation_guard() as quiescent:
+        assert quiescent is True
+
+
 def test_private_transformers_worker_survives_logger_failure_without_excepthook(monkeypatch, capsys):
     target_canary = "PRIVATE_LOCAL_WORKER_TARGET_CANARY"
     logger_canary = "PRIVATE_LOCAL_WORKER_LOGGER_CANARY"
@@ -543,6 +603,125 @@ def test_private_transformers_worker_survives_logger_failure_without_excepthook(
     assert streamer.ended is True
     assert target_canary not in stderr
     assert logger_canary not in stderr
+    assert "Exception in thread" not in stderr
+    with handler.cancel_scope.private_activation_guard() as quiescent:
+        assert quiescent is True
+
+
+def test_private_generation_base_exception_returns_content_free_terminal(capsys):
+    canary = "PRIVATE_GENERATION_BASE_EXCEPTION_CANARY"
+
+    class GenerationFault(BaseException):
+        pass
+
+    handler = object.__new__(_ExplodingLanguageModelHandler)
+    handler.speculative_turns = None
+    handler.cancel_scope = None
+    handler.enable_lang_prompt = False
+    handler.compactor = None
+    handler.tokenizer = type("Tokenizer", (), {"encode": staticmethod(lambda _text: [])})()
+    handler.failure = GenerationFault(canary)
+    runtime_config = _private_config()
+    runtime_config.chat.add_item(make_user_message("private request"))
+
+    outputs = list(handler.process(GenerateResponseRequest(runtime_config=runtime_config)))
+
+    assert outputs == [
+        EndOfResponse(error="Language model generation failed in private transcript mode."),
+    ]
+    assert canary not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("failure_site", ["logger", "guard"])
+def test_private_generation_failure_always_returns_content_free_terminal(
+    monkeypatch,
+    capsys,
+    failure_site,
+):
+    secondary_canary = f"PRIVATE_{failure_site.upper()}_FAILURE_CANARY"
+    handler = object.__new__(_ExplodingLanguageModelHandler)
+    handler.speculative_turns = None
+    handler.cancel_scope = None
+    handler.enable_lang_prompt = False
+    handler.compactor = None
+    handler.tokenizer = type("Tokenizer", (), {"encode": staticmethod(lambda _text: [])})()
+    handler.failure = RuntimeError("PRIVATE_GENERATION_FAILURE_CANARY")
+    runtime_config = _private_config()
+    runtime_config.chat.add_item(make_user_message("private request"))
+
+    if failure_site == "logger":
+
+        def fail_logger(*_args, **_kwargs):
+            raise RuntimeError(secondary_canary)
+
+        monkeypatch.setattr("speech_to_speech.LLM.language_model.logger.error", fail_logger)
+    else:
+
+        class GuardFault(BaseException):
+            pass
+
+        def fail_guard(_self):
+            raise GuardFault(secondary_canary)
+
+        monkeypatch.setattr(RuntimeConfig, "transcript_barrier_content_guard", fail_guard)
+
+    outputs = list(handler.process(GenerateResponseRequest(runtime_config=runtime_config)))
+    stderr = capsys.readouterr().err
+
+    assert outputs == [
+        EndOfResponse(error="Language model generation failed in private transcript mode."),
+    ]
+    assert "PRIVATE_GENERATION_FAILURE_CANARY" not in stderr
+    assert secondary_canary not in stderr
+    assert "Exception in thread" not in stderr
+
+
+def test_private_streamer_end_failure_cannot_strand_transformers_consumer(caplog, capsys):
+    target_canary = "PRIVATE_TRANSFORMERS_TARGET_FAILURE_CANARY"
+    handler = object.__new__(_NeverCalledLanguageModelHandler)
+    handler.cancel_scope = CancelScope()
+    handler.speculative_turns = None
+    handler.stop_event = Event()
+    streamer = _FailingEndStreamer()
+
+    def explode_target() -> None:
+        raise RuntimeError(target_canary)
+
+    worker, worker_state = handler._start_transformers_generation(
+        explode_target,
+        streamer,
+        _private_config(),
+    )
+    ctx = StreamContext()
+    outputs: list[LLMResponseChunk] = []
+    consumer = Thread(
+        target=lambda: outputs.extend(
+            handler._stream_tokens(
+                streamer,
+                None,
+                None,
+                ctx,
+                _private_config(),
+                worker_state=worker_state,
+            )
+        )
+    )
+    consumer.start()
+    consumer.join(timeout=1.0)
+    worker.join(timeout=1.0)
+
+    assert not consumer.is_alive()
+    assert not worker.is_alive()
+    assert outputs == []
+    assert worker_state.failed is True
+    assert worker_state.completed.is_set()
+    with pytest.raises(RuntimeError, match="^Local Transformers generation worker failed$"):
+        handler._finish_transformers_generation(worker, streamer, _CancelCriteria(), worker_state)
+    stderr = capsys.readouterr().err
+    assert target_canary not in caplog.text
+    assert "PRIVATE_STREAMER_END_FAILURE_CANARY" not in caplog.text
+    assert target_canary not in stderr
+    assert "PRIVATE_STREAMER_END_FAILURE_CANARY" not in stderr
     assert "Exception in thread" not in stderr
     with handler.cancel_scope.private_activation_guard() as quiescent:
         assert quiescent is True
