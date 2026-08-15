@@ -450,6 +450,17 @@ class TestHandleSessionUpdate:
         err = service.handle_session_update(conn_id, evt)
         assert isinstance(err, RealtimeErrorEvent)
         assert err.error.type == "invalid_session_type"
+        assert runtime_config.transcript_barrier_session_updates == 1
+
+        barrier = service.handle_session_update(
+            conn_id,
+            self._make_update(
+                reachy_private_transcript_barrier={"version": 1, "nonce": "aa" * 32},
+            ),
+        )
+        assert isinstance(barrier, RealtimeErrorEvent)
+        assert barrier.error.type == "invalid_transcript_barrier"
+        assert runtime_config.transcript_barrier_failed is True
 
     def test_session_update_nested_audio_format(self, service, conn_id, runtime_config):
         raw = {

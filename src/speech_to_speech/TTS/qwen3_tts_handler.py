@@ -728,10 +728,11 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         model_type = self._model_type()
         self._apply_session_voice_override(model_type, runtime_config, response)
 
-        if runtime_config is not None and runtime_config.transcript_barrier_private:
-            console.print("[green]ASSISTANT: [private content redacted]")
-        else:
-            console.print(f"[green]ASSISTANT: {text}")
+        with self._runtime_config_private_logging_guard(runtime_config) as private_barrier:
+            if private_barrier:
+                console.print("[green]ASSISTANT: [private content redacted]")
+            else:
+                console.print(f"[green]ASSISTANT: {text}")
 
         try:
             if self.ref_audio:
@@ -752,10 +753,11 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                     first_audio = False
                 yield audio_chunk
         except Exception as e:
-            if runtime_config is not None and runtime_config.transcript_barrier_private:
-                logger.error("Qwen3-TTS generation failed; private content redacted")
-            else:
-                logger.error("Error during Qwen3-TTS generation: %s", e, exc_info=True)
+            with self._runtime_config_private_logging_guard(runtime_config) as private_barrier:
+                if private_barrier:
+                    logger.error("Qwen3-TTS generation failed; private content redacted")
+                else:
+                    logger.error("Error during Qwen3-TTS generation: %s", e, exc_info=True)
 
     def _log_first_audio_latency(self, tts_input: TTSInput) -> None:
         if tts_input.speech_stopped_at_s is None:

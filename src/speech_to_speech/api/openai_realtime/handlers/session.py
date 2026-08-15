@@ -40,13 +40,14 @@ class SessionHandler(RealtimeBaseHandler):
         if s is None:
             return None
 
+        cfg = self._state(conn_id).runtime_config
+        cfg.transcript_barrier_session_updates += 1
         if isinstance(s, RealtimeTranscriptionSessionCreateRequest):
             return self.make_error(
                 message="Only 'realtime' session type is supported; transcription sessions are not.",
                 _type="invalid_session_type",
             )
 
-        cfg = self._state(conn_id).runtime_config
         state = self._state(conn_id)
         extra = s.model_extra or {}
         barrier_requested = TRANSCRIPT_BARRIER_FIELD in extra
@@ -58,7 +59,7 @@ class SessionHandler(RealtimeBaseHandler):
             if (
                 barrier_nonce is None
                 or cfg.transcript_barrier_version is not None
-                or cfg.transcript_barrier_session_updates != 0
+                or cfg.transcript_barrier_session_updates != 1
                 or state.audio_buffer_has_data
                 or bool(state.audio_remainder)
                 or state.input_audio_duration_s != 0.0
@@ -82,7 +83,6 @@ class SessionHandler(RealtimeBaseHandler):
             cfg.session = s
         else:
             cfg.apply_session_update(s)
-        cfg.transcript_barrier_session_updates += 1
         logger.info("Session configuration updated")
         if barrier_nonce is not None:
             cfg.transcript_barrier_version = TRANSCRIPT_BARRIER_VERSION

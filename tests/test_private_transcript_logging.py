@@ -42,6 +42,35 @@ class _ExplodingHandler(BaseHandler[TTSInput, bytes]):
         yield b"unreachable"
 
 
+class _BlockingExplodingHandler(BaseHandler[TTSInput, bytes]):
+    def __init__(self, stop_event, queue_in, queue_out, started: Event, release: Event):
+        self.started = started
+        self.release = release
+        super().__init__(stop_event, queue_in, queue_out)
+
+    def process(self, _input: TTSInput):
+        self.started.set()
+        assert self.release.wait(timeout=2.0)
+        raise RuntimeError("PRIVATE_INFLIGHT_HANDLER_CANARY")
+        yield b"unreachable"
+
+
+class _BlockingCleanupHandler(BaseHandler[TTSInput, bytes]):
+    def __init__(self, stop_event, queue_in, queue_out, started: Event, release: Event):
+        self.started = started
+        self.release = release
+        super().__init__(stop_event, queue_in, queue_out)
+
+    def process(self, _input: TTSInput):
+        self.started.set()
+        assert self.release.wait(timeout=2.0)
+        if False:
+            yield b"unreachable"
+
+    def cleanup(self) -> None:
+        raise RuntimeError("PRIVATE_INFLIGHT_CLEANUP_CANARY")
+
+
 class _PoisoningLanguageModelHandler(BaseLanguageModelHandler):
     """Provider-free local handler that poisons immediately before write-back."""
 
@@ -106,6 +135,56 @@ def test_generic_handler_drops_work_after_rejected_private_activation(caplog):
     assert "dropping input after private barrier failure" in caplog.text
 
 
+def test_generic_handler_rechecks_privacy_when_poisoned_while_processing(caplog):
+    queue_in: Queue = Queue()
+    queue_out: Queue = Queue()
+    started = Event()
+    release = Event()
+    handler = _BlockingExplodingHandler(Event(), queue_in, queue_out, started, release)
+    worker = Thread(target=handler.run)
+    runtime_config = RuntimeConfig()
+
+    with caplog.at_level(logging.ERROR, logger="speech_to_speech.baseHandler"):
+        worker.start()
+        queue_in.put(TTSInput(text="ordinary before poison", runtime_config=runtime_config))
+        assert started.wait(timeout=2.0)
+        with runtime_config.transcript_barrier_state_guard():
+            runtime_config.transcript_barrier_failed = True
+            runtime_config.chat.enable_private_content_logging()
+        release.set()
+        queue_in.put(PIPELINE_END)
+        worker.join(timeout=2.0)
+
+    assert worker.is_alive() is False
+    assert "PRIVATE_INFLIGHT_HANDLER_CANARY" not in caplog.text
+    assert "private content redacted" in caplog.text
+
+
+def test_generic_handler_latches_poison_before_final_cleanup(caplog):
+    queue_in: Queue = Queue()
+    queue_out: Queue = Queue()
+    started = Event()
+    release = Event()
+    handler = _BlockingCleanupHandler(Event(), queue_in, queue_out, started, release)
+    worker = Thread(target=handler.run)
+    runtime_config = RuntimeConfig()
+
+    with caplog.at_level(logging.ERROR, logger="speech_to_speech.baseHandler"):
+        worker.start()
+        queue_in.put(TTSInput(text="ordinary before poison", runtime_config=runtime_config))
+        assert started.wait(timeout=2.0)
+        with runtime_config.transcript_barrier_state_guard():
+            runtime_config.transcript_barrier_failed = True
+            runtime_config.chat.enable_private_content_logging()
+        release.set()
+        queue_in.put(PIPELINE_END)
+        worker.join(timeout=2.0)
+
+    assert worker.is_alive() is False
+    assert "PRIVATE_INFLIGHT_CLEANUP_CANARY" not in caplog.text
+    assert "final cleanup failed; private content redacted" in caplog.text
+
+
 def test_facebook_mms_exception_has_no_private_traceback(caplog):
     class _ExplodingTokenizer:
         def __call__(self, *_args, **_kwargs):
@@ -121,6 +200,56 @@ def test_facebook_mms_exception_has_no_private_traceback(caplog):
 
     assert "PRIVATE_TTS_EXCEPTION_CANARY" not in caplog.text
     assert "PRIVATE_TTS_TEXT_CANARY" not in caplog.text
+    assert "private content redacted" in caplog.text
+
+
+def test_facebook_mms_rechecks_privacy_when_poisoned_during_generation(caplog):
+    class _TensorInputs:
+        input_ids = __import__("torch").tensor([[1]])
+        attention_mask = __import__("torch").tensor([[1]])
+
+    class _Tokenizer:
+        def __call__(self, *_args, **_kwargs):
+            return _TensorInputs()
+
+    started = Event()
+    release = Event()
+
+    class _BlockingModel:
+        def __call__(self, **_kwargs):
+            started.set()
+            assert release.wait(timeout=2.0)
+            raise RuntimeError("PRIVATE_FACEBOOK_PROVIDER_CANARY")
+
+    handler = object.__new__(FacebookMMSTTSHandler)
+    handler.language = "en"
+    handler.tokenizer = _Tokenizer()
+    handler.model = _BlockingModel()
+    handler.device = "cpu"
+    runtime_config = RuntimeConfig()
+    result: list[object] = []
+
+    def generate() -> None:
+        result.append(
+            handler.generate_audio(
+                "ordinary before poison",
+                runtime_config=runtime_config,
+            )
+        )
+
+    worker = Thread(target=generate)
+    with caplog.at_level(logging.DEBUG, logger="speech_to_speech.TTS.facebookmms_handler"):
+        worker.start()
+        assert started.wait(timeout=2.0)
+        with runtime_config.transcript_barrier_state_guard():
+            runtime_config.transcript_barrier_failed = True
+            runtime_config.chat.enable_private_content_logging()
+        release.set()
+        worker.join(timeout=2.0)
+
+    assert worker.is_alive() is False
+    assert result == [None]
+    assert "PRIVATE_FACEBOOK_PROVIDER_CANARY" not in caplog.text
     assert "private content redacted" in caplog.text
 
 

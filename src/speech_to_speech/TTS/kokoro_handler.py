@@ -272,10 +272,11 @@ class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
         if voice:
             self.voice = voice
 
-        if runtime_config is not None and runtime_config.transcript_barrier_private:
-            console.print("[green]ASSISTANT: [private content redacted]")
-        else:
-            console.print(f"[green]ASSISTANT: {text}")
+        with self._runtime_config_private_logging_guard(runtime_config) as private_barrier:
+            if private_barrier:
+                console.print("[green]ASSISTANT: [private content redacted]")
+            else:
+                console.print(f"[green]ASSISTANT: {text}")
 
         if self.backend == "mlx":
             yield from self._process_mlx(text, language_code)

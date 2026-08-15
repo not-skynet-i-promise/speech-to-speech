@@ -3,6 +3,7 @@ from __future__ import annotations
 # ruff: noqa: I001
 
 import logging
+from contextlib import ExitStack, contextmanager, nullcontext
 from queue import Empty, Queue
 from threading import Event
 from time import perf_counter
@@ -90,16 +91,64 @@ class BaseHandler(Generic[InT, OutT]):
 
     def _input_requires_private_logging(self, item: object) -> bool:
         """Detect the sticky session privacy mode without coupling handler types."""
+        with self._input_private_logging_guard(item) as private_content:
+            return private_content
+
+    @contextmanager
+    def _input_private_logging_guard(self, item: object) -> Iterator[bool]:
+        """Hold available barrier locks while selecting a content-log policy."""
         candidates = item if isinstance(item, tuple) else (item,)
+        runtime_configs: list[object] = []
         for candidate in candidates:
             runtime_config = getattr(candidate, "runtime_config", None)
-            if runtime_config is not None and bool(getattr(runtime_config, "transcript_barrier_private", False)):
-                return True
-        barrier_state = getattr(self, "transcript_barrier_enabled", False)
+            if runtime_config is not None and all(runtime_config is not current for current in runtime_configs):
+                runtime_configs.append(runtime_config)
+
+        stack = ExitStack()
         try:
-            return bool(barrier_state() if callable(barrier_state) else barrier_state)
+            for runtime_config in runtime_configs:
+                state_guard = getattr(runtime_config, "transcript_barrier_state_guard", None)
+                if callable(state_guard):
+                    stack.enter_context(state_guard())
         except Exception:
-            return self._private_content_logging
+            stack.close()
+            yield True
+            return
+
+        with stack:
+            for runtime_config in runtime_configs:
+                try:
+                    if bool(getattr(runtime_config, "transcript_barrier_private", False)):
+                        yield True
+                        return
+                except Exception:
+                    yield True
+                    return
+            barrier_state = getattr(self, "transcript_barrier_enabled", False)
+            try:
+                private_content = bool(barrier_state() if callable(barrier_state) else barrier_state)
+            except Exception:
+                private_content = True
+            yield self._private_content_logging or private_content
+
+    @contextmanager
+    def _runtime_config_private_logging_guard(self, runtime_config: object | None) -> Iterator[bool]:
+        """Hold one live barrier lock while selecting a content-log policy."""
+        if runtime_config is None:
+            yield bool(getattr(self, "_private_content_logging", False))
+            return
+        state_guard = getattr(runtime_config, "transcript_barrier_state_guard", None)
+        try:
+            guard = state_guard() if callable(state_guard) else nullcontext()
+        except Exception:
+            yield True
+            return
+        with guard:
+            try:
+                private_content = bool(getattr(runtime_config, "transcript_barrier_private", False))
+            except Exception:
+                private_content = True
+            yield bool(getattr(self, "_private_content_logging", False)) or private_content
 
     def run(self) -> None:
         if self.pipeline_index is not None:
@@ -117,13 +166,18 @@ class BaseHandler(Generic[InT, OutT]):
                 try:
                     self.on_session_end()
                 except Exception as e:
-                    if self._private_content_logging:
-                        logger.error("%s: session cleanup failed; private content redacted", self.__class__.__name__)
-                    else:
-                        logger.error(
-                            f"{self.__class__.__name__}: Error in on_session_end(): {type(e).__name__}: {e}",
-                            exc_info=True,
-                        )
+                    with self._input_private_logging_guard(()) as private_content:
+                        if private_content:
+                            self._private_content_logging = True
+                            logger.error(
+                                "%s: session cleanup failed; private content redacted",
+                                self.__class__.__name__,
+                            )
+                        else:
+                            logger.error(
+                                f"{self.__class__.__name__}: Error in on_session_end(): {type(e).__name__}: {e}",
+                                exc_info=True,
+                            )
                 self.queue_out.put(item)
                 self._private_content_logging = False
                 continue
@@ -146,6 +200,8 @@ class BaseHandler(Generic[InT, OutT]):
             start_time = perf_counter()
             try:
                 for output in self.process(typed_item):
+                    if not self.should_process_input(typed_item):
+                        break
                     if not self.should_emit_output(output):
                         start_time = perf_counter()
                         continue
@@ -160,15 +216,28 @@ class BaseHandler(Generic[InT, OutT]):
                     self.queue_out.put(queued_output)
                     start_time = perf_counter()
             except Exception as e:
-                if self._private_content_logging:
-                    logger.error("%s: processing failed; private content redacted", self.__class__.__name__)
-                else:
-                    logger.error(
-                        f"{self.__class__.__name__}: Error in process(): {type(e).__name__}: {e}",
-                        exc_info=True,
-                    )
+                with self._input_private_logging_guard(typed_item) as private_content:
+                    if private_content:
+                        self._private_content_logging = True
+                        logger.error("%s: processing failed; private content redacted", self.__class__.__name__)
+                    else:
+                        logger.error(
+                            f"{self.__class__.__name__}: Error in process(): {type(e).__name__}: {e}",
+                            exc_info=True,
+                        )
+            finally:
+                if self._input_requires_private_logging(typed_item):
+                    self._private_content_logging = True
 
-        self.cleanup()
+        try:
+            self.cleanup()
+        except Exception:
+            with self._input_private_logging_guard(()) as private_content:
+                if private_content:
+                    self._private_content_logging = True
+                    logger.error("%s: final cleanup failed; private content redacted", self.__class__.__name__)
+                else:
+                    raise
         self.queue_out.put(PIPELINE_END)
 
     @property
