@@ -1174,6 +1174,27 @@ class TestCompaction:
         assert chat.buffer == before
         assert chat._shutdown.is_set() is False
 
+    def test_suspended_compaction_stays_frozen_until_explicit_resume(self):
+        chat = Chat(size=2)
+        started = threading.Event()
+
+        def compactor(_snapshot):
+            started.set()
+            return CompactionResult(user_summary="u", assistant_summary="a")
+
+        for i in range(4):
+            chat.add_item(_user(f"u{i}"))
+            chat.add_item(_assistant(f"a{i}"))
+
+        chat.suspend_compaction()
+        chat.trim_if_needed(compactor)
+        assert started.wait(timeout=0.05) is False
+
+        chat.resume_compaction()
+        chat.trim_if_needed(compactor)
+        assert started.wait(timeout=2.0) is True
+        _wait_thread(chat)
+
     def test_compactor_exception_leaves_buffer_unchanged(self):
         chat = Chat(size=2)
 

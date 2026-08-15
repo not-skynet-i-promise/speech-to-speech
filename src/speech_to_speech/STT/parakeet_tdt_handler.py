@@ -289,7 +289,10 @@ class ParakeetTDTSTTHandler(BaseSTTHandler):
                             )
                             return
                     except Exception as e:
-                        logger.debug(f"Progressive transcription failed: {e}")
+                        if self.transcript_barrier_enabled:
+                            logger.debug("Progressive transcription failed; private content redacted")
+                        else:
+                            logger.debug(f"Progressive transcription failed: {e}")
                 else:
                     logger.debug("Skipping progressive update (compute busy)")
             return
@@ -333,7 +336,10 @@ class ParakeetTDTSTTHandler(BaseSTTHandler):
                 language_code = self.last_language
 
         except Exception as e:
-            logger.error(f"Parakeet TDT inference failed: {e}")
+            if self.transcript_barrier_enabled:
+                logger.error("Parakeet TDT inference failed; private content redacted")
+            else:
+                logger.error(f"Parakeet TDT inference failed: {e}")
             pred_text = ""
             language_code = self.last_language
 

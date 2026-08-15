@@ -208,6 +208,7 @@ class ConnState(BaseModel):
     # write-back (cross-thread), so they are buffered here and flushed in order
     # once the response completes. See ConversationHandler.flush_deferred_items.
     deferred_items: list[ConversationItem] = Field(default_factory=list)
+    transcript_barrier_replacement_item_ids: set[str] = Field(default_factory=set)
 
 
 class RealtimeService:
@@ -260,9 +261,9 @@ class RealtimeService:
         return state.session_id
 
     def unregister(self, conn_id: str) -> None:
+        self.scrub_transcript_barrier_for_disconnect(conn_id)
         st = self._conns.pop(conn_id, None)
         if st is not None:
-            st.runtime_config.clear_transcript_barrier_pending()
             # Suppress any in-flight compaction splice so a daemon worker can't
             # mutate a Chat tied to a closed session, and don't make further
             # billable LLM calls on its behalf once the splice is suppressed.
@@ -330,10 +331,26 @@ class RealtimeService:
         return not cfg.transcript_barrier_failed and not cfg.transcript_barrier_pending
 
     def poison_transcript_barrier(self, conn_id: str, error_type: str) -> RealtimeErrorEvent:
-        cfg = self._state(conn_id).runtime_config
+        st = self._state(conn_id)
+        cfg = st.runtime_config
         cfg.clear_transcript_barrier_pending()
         cfg.transcript_barrier_failed = True
+        cfg.chat.suspend_compaction()
+        st.deferred_items.clear()
         return self.make_error("Private transcript barrier protocol violation.", error_type)
+
+    def scrub_transcript_barrier_for_disconnect(self, conn_id: str) -> None:
+        """Synchronously scrub private state before asynchronous pipeline drain."""
+        st = self._conns.get(conn_id)
+        if st is None:
+            return
+        cfg = st.runtime_config
+        if not cfg.transcript_barrier_enabled and not cfg.transcript_barrier_pending:
+            return
+        cfg.clear_transcript_barrier_pending()
+        cfg.transcript_barrier_failed = True
+        cfg.chat.suspend_compaction()
+        st.deferred_items.clear()
 
     def handle_audio_append(self, conn_id: str, event: InputAudioBufferAppendEvent) -> list[bytes]:
         if not self.transcript_barrier_audio_allowed(conn_id):
@@ -379,7 +396,7 @@ class RealtimeService:
         cfg = self._state(conn_id).runtime_config
         expected_transcript = cfg.transcript_barrier_pending_transcript
         valid_context = (
-            cfg.transcript_barrier_enabled
+            cfg.transcript_barrier_operational
             and cfg.transcript_barrier_pending
             and event.nonce == cfg.transcript_barrier_nonce
             and event.sequence == cfg.transcript_barrier_pending_sequence
@@ -413,14 +430,37 @@ class RealtimeService:
                 return [self.poison_transcript_barrier(conn_id, "invalid_transcript_barrier_resolution")]
             item_id = item.id
             assert item_id is not None
+            st = self._state(conn_id)
+            existing_ids = {
+                existing_id
+                for existing_id in (
+                    st.last_item_id,
+                    st.current_item_id,
+                    st.current_output_item_id,
+                    *(getattr(entry, "id", None) for entry in cfg.chat.buffer),
+                    *(getattr(entry, "id", None) for entry in st.deferred_items),
+                )
+                if existing_id is not None
+            }
+            if item_id in existing_ids or item_id in st.transcript_barrier_replacement_item_ids:
+                return [self.poison_transcript_barrier(conn_id, "invalid_transcript_barrier_resolution")]
             cfg.clear_transcript_barrier_pending()
-            created = self.conversation._apply_item(conn_id, item)
-            if not created or created[0].type == "error":
-                cfg.transcript_barrier_failed = True
+            cfg.chat.resume_compaction()
+            if not st.in_response:
+                created.extend(self.conversation.flush_deferred_items(conn_id))
+            item_created = self.conversation._apply_item(conn_id, item)
+            created.extend(item_created)
+            if not item_created or item_created[0].type == "error":
+                self.poison_transcript_barrier(conn_id, "invalid_transcript_barrier_resolution")
                 return created
+            st.transcript_barrier_replacement_item_ids.add(item_id)
             action: Literal["accepted", "discarded"] = "accepted"
         else:
             cfg.clear_transcript_barrier_pending()
+            cfg.chat.resume_compaction()
+            st = self._state(conn_id)
+            if not st.in_response:
+                created.extend(self.conversation.flush_deferred_items(conn_id))
             action = "discarded"
 
         return [
@@ -580,7 +620,7 @@ class RealtimeService:
         st = self._state(conn_id)
         cfg = st.runtime_config
         nonce = cfg.transcript_barrier_nonce
-        if not cfg.transcript_barrier_enabled or nonce is None:
+        if not cfg.transcript_barrier_operational or nonce is None:
             raise RuntimeError("private transcript barrier event arrived without an active handshake")
         sequence = cfg.next_transcript_barrier_sequence()
         item_id = self.conversation._input_item_id(conn_id)
@@ -593,10 +633,12 @@ class RealtimeService:
         event: TranscriptBarrierCompletedEvent,
     ) -> list[ServerEvent]:
         """Emit one private final without storing it or triggering generation."""
+        st = self._state(conn_id)
+        if st.runtime_config.transcript_barrier_failed:
+            return []
         cfg, nonce, sequence, item_id = self._transcript_barrier_context(conn_id)
-        if cfg.transcript_barrier_pending:
-            cfg.clear_transcript_barrier_pending()
-            cfg.transcript_barrier_failed = True
+        if cfg.transcript_barrier_pending or st.in_response or st.response_pending or st.deferred_items:
+            self.poison_transcript_barrier(conn_id, "transcript_barrier_pending")
             return [
                 TranscriptBarrierFailedServerEvent(
                     event_id=self._next_event_id(),
@@ -607,7 +649,7 @@ class RealtimeService:
                 )
             ]
         if not event.transcript.strip() or len(event.transcript) > TRANSCRIPT_BARRIER_MAX_CHARS:
-            cfg.transcript_barrier_failed = True
+            self.poison_transcript_barrier(conn_id, "invalid_transcript_barrier_transcript")
             return [
                 TranscriptBarrierFailedServerEvent(
                     event_id=self._next_event_id(),
@@ -617,7 +659,7 @@ class RealtimeService:
                     reason="transcript_too_large",
                 )
             ]
-        cfg.chat.suppress_inflight_compaction()
+        cfg.chat.suspend_compaction()
         cfg.transcript_barrier_pending_sequence = sequence
         cfg.transcript_barrier_pending_item_id = item_id
         cfg.transcript_barrier_pending_transcript = event.transcript
@@ -638,10 +680,12 @@ class RealtimeService:
         event: TranscriptBarrierDiscardedEvent,
     ) -> list[ServerEvent]:
         """Emit a content-free empty-final acknowledgement."""
+        st = self._state(conn_id)
+        if st.runtime_config.transcript_barrier_failed:
+            return []
         cfg, nonce, sequence, item_id = self._transcript_barrier_context(conn_id)
-        if cfg.transcript_barrier_pending:
-            cfg.clear_transcript_barrier_pending()
-            cfg.transcript_barrier_failed = True
+        if cfg.transcript_barrier_pending or st.in_response or st.response_pending or st.deferred_items:
+            self.poison_transcript_barrier(conn_id, "transcript_barrier_pending")
             return [
                 TranscriptBarrierFailedServerEvent(
                     event_id=self._next_event_id(),

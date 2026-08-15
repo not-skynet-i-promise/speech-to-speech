@@ -110,12 +110,19 @@ class RuntimeConfig(BaseModel):
 
     @property
     def transcript_barrier_enabled(self) -> bool:
-        """Whether the exact opt-in handshake is active for this session."""
-        return (
-            not self.transcript_barrier_failed
-            and self.transcript_barrier_version == 1
-            and self.transcript_barrier_nonce is not None
-        )
+        """Whether this session ever completed the exact opt-in handshake.
+
+        This is deliberately sticky after a protocol failure.  Pipeline
+        handlers use it as the privacy/redaction boundary while stale work
+        drains; treating a poisoned session as ordinary would expose the very
+        transcript or generated content that caused the failure.
+        """
+        return self.transcript_barrier_version == 1 and self.transcript_barrier_nonce is not None
+
+    @property
+    def transcript_barrier_operational(self) -> bool:
+        """Whether the negotiated barrier may still accept protocol work."""
+        return self.transcript_barrier_enabled and not self.transcript_barrier_failed
 
     def next_transcript_barrier_sequence(self) -> int:
         """Allocate one monotonic event sequence within the current session."""

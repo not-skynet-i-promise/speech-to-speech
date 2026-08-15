@@ -135,7 +135,10 @@ class MLXAudioWhisperSTTHandler(BaseSTTHandler):
                 self.last_language = language_code
 
         except Exception as e:
-            logger.error(f"MLX Audio Whisper inference failed: {e}")
+            if self.transcript_barrier_enabled:
+                logger.error("MLX Audio Whisper inference failed; private content redacted")
+            else:
+                logger.error(f"MLX Audio Whisper inference failed: {e}")
             pred_text = ""
             language_code = self.last_language if self.last_language else "en"
 

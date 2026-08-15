@@ -437,6 +437,7 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
             old_session = unit.session
             if old_session is not None:
                 old_session.released_at = time.monotonic()
+            unit.service.scrub_transcript_barrier_for_disconnect(session_id)
             _clean_unit(unit)
             unit.input_queue.put(SESSION_END)
             # Spawn the drain-and-release as a separate task so the route handler's

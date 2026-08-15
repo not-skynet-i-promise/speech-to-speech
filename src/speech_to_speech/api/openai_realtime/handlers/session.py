@@ -68,11 +68,7 @@ class SessionHandler(RealtimeBaseHandler):
                 or state.response_pending
                 or bool(cfg.chat.buffer)
             ):
-                cfg.transcript_barrier_failed = True
-                return self.make_error(
-                    message="Private transcript barrier negotiation failed.",
-                    _type="invalid_transcript_barrier",
-                )
+                return self._service.poison_transcript_barrier(conn_id, "invalid_transcript_barrier")
 
         model = getattr(s, "model", None)
         if model is not None:
@@ -88,6 +84,7 @@ class SessionHandler(RealtimeBaseHandler):
         if barrier_nonce is not None:
             cfg.transcript_barrier_version = TRANSCRIPT_BARRIER_VERSION
             cfg.transcript_barrier_nonce = barrier_nonce
+            cfg.chat.enable_private_content_logging()
             return TranscriptBarrierReadyEvent(
                 event_id=self._next_event_id(),
                 nonce=barrier_nonce,

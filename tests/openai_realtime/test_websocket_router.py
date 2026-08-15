@@ -347,6 +347,35 @@ class TestClientEventDispatch:
                 assert cfg.transcript_barrier_failed is True
                 assert cfg.transcript_barrier_pending_transcript is None
 
+    def test_disconnect_scrubs_pending_private_transcript_before_handler_drain(self, setup):
+        app, service, _, _, text_output_queue, *_ = setup
+        nonce = "02" * 32
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "realtime",
+                            "reachy_private_transcript_barrier": {"version": 1, "nonce": nonce},
+                        },
+                    }
+                )
+                ws.receive_json()
+                text_output_queue.put(TranscriptBarrierCompletedEvent(transcript="DISCONNECT_PRIVATE_CANARY"))
+                assert ws.receive_json()["type"] == "reachy.transcript_barrier.completed"
+                conn_id = service.connection_ids[0]
+                cfg = service._state(conn_id).runtime_config
+                assert cfg.transcript_barrier_pending is True
+
+            # The handler chain has not consumed SESSION_END in this fixture,
+            # so unregister is deliberately still pending. Scrubbing is not.
+            assert conn_id in service.connection_ids
+            assert cfg.transcript_barrier_pending is False
+            assert cfg.transcript_barrier_pending_transcript is None
+            assert cfg.transcript_barrier_failed is True
+
     def test_conversation_item_create_returns_events(self, setup):
         app, *_ = setup
         with TestClient(app) as client:

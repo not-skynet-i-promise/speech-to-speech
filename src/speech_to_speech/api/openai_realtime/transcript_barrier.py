@@ -89,12 +89,42 @@ class TranscriptBarrierResolveEvent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: Literal["reachy.transcript_barrier.resolve"] = "reachy.transcript_barrier.resolve"
-    version: Literal[1] = TRANSCRIPT_BARRIER_VERSION
+    version: Literal[1]
     nonce: str = Field(pattern=r"^[0-9a-f]{64}$")
     sequence: int = Field(ge=1)
     input_item_id: str
     action: Literal["accept", "discard"]
     item: RealtimeConversationItemUserMessage | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_exact_wire_shape(cls, value: object) -> object:
+        """Reject coercions and optional fields that disappear after parsing."""
+        if not isinstance(value, Mapping):
+            raise ValueError("resolution must be one object")
+        action = value.get("action")
+        required = {"type", "version", "nonce", "sequence", "input_item_id", "action"}
+        expected = required | ({"item"} if action == "accept" else set())
+        if set(value) != expected:
+            raise ValueError("resolution fields must match the selected action exactly")
+        if type(value.get("version")) is not int or value.get("version") != TRANSCRIPT_BARRIER_VERSION:
+            raise ValueError("unsupported resolution version")
+        sequence = value.get("sequence")
+        if type(sequence) is not int or sequence < 1:
+            raise ValueError("sequence must be one positive integer")
+        if action == "accept":
+            item = value.get("item")
+            if not isinstance(item, Mapping) or set(item) != {"id", "type", "role", "content"}:
+                raise ValueError("replacement message fields must be exact")
+            content = item.get("content")
+            if not isinstance(content, list) or len(content) != 1:
+                raise ValueError("replacement message requires one content part")
+            part = content[0]
+            if not isinstance(part, Mapping) or set(part) != {"type", "text"}:
+                raise ValueError("replacement content fields must be exact")
+        elif action != "discard":
+            raise ValueError("unsupported resolution action")
+        return value
 
     @model_validator(mode="after")
     def _validate_action_shape(self) -> "TranscriptBarrierResolveEvent":

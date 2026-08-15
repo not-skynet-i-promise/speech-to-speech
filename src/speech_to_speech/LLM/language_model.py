@@ -348,19 +348,28 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 try:
                     tool_call = fc.to_realtime_function_tool_call(ctx.function_tools)
                 except ValueError as e:
-                    logger.warning("Skipping invalid tool call: %s", e)
+                    if runtime_config is not None and runtime_config.transcript_barrier_enabled:
+                        logger.warning("Skipping invalid private tool call; content redacted")
+                    else:
+                        logger.warning("Skipping invalid tool call: %s", e)
                     continue
                 if any(
                     previous.name == tool_call.name and previous.arguments == tool_call.arguments for previous in tools
                 ):
-                    logger.warning("Skipping duplicate tool call '%s'", tool_call.name)
+                    if runtime_config is not None and runtime_config.transcript_barrier_enabled:
+                        logger.warning("Skipping duplicate private tool call; content redacted")
+                    else:
+                        logger.warning("Skipping duplicate tool call '%s'", tool_call.name)
                     continue
                 if len(tools) >= MAX_TOOL_CALLS_PER_RESPONSE:
-                    logger.warning(
-                        "Skipping extra tool call '%s'; at most %d tool calls are allowed per response",
-                        tool_call.name,
-                        MAX_TOOL_CALLS_PER_RESPONSE,
-                    )
+                    if runtime_config is not None and runtime_config.transcript_barrier_enabled:
+                        logger.warning("Skipping extra private tool call; content redacted")
+                    else:
+                        logger.warning(
+                            "Skipping extra tool call '%s'; at most %d tool calls are allowed per response",
+                            tool_call.name,
+                            MAX_TOOL_CALLS_PER_RESPONSE,
+                        )
                     continue
                 tools.append(tool_call)
                 parsed_tools.append(tool_call)

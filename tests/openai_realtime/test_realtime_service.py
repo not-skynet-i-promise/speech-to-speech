@@ -199,6 +199,54 @@ class TestParseClientEvent:
         assert canary not in caplog.text
         assert "Invalid private transcript barrier resolution payload" in caplog.text
 
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            lambda raw: raw.pop("version"),
+            lambda raw: raw.update(version=True),
+            lambda raw: raw.update(sequence=True),
+            lambda raw: raw.update(item=None),
+        ],
+    )
+    def test_private_discard_resolution_rejects_coercions_and_extra_nulls(self, service, mutation):
+        raw = {
+            "type": "reachy.transcript_barrier.resolve",
+            "version": 1,
+            "nonce": "ab" * 32,
+            "sequence": 1,
+            "input_item_id": "item_1",
+            "action": "discard",
+        }
+        mutation(raw)
+
+        assert service.parse_client_event(raw) is None
+
+    @pytest.mark.parametrize(
+        "path",
+        ["status", "object", "content_audio", "content_transcript"],
+    )
+    def test_private_accept_resolution_rejects_optional_null_fields(self, service, path):
+        raw = {
+            "type": "reachy.transcript_barrier.resolve",
+            "version": 1,
+            "nonce": "ab" * 32,
+            "sequence": 1,
+            "input_item_id": "item_1",
+            "action": "accept",
+            "item": {
+                "id": "msg_private_1",
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "private"}],
+            },
+        }
+        if path in {"status", "object"}:
+            raw["item"][path] = None
+        else:
+            raw["item"]["content"][0][path.removeprefix("content_")] = None
+
+        assert service.parse_client_event(raw) is None
+
 
 # ===================================================================
 # Audio append
@@ -265,6 +313,7 @@ class TestHandleSessionUpdate:
         assert result.nonce == nonce
         assert runtime_config.transcript_barrier_enabled is True
         assert "reachy_private_transcript_barrier" not in (runtime_config.session.model_extra or {})
+        assert runtime_config.chat._private_content_logging is True
 
         duplicate = service.handle_session_update(
             conn_id,
@@ -275,6 +324,8 @@ class TestHandleSessionUpdate:
         assert isinstance(duplicate, RealtimeErrorEvent)
         assert duplicate.error.type == "invalid_transcript_barrier"
         assert runtime_config.transcript_barrier_failed is True
+        assert runtime_config.transcript_barrier_enabled is True
+        assert runtime_config.transcript_barrier_operational is False
 
     def test_private_transcript_barrier_must_be_in_first_session_update(
         self,
@@ -1727,11 +1778,15 @@ class TestDispatchPipelineEvent:
 
         resolved = service.handle_transcript_barrier_resolve(
             conn_id,
-            TranscriptBarrierResolveEvent(
-                nonce=nonce,
-                sequence=completed.sequence,
-                input_item_id=completed.item_id,
-                action="discard",
+            TranscriptBarrierResolveEvent.model_validate(
+                {
+                    "type": "reachy.transcript_barrier.resolve",
+                    "version": 1,
+                    "nonce": nonce,
+                    "sequence": completed.sequence,
+                    "input_item_id": completed.item_id,
+                    "action": "discard",
+                }
             ),
         )
 
@@ -1796,6 +1851,115 @@ class TestDispatchPipelineEvent:
         assert runtime_config.transcript_barrier_pending is False
         assert runtime_config.transcript_barrier_pending_transcript is None
         assert runtime_config.chat.buffer == []
+
+    def test_private_final_rejects_an_active_response_and_scrubs_deferred_items(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+    ):
+        runtime_config.transcript_barrier_version = 1
+        runtime_config.transcript_barrier_nonce = "79" * 32
+        service.response._ensure_response(conn_id)
+        deferred = ConversationItemCreateEvent.model_validate(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "id": "msg_deferred_private_boundary",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "must not mutate history"}],
+                },
+            }
+        )
+        assert service.handle_conversation_item_create(conn_id, deferred) == []
+
+        events = service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptBarrierCompletedEvent(transcript="private final"),
+        )
+
+        assert isinstance(events[0], TranscriptBarrierFailedServerEvent)
+        assert runtime_config.transcript_barrier_failed is True
+        assert runtime_config.transcript_barrier_pending is False
+        assert service._state(conn_id).deferred_items == []
+        assert runtime_config.chat.buffer == []
+
+    def test_response_finish_cannot_flush_deferred_history_while_private_final_is_pending(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+    ):
+        runtime_config.transcript_barrier_version = 1
+        runtime_config.transcript_barrier_nonce = "80" * 32
+        completed = service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptBarrierCompletedEvent(transcript="pending private final"),
+        )[0]
+        assert isinstance(completed, TranscriptBarrierCompletedServerEvent)
+        st = service._state(conn_id)
+        st.in_response = True
+        st.current_response_id = "resp_stale"
+        st.current_item_id = "item_stale"
+        st.deferred_items.append(
+            ConversationItemCreateEvent.model_validate(
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "id": "msg_deferred_stale",
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "deferred mutation"}],
+                    },
+                }
+            ).item
+        )
+
+        service.finish_response(conn_id, status="cancelled")
+
+        assert runtime_config.transcript_barrier_pending is True
+        assert runtime_config.chat.buffer == []
+        assert len(st.deferred_items) == 1
+
+    def test_private_replacement_item_id_cannot_be_reused(self, service, conn_id, runtime_config):
+        nonce = "81" * 32
+        runtime_config.transcript_barrier_version = 1
+        runtime_config.transcript_barrier_nonce = nonce
+
+        def resolve(transcript: str):
+            completed = service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptBarrierCompletedEvent(transcript=transcript),
+            )[0]
+            assert isinstance(completed, TranscriptBarrierCompletedServerEvent)
+            return service.handle_transcript_barrier_resolve(
+                conn_id,
+                TranscriptBarrierResolveEvent.model_validate(
+                    {
+                        "type": "reachy.transcript_barrier.resolve",
+                        "version": 1,
+                        "nonce": nonce,
+                        "sequence": completed.sequence,
+                        "input_item_id": completed.item_id,
+                        "action": "accept",
+                        "item": {
+                            "id": "msg_private_reused",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": transcript}],
+                        },
+                    }
+                ),
+            )
+
+        first = resolve("first private final")
+        second = resolve("second private final")
+
+        assert first[-1].type == "reachy.transcript_barrier.resolved"
+        assert second[0].type == "error"
+        assert runtime_config.transcript_barrier_failed is True
+        assert len(runtime_config.chat.buffer) == 1
 
     def test_private_barrier_whitespace_final_is_content_free_and_inert(
         self,

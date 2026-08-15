@@ -107,6 +107,29 @@ def test_private_barrier_suppresses_partials_and_reserves_the_final_without_logg
     assert canary not in caplog.text
 
 
+def test_poisoned_private_session_keeps_stt_redaction_sticky_while_work_drains(caplog):
+    text_output_queue = Queue()
+    runtime_config = RuntimeConfig()
+    runtime_config.transcript_barrier_version = 1
+    runtime_config.transcript_barrier_nonce = "ab" * 32
+    runtime_config.transcript_barrier_failed = True
+    notifier = object.__new__(TranscriptionNotifier)
+    notifier.setup(
+        text_output_queue=text_output_queue,
+        transcript_barrier_enabled=lambda: runtime_config.transcript_barrier_enabled,
+    )
+    canary = "PRIVATE_STT_AFTER_POISON_CANARY"
+
+    with caplog.at_level(logging.DEBUG, logger="speech_to_speech.STT.transcription_notifier"):
+        assert list(notifier.process(PartialTranscription(text=canary))) == []
+        assert list(notifier.process(Transcription(text=canary, language_code="en"))) == []
+
+    event = text_output_queue.get_nowait()
+    assert isinstance(event, TranscriptBarrierCompletedEvent)
+    assert event.transcript == canary
+    assert canary not in caplog.text
+
+
 def test_private_barrier_discards_whitespace_without_a_placeholder_or_response():
     text_output_queue = Queue()
     should_listen = Event()

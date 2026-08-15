@@ -42,6 +42,7 @@ class BaseHandler(Generic[InT, OutT]):
         self.queue_in = queue_in
         self.queue_out = queue_out
         self.pipeline_index: int | None = None
+        self._private_content_logging = False
         self.setup(*setup_args, **setup_kwargs)
         self._times: list[float] = []
 
@@ -81,6 +82,19 @@ class BaseHandler(Generic[InT, OutT]):
             return AudioOutput(audio=audio, cancel_generation=cancel_generation)
         return output
 
+    def _input_requires_private_logging(self, item: object) -> bool:
+        """Detect the sticky session privacy mode without coupling handler types."""
+        candidates = item if isinstance(item, tuple) else (item,)
+        for candidate in candidates:
+            runtime_config = getattr(candidate, "runtime_config", None)
+            if runtime_config is not None and bool(getattr(runtime_config, "transcript_barrier_enabled", False)):
+                return True
+        barrier_state = getattr(self, "transcript_barrier_enabled", False)
+        try:
+            return bool(barrier_state() if callable(barrier_state) else barrier_state)
+        except Exception:
+            return self._private_content_logging
+
     def run(self) -> None:
         if self.pipeline_index is not None:
             pipeline_log_ctx.set(self.pipeline_index)
@@ -97,11 +111,15 @@ class BaseHandler(Generic[InT, OutT]):
                 try:
                     self.on_session_end()
                 except Exception as e:
-                    logger.error(
-                        f"{self.__class__.__name__}: Error in on_session_end(): {type(e).__name__}: {e}",
-                        exc_info=True,
-                    )
+                    if self._private_content_logging:
+                        logger.error("%s: session cleanup failed; private content redacted", self.__class__.__name__)
+                    else:
+                        logger.error(
+                            f"{self.__class__.__name__}: Error in on_session_end(): {type(e).__name__}: {e}",
+                            exc_info=True,
+                        )
                 self.queue_out.put(item)
+                self._private_content_logging = False
                 continue
 
             if isinstance(item, bytes) and item == PIPELINE_END:
@@ -114,6 +132,8 @@ class BaseHandler(Generic[InT, OutT]):
                 continue
 
             typed_item = cast(InT, item)
+            if self._input_requires_private_logging(typed_item):
+                self._private_content_logging = True
             if not self.should_process_input(typed_item):
                 continue
 
@@ -134,7 +154,13 @@ class BaseHandler(Generic[InT, OutT]):
                     self.queue_out.put(queued_output)
                     start_time = perf_counter()
             except Exception as e:
-                logger.error(f"{self.__class__.__name__}: Error in process(): {type(e).__name__}: {e}", exc_info=True)
+                if self._private_content_logging:
+                    logger.error("%s: processing failed; private content redacted", self.__class__.__name__)
+                else:
+                    logger.error(
+                        f"{self.__class__.__name__}: Error in process(): {type(e).__name__}: {e}",
+                        exc_info=True,
+                    )
 
         self.cleanup()
         self.queue_out.put(PIPELINE_END)

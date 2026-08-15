@@ -113,18 +113,24 @@ held outside model history. While that final is pending, new audio,
 `conversation.item.create`, and `response.create` fail closed.
 
 The client must answer once with `reachy.transcript_barrier.resolve`, matching
-the nonce, sequence, and input item ID. `action="accept"` must include exactly
+the explicitly supplied integer version, positive integer sequence, nonce, and
+input item ID; booleans, coercions, omitted fields, explicit nulls, and extra
+fields are rejected. `action="accept"` must include exactly
 one `msg_` user message whose sole `input_text` is byte-for-byte equal to the
-pending final; the server then inserts that one message and acknowledges it as
+pending final and whose ID has not previously resolved a private final; the
+server then inserts that one message and acknowledges it as
 `accepted`. `action="discard"` includes no item and scrubs the final without a
 history entry. Empty or whitespace-only STT results produce a content-free
 `reachy.transcript_barrier.discarded` event and require no resolution.
 
 Malformed, duplicate, overlapping, stale, or mismatched barrier events poison
 the session and close the WebSocket. Pending transcript text is scrubbed on
-resolution, failure, and disconnect. Assistant content logs are also redacted
-for a barrier-enabled session. Clients that do not request this extension keep
-the standard Realtime behavior described above.
+resolution, failure, and synchronously at disconnect before handler drain.
+Pending private input also freezes deferred history application and chat
+compaction until exact resolution. Privacy-mode exception and content logging
+remains sticky after poison until the session is unregistered, so draining work
+cannot downgrade into ordinary logging. Clients that do not request this
+extension keep the standard Realtime behavior described above.
 
 ---
 

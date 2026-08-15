@@ -116,14 +116,16 @@ class FacebookMMSTTSHandler(BaseHandler[TTSIn, TTSOut]):
             else:
                 logger.debug("Tokenizing text: %s", text)
             logger.debug(f"Current language: {self.language}")
-            logger.debug(f"Tokenizer: {self.tokenizer}")
+            if not redact_content:
+                logger.debug(f"Tokenizer: {self.tokenizer}")
 
             inputs = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True)
             input_ids = inputs.input_ids.to(self.device).long()
             attention_mask = inputs.attention_mask.to(self.device)
 
             logger.debug(f"Input IDs shape: {input_ids.shape}, dtype: {input_ids.dtype}")
-            logger.debug(f"Input IDs: {input_ids}")
+            if not redact_content:
+                logger.debug(f"Input IDs: {input_ids}")
 
             if input_ids.numel() == 0:
                 logger.error("Input IDs tensor is empty")
@@ -139,7 +141,7 @@ class FacebookMMSTTSHandler(BaseHandler[TTSIn, TTSOut]):
                 logger.error("Facebook MMS generation failed; private content redacted")
             else:
                 logger.error("Error in generate_audio: %s", e)
-            logger.exception("Full traceback:")
+                logger.exception("Full traceback:")
             return None
 
     def process(self, tts_input: TTSIn) -> Iterator[TTSOut]:

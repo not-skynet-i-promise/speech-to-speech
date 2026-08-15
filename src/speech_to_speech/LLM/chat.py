@@ -110,6 +110,8 @@ class Chat:
         self._compact_thread: threading.Thread | None = None
         self._shutdown = threading.Event()
         self._gen_counter = 0
+        self._compaction_suspended = False
+        self._private_content_logging = False
 
     # ── Internal mutators (caller holds _lock) ─────────────────
 
@@ -246,6 +248,8 @@ class Chat:
         Call once after each successful generation, not inside :meth:`add_item`.
         """
         with self._lock:
+            if self._compaction_suspended:
+                return
             if self._user_turn_count <= self.size:
                 return
             if compactor is not None:
@@ -435,6 +439,8 @@ class Chat:
             clone.buffer = list(self.buffer)
             clone._pending_tool_calls = dict(self._pending_tool_calls)
             clone._user_turn_count = self._user_turn_count
+            clone._compaction_suspended = self._compaction_suspended
+            clone._private_content_logging = self._private_content_logging
             return clone
 
     def reset(self) -> None:
@@ -442,6 +448,8 @@ class Chat:
         with self._lock:
             self._gen_counter += 1
             self._compact_in_flight = False
+            self._compaction_suspended = False
+            self._private_content_logging = False
             self.buffer = []
             self.init_chat_message = None
             self._pending_tool_calls = {}
@@ -463,6 +471,24 @@ class Chat:
         with self._lock:
             self._gen_counter += 1
             self._compact_in_flight = False
+
+    def suspend_compaction(self) -> None:
+        """Freeze current and future compaction until an explicit resume."""
+        with self._lock:
+            self._gen_counter += 1
+            self._compact_in_flight = False
+            self._compaction_suspended = True
+
+    def resume_compaction(self) -> None:
+        """Allow later size enforcement after a private input is resolved."""
+        with self._lock:
+            if not self._shutdown.is_set():
+                self._compaction_suspended = False
+
+    def enable_private_content_logging(self) -> None:
+        """Keep exception logs content-free for the lifetime of this chat."""
+        with self._lock:
+            self._private_content_logging = True
 
     def image_message_ids(self) -> set[str]:
         """IDs of user messages currently carrying ``input_image`` content."""
@@ -573,7 +599,10 @@ class Chat:
             try:
                 result = compactor(snapshot)
             except Exception:
-                logger.exception("Chat compaction failed; chat unchanged")
+                if self._private_content_logging:
+                    logger.error("Chat compaction failed; private content redacted")
+                else:
+                    logger.exception("Chat compaction failed; chat unchanged")
                 return
             if not isinstance(result, CompactionResult):
                 logger.error("Compactor must return a CompactionResult, got %r", type(result).__name__)
