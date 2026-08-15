@@ -345,6 +345,12 @@ class RealtimeService:
     def transcript_barrier_failed(self, conn_id: str) -> bool:
         return self._state(conn_id).runtime_config.transcript_barrier_failed
 
+    def transcript_barrier_poisoned(self) -> bool:
+        """Return whether the single-session unit must drop queued work."""
+        if len(self._conns) != 1:
+            return False
+        return next(iter(self._conns.values())).runtime_config.transcript_barrier_failed
+
     def transcript_barrier_audio_allowed(self, conn_id: str) -> bool:
         cfg = self._state(conn_id).runtime_config
         return not cfg.transcript_barrier_failed and not cfg.transcript_barrier_pending
@@ -531,8 +537,8 @@ class RealtimeService:
         wait_for_pending_reopen: bool,
     ) -> list[ServerEvent] | None:
         cfg = self._state(conn_id).runtime_config
-        if cfg.transcript_barrier_failed and not cfg.transcript_barrier_enabled:
-            logger.debug("Dropping pipeline event after rejected private activation")
+        if cfg.transcript_barrier_failed:
+            logger.debug("Dropping pipeline event after private barrier failure")
             return []
         is_stale = self._is_stale_turn_event(event, wait_for_pending_reopen=wait_for_pending_reopen)
         if is_stale is None:

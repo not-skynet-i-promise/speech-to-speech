@@ -18,6 +18,7 @@ def _notifier(
     runtime_config: RuntimeConfig | None = None,
     should_listen: Event | None = None,
     barrier_enabled: bool = False,
+    barrier_failed: bool = False,
 ) -> TranscriptionNotifier:
     notifier = object.__new__(TranscriptionNotifier)
     notifier.setup(
@@ -25,6 +26,7 @@ def _notifier(
         runtime_config=runtime_config,
         should_listen=should_listen,
         transcript_barrier_enabled=lambda: barrier_enabled,
+        transcript_barrier_failed=lambda: barrier_failed,
     )
     return notifier
 
@@ -115,6 +117,7 @@ def test_poisoned_private_session_keeps_stt_redaction_sticky_while_work_drains(c
     notifier.setup(
         text_output_queue=text_output_queue,
         transcript_barrier_enabled=lambda: runtime_config.transcript_barrier_private,
+        transcript_barrier_failed=lambda: runtime_config.transcript_barrier_failed,
     )
     canary = "PRIVATE_STT_AFTER_POISON_CANARY"
 
@@ -122,9 +125,7 @@ def test_poisoned_private_session_keeps_stt_redaction_sticky_while_work_drains(c
         assert list(notifier.process(PartialTranscription(text=canary))) == []
         assert list(notifier.process(Transcription(text=canary, language_code="en"))) == []
 
-    event = text_output_queue.get_nowait()
-    assert isinstance(event, TranscriptBarrierCompletedEvent)
-    assert event.transcript == canary
+    assert text_output_queue.empty()
     assert canary not in caplog.text
 
 

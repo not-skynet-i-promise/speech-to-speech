@@ -1155,6 +1155,34 @@ class TestFinishAudioResponse:
 
 
 class TestDispatchPipelineEvent:
+    def test_poisoned_enabled_barrier_drops_inflight_assistant_text_and_tools(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+    ):
+        runtime_config.transcript_barrier_version = 1
+        runtime_config.transcript_barrier_nonce = "91" * 32
+        service.poison_transcript_barrier(conn_id, "test_failure")
+
+        events = service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(
+                text="PRIVATE_ASSISTANT_DRAIN_CONTENT",
+                tools=[
+                    {
+                        "type": "function_call",
+                        "call_id": "call_private_drain",
+                        "name": "private_tool",
+                        "arguments": "{}",
+                    }
+                ],
+            ),
+        )
+
+        assert events == []
+        assert service._state(conn_id).current_response_id is None
+
     # -- speech_started --
 
     def test_speech_started_emits_event(self, service, conn_id):

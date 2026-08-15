@@ -21,16 +21,24 @@ class BaseSTTHandler(BaseHandler[STTIn, STTOut]):
     speculative_turns: SpeculativeTurnTracker | None = None
     final_revision_settle_s: float = 0.0
     _transcript_barrier_enabled: Callable[[], bool] = staticmethod(lambda: False)
+    _transcript_barrier_failed: Callable[[], bool] = staticmethod(lambda: False)
 
     def set_transcript_barrier_enabled(self, enabled: Callable[[], bool]) -> None:
         """Install the single-session content-redaction gate after construction."""
         self._transcript_barrier_enabled = enabled
+
+    def set_transcript_barrier_failed(self, failed: Callable[[], bool]) -> None:
+        """Install the single-session fail-closed output gate."""
+        self._transcript_barrier_failed = failed
 
     @property
     def transcript_barrier_enabled(self) -> bool:
         return self._transcript_barrier_enabled()
 
     def should_process_input(self, item: STTIn) -> bool:
+        if self._transcript_barrier_failed():
+            logger.debug("Dropping STT input after private barrier failure")
+            return False
         mode = getattr(item, "mode", None)
         turn_id = getattr(item, "turn_id", None)
         turn_revision = getattr(item, "turn_revision", None)
@@ -70,6 +78,9 @@ class BaseSTTHandler(BaseHandler[STTIn, STTOut]):
         return True
 
     def should_emit_output(self, output: STTOut) -> bool:
+        if self._transcript_barrier_failed():
+            logger.debug("Dropping STT output after private barrier failure")
+            return False
         if isinstance(output, PartialTranscription) and self._is_completed_final_revision(output):
             self._log_stale_turn_item(output, "output-after-final")
             return False

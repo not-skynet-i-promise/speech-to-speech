@@ -545,6 +545,7 @@ def _build_realtime_pipeline_unit(
             "text_output_queue": text_output_queue,
             "should_listen": should_listen,
             "transcript_barrier_enabled": service.transcript_barrier_private,
+            "transcript_barrier_failed": service.transcript_barrier_poisoned,
         },
         module_kwargs=module_kwargs,
         vad_handler_kwargs=vad_kw,
@@ -568,6 +569,7 @@ def _build_realtime_pipeline_unit(
         h.pipeline_index = index
         if isinstance(h, BaseSTTHandler):
             h.set_transcript_barrier_enabled(service.transcript_barrier_private)
+            h.set_transcript_barrier_failed(service.transcript_barrier_poisoned)
 
     return PipelineUnit(
         index=index,

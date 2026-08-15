@@ -40,13 +40,18 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
         runtime_config: RuntimeConfig | None = None,
         should_listen: Event | None = None,
         transcript_barrier_enabled: Callable[[], bool] | None = None,
+        transcript_barrier_failed: Callable[[], bool] | None = None,
     ) -> None:
         self.text_output_queue = text_output_queue
         self.runtime_config = runtime_config
         self.should_listen = should_listen
         self.transcript_barrier_enabled = transcript_barrier_enabled or (lambda: False)
+        self.transcript_barrier_failed = transcript_barrier_failed or (lambda: False)
 
     def process(self, transcription: STTOut) -> Iterator[Union[STTOut, LLMIn]]:
+        if self.transcript_barrier_failed():
+            logger.debug("Dropping transcription after private barrier failure")
+            return
         if isinstance(transcription, PartialTranscription):
             if self.transcript_barrier_enabled():
                 logger.debug("Private transcript barrier suppressed a partial transcription")
