@@ -524,6 +524,7 @@ def _build_realtime_pipeline_unit(
         should_listen=should_listen,
         chat_size=chat_size,
         speculative_turns=speculative_turns,
+        cancel_scope=cancel_scope,
     )
 
     if module_kwargs.enable_live_transcription:

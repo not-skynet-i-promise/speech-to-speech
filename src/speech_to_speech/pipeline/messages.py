@@ -197,6 +197,10 @@ class GenerateResponseRequest(PipelineMessage):
     turn_id: str | None = None
     turn_revision: int | None = None
     speech_stopped_at_s: float | None = None
+    # Snapshot when the request is admitted to the LLM queue. A cancel that
+    # happens before dequeue must still make this request stale; capturing the
+    # generation only inside the LLM worker would incorrectly revive it.
+    cancel_generation: int | None = None
 
 
 # ── Binary sentinels (audio/output queue) ─────────────────────────────

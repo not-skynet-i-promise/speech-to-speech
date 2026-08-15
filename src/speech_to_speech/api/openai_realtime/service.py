@@ -49,6 +49,7 @@ from speech_to_speech.api.openai_realtime.transcript_barrier import (
     TranscriptBarrierResolveEvent,
 )
 from speech_to_speech.LLM.chat import Chat, make_user_message
+from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
     PartialTranscriptionEvent,
@@ -226,11 +227,13 @@ class RealtimeService:
         should_listen: ThreadingEvent | None = None,
         chat_size: int = 10,
         speculative_turns: SpeculativeTurnTracker | None = None,
+        cancel_scope: CancelScope | None = None,
     ) -> None:
         self.text_prompt_queue = text_prompt_queue
         self.should_listen = should_listen
         self._chat_size = chat_size
         self.speculative_turns = speculative_turns
+        self.cancel_scope = cancel_scope
         self._conns: dict[str, ConnState] = {}
         self.total_usage = GlobalUsageMetrics()
 
@@ -663,6 +666,7 @@ class RealtimeService:
                     turn_id=event.turn_id,
                     turn_revision=event.turn_revision,
                     speech_stopped_at_s=event.speech_stopped_at_s,
+                    cancel_generation=(self.cancel_scope.generation if self.cancel_scope else None),
                 )
             )
 

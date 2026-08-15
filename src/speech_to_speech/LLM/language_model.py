@@ -536,6 +536,19 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         ctx.turn_id = request.turn_id
         ctx.turn_revision = request.turn_revision
         ctx.speech_stopped_at_s = request.speech_stopped_at_s
+        request_generation = request.cancel_generation
+        if (
+            request_generation is not None
+            and self.cancel_scope is not None
+            and self.cancel_scope.is_stale(request_generation)
+        ):
+            logger.info("Skipping cancelled LLM request before provider execution")
+            yield EndOfResponse(
+                turn_id=ctx.turn_id,
+                turn_revision=ctx.turn_revision,
+                cancel_generation=request_generation,
+            )
+            return
         if not self._turn_is_latest(ctx.turn_id, ctx.turn_revision):
             logger.info("Skipping stale LLM request for turn=%s rev=%s", ctx.turn_id, ctx.turn_revision)
             yield EndOfResponse(turn_id=ctx.turn_id, turn_revision=ctx.turn_revision)
@@ -582,7 +595,9 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         if lang_name and self.enable_lang_prompt:
             active_chat.add_item(make_user_message(f"Please reply to my message in {lang_name}."))
 
-        gen = self.cancel_scope.generation if self.cancel_scope else None
+        gen = request_generation
+        if gen is None and self.cancel_scope is not None:
+            gen = self.cancel_scope.generation
         ctx.cancel_generation = gen
         # Images the model sees this turn; only these are stripped on write-back,
         # so an image a fast client injects mid-generation for the next turn

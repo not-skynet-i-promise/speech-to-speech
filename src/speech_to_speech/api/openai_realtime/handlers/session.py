@@ -69,6 +69,7 @@ class SessionHandler(RealtimeBaseHandler):
                     or state.in_response
                     or state.response_pending
                     or bool(cfg.chat.buffer)
+                    or self._service.cancel_scope is None
                 ):
                     return self._service.poison_transcript_barrier(conn_id, "invalid_transcript_barrier")
 

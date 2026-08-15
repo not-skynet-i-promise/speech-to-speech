@@ -15,6 +15,7 @@ import queue
 import threading
 from types import SimpleNamespace
 
+from openai.types.realtime import ResponseCreatedEvent, ResponseCreateEvent, SessionUpdateEvent
 from openai.types.realtime.conversation_item import (
     RealtimeConversationItemFunctionCall,
     RealtimeConversationItemFunctionCallOutput,
@@ -28,12 +29,15 @@ from openai.types.responses import ResponseFunctionToolCall
 import speech_to_speech.LLM.base_openai_compatible_language_model as base_mod
 import speech_to_speech.LLM.chat_completions_language_model as ccm
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
+from speech_to_speech.api.openai_realtime.service import RealtimeService
+from speech_to_speech.api.openai_realtime.transcript_barrier import TranscriptBarrierReadyEvent
 from speech_to_speech.LLM.chat import Chat, make_user_message
 from speech_to_speech.LLM.chat_completions_language_model import (
     ChatCompletionsApiModelHandler,
     _to_chat_tool_choice,
     _to_chat_tools,
 )
+from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.messages import (
     EndOfResponse,
     GenerateResponseRequest,
@@ -103,7 +107,7 @@ class _FakeClient:
         return self
 
 
-def _make_handler(stream=True):
+def _make_handler(stream=True, *, cancel_scope: CancelScope | None = None):
     """Build a handler whose warmup hits the fake client (no network)."""
     orig_openai = base_mod.OpenAI
     base_mod.OpenAI = _FakeClient
@@ -119,6 +123,7 @@ def _make_handler(stream=True):
                 stream=stream,
                 disable_thinking=True,
                 compact_history=False,
+                cancel_scope=cancel_scope,
             ),
         )
     finally:
@@ -130,6 +135,44 @@ def test_warmup_uses_request_scoped_sdk_retries():
     handler = _make_handler()
 
     assert handler.client.last_options == {"max_retries": base_mod.WARMUP_MAX_RETRIES}
+
+
+def test_cancelled_queued_request_cannot_start_after_private_barrier_ready():
+    text_prompt_queue: queue.Queue = queue.Queue()
+    cancel_scope = CancelScope()
+    service = RealtimeService(text_prompt_queue=text_prompt_queue, cancel_scope=cancel_scope)
+    conn_id = service.register()
+
+    created = service.handle_response_create(
+        conn_id,
+        ResponseCreateEvent(type="response.create", response={"conversation": "none"}),
+    )
+    assert isinstance(created, ResponseCreatedEvent)
+    request = text_prompt_queue.get(timeout=1.0)
+    assert isinstance(request, GenerateResponseRequest)
+    assert request.cancel_generation == 0
+
+    cancel_scope.cancel()
+    service.handle_response_cancel(conn_id)
+    ready = service.handle_session_update(
+        conn_id,
+        SessionUpdateEvent(
+            type="session.update",
+            session={
+                "type": "realtime",
+                "reachy_private_transcript_barrier": {"version": 1, "nonce": "cd" * 32},
+            },
+        ),
+    )
+    assert isinstance(ready, TranscriptBarrierReadyEvent)
+
+    handler = _make_handler(stream=False, cancel_scope=cancel_scope)
+    handler.client.chat.completions.last_kwargs = None
+    outputs = list(handler.process(request))
+
+    assert handler.client.chat.completions.last_kwargs is None
+    assert outputs == [EndOfResponse(cancel_generation=0)]
+    service.unregister(conn_id)
 
 
 def _chunk(content=None, tool_calls=None, usage=None):

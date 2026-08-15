@@ -15,8 +15,10 @@ from speech_to_speech.api.openai_realtime.service import RealtimeService
 from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.LLM.chat import Chat, make_assistant_message, make_user_message
 from speech_to_speech.LLM.language_model import BaseLanguageModelHandler, StreamContext
+from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.messages import (
     PIPELINE_END,
+    EndOfResponse,
     GenerateResponseRequest,
     LLMResponseChunk,
     Transcription,
@@ -118,6 +120,17 @@ class _PoisoningLanguageModelHandler(BaseLanguageModelHandler):
         runtime_config.transcript_barrier_failed = True
         if False:
             yield LLMResponseChunk()
+
+
+class _NeverCalledLanguageModelHandler(BaseLanguageModelHandler):
+    """Provider-free local handler whose generation hook must stay unreachable."""
+
+    def _load_model(self, model_name, device, torch_dtype, gen_kwargs):
+        raise AssertionError("test bypasses setup")
+
+    def _generate(self, *args, **kwargs):
+        raise AssertionError("stale queued request reached local model generation")
+        yield LLMResponseChunk()
 
 
 def test_generic_handler_exception_is_content_free_in_private_mode(caplog):
@@ -378,3 +391,17 @@ def test_local_llm_poison_during_generation_blocks_assistant_and_tool_history_wr
     assert runtime_config.transcript_barrier_failed is True
     assert not any(getattr(item, "role", None) == "assistant" for item in chat.buffer)
     assert not any(getattr(item, "type", None) == "function_call" for item in chat.buffer)
+
+
+def test_local_llm_drops_request_cancelled_before_dequeue():
+    handler = object.__new__(_NeverCalledLanguageModelHandler)
+    handler.speculative_turns = None
+    handler.cancel_scope = CancelScope()
+
+    request = GenerateResponseRequest(
+        runtime_config=RuntimeConfig(),
+        cancel_generation=handler.cancel_scope.generation,
+    )
+    handler.cancel_scope.cancel()
+
+    assert list(handler.process(request)) == [EndOfResponse(cancel_generation=0)]

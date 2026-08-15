@@ -61,16 +61,17 @@ def setup():
     text_prompt_queue: Queue = Queue()
     should_listen = ThreadingEvent()
     should_listen.set()
+    cancel_scope = CancelScope()
     service = RealtimeService(
         text_prompt_queue=text_prompt_queue,
         should_listen=should_listen,
+        cancel_scope=cancel_scope,
     )
     input_queue: Queue = Queue()
     output_queue: Queue = Queue()
     text_output_queue: Queue = Queue()
     stop_event = ThreadingEvent()
     response_playing = ThreadingEvent()
-    cancel_scope = CancelScope()
     unit = PipelineUnit(
         index=0,
         service=service,
@@ -1236,10 +1237,15 @@ def _make_unit(index: int) -> PipelineUnit:
     text_prompt_queue: Queue = Queue()
     should_listen = ThreadingEvent()
     should_listen.set()
+    cancel_scope = CancelScope()
     return PipelineUnit(
         index=index,
-        service=RealtimeService(text_prompt_queue=text_prompt_queue, should_listen=should_listen),
-        cancel_scope=CancelScope(),
+        service=RealtimeService(
+            text_prompt_queue=text_prompt_queue,
+            should_listen=should_listen,
+            cancel_scope=cancel_scope,
+        ),
+        cancel_scope=cancel_scope,
         should_listen=should_listen,
         response_playing=ThreadingEvent(),
         input_queue=Queue(),

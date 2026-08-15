@@ -62,16 +62,17 @@ class _ServerEnv:
         self.text_prompt_queue: Queue = Queue()
         self.should_listen = ThreadingEvent()
         self.should_listen.set()
+        self.cancel_scope = CancelScope()
         self.service = RealtimeService(
             text_prompt_queue=self.text_prompt_queue,
             should_listen=self.should_listen,
+            cancel_scope=self.cancel_scope,
         )
         self.input_queue: Queue = Queue()
         self.output_queue: Queue = Queue()
         self.text_output_queue: Queue = Queue()
         self.stop_event = ThreadingEvent()
         self.response_playing = ThreadingEvent()
-        self.cancel_scope = CancelScope()
         self.unit = PipelineUnit(
             index=0,
             service=self.service,

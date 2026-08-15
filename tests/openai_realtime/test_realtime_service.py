@@ -345,6 +345,25 @@ class TestHandleSessionUpdate:
         assert runtime_config.transcript_barrier_enabled is True
         assert runtime_config.transcript_barrier_operational is False
 
+    def test_private_transcript_barrier_requires_shared_cancel_scope(self, runtime_config):
+        service = RealtimeService(text_prompt_queue=Queue())
+        conn_id = service.register()
+        service._state(conn_id).runtime_config = runtime_config
+        try:
+            result = service.handle_session_update(
+                conn_id,
+                self._make_update(
+                    reachy_private_transcript_barrier={"version": 1, "nonce": "ef" * 32},
+                ),
+            )
+
+            assert isinstance(result, RealtimeErrorEvent)
+            assert result.error.type == "invalid_transcript_barrier"
+            assert runtime_config.transcript_barrier_failed is True
+            assert runtime_config.transcript_barrier_enabled is False
+        finally:
+            service.unregister(conn_id)
+
     def test_barrier_ready_waits_for_cancelled_provider_content_guard(
         self,
         service,

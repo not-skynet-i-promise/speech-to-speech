@@ -620,6 +620,19 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         turn_id = request.turn_id
         turn_revision = request.turn_revision
         speech_stopped_at_s = request.speech_stopped_at_s
+        request_generation = request.cancel_generation
+        if (
+            request_generation is not None
+            and self.cancel_scope is not None
+            and self.cancel_scope.is_stale(request_generation)
+        ):
+            logger.info("Skipping cancelled LLM request before provider execution")
+            yield EndOfResponse(
+                turn_id=turn_id,
+                turn_revision=turn_revision,
+                cancel_generation=request_generation,
+            )
+            return
         if not self._turn_is_latest(turn_id, turn_revision):
             logger.info("Skipping stale LLM request for turn=%s rev=%s", turn_id, turn_revision)
             yield EndOfResponse(turn_id=turn_id, turn_revision=turn_revision)
@@ -664,7 +677,9 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         # CancelScope.is_stale(gen) is checked when the stream iterator advances; a
         # blocked read inside httpx cannot be aborted by cancel_scope.cancel() from
         # the websocket router. Mitigations: request_timeout_s / ReadTimeout.
-        gen = self.cancel_scope.generation if self.cancel_scope else None
+        gen = request_generation
+        if gen is None and self.cancel_scope is not None:
+            gen = self.cancel_scope.generation
 
         turn = _Turn(
             language_code=language_code,
