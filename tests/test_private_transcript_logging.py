@@ -576,6 +576,65 @@ def test_private_transformers_thread_base_exception_is_normalized(monkeypatch, f
         assert quiescent is True
 
 
+def test_transformers_start_exception_after_launch_keeps_activation_lease(monkeypatch, capsys):
+    canary = "PRIVATE_POST_LAUNCH_START_EXCEPTION_CANARY"
+    handler = object.__new__(_NeverCalledLanguageModelHandler)
+    handler.cancel_scope = CancelScope()
+    handler.speculative_turns = None
+    handler.enable_lang_prompt = False
+    handler.compactor = None
+    handler.tokenizer = type("Tokenizer", (), {"encode": staticmethod(lambda _text: [])})()
+    worker_started = Event()
+    release_worker = Event()
+    created: list[Thread] = []
+
+    class StartFault(BaseException):
+        pass
+
+    class RaiseAfterLaunchThread(Thread):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+        def start(self) -> None:
+            super().start()
+            assert worker_started.wait(timeout=1.0)
+            raise StartFault(canary)
+
+    def blocked_worker() -> None:
+        worker_started.set()
+        assert release_worker.wait(timeout=2.0)
+
+    def generate(_chat, _language_code, _gen, _ctx, runtime_config=None, _response=None):
+        handler._start_transformers_generation(
+            blocked_worker,
+            _ImmediateTimeoutStreamer(),
+            runtime_config,
+        )
+        yield LLMResponseChunk(text="unreachable")
+
+    monkeypatch.setattr("speech_to_speech.LLM.language_model.Thread", RaiseAfterLaunchThread)
+    monkeypatch.setattr(handler, "_generate", generate)
+    runtime_config = _private_config()
+    runtime_config.chat.add_item(make_user_message("private request"))
+    outputs = list(handler.process(GenerateResponseRequest(runtime_config=runtime_config)))
+
+    assert len(created) == 1
+    assert created[0].is_alive()
+    assert len(outputs) == 1
+    assert isinstance(outputs[0], EndOfResponse)
+    assert outputs[0].error == "Language model generation failed in private transcript mode."
+    assert canary not in capsys.readouterr().err
+    with handler.cancel_scope.private_activation_guard() as quiescent:
+        assert quiescent is False
+
+    release_worker.set()
+    created[0].join(timeout=1.0)
+    assert not created[0].is_alive()
+    with handler.cancel_scope.private_activation_guard() as quiescent:
+        assert quiescent is True
+
+
 def test_private_transformers_worker_survives_logger_failure_without_excepthook(monkeypatch, capsys):
     target_canary = "PRIVATE_LOCAL_WORKER_TARGET_CANARY"
     logger_canary = "PRIVATE_LOCAL_WORKER_LOGGER_CANARY"

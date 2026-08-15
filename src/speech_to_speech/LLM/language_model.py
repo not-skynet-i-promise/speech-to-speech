@@ -126,6 +126,7 @@ class _TransformersWorkerState:
     """Content-free completion state shared with one local generation worker."""
 
     failed: bool = False
+    started: Event = field(default_factory=Event)
     completed: Event = field(default_factory=Event)
 
 
@@ -265,6 +266,7 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             cancel_scope.response_worker_started()
 
         def run() -> None:
+            state.started.set()
             try:
                 target()
             except BaseException:
@@ -306,9 +308,23 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
         try:
             thread = Thread(target=run)
-            thread.start()
         except BaseException as exc:
             if cancel_scope is not None:
+                try:
+                    cancel_scope.response_worker_done()
+                except BaseException:
+                    pass
+            if isinstance(exc, Exception):
+                raise
+            raise RuntimeError("Local Transformers generation worker could not start") from None
+        try:
+            thread.start()
+        except BaseException as exc:
+            # ``Thread.start()`` can be interrupted after the OS thread has
+            # actually launched. In that case ``run`` still owns the lease and
+            # releases it from its ``finally`` block. Only a provably unstarted
+            # thread is balanced here.
+            if not state.started.is_set() and getattr(thread, "ident", None) is None and cancel_scope is not None:
                 try:
                     cancel_scope.response_worker_done()
                 except BaseException:
