@@ -272,22 +272,29 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 # decision and log with sticky session privacy, retain no
                 # exception object, and wake this generation's consumer.
                 state.failed = True
-                guard = (
-                    runtime_config.transcript_barrier_content_guard()
-                    if runtime_config is not None
-                    else nullcontext(False)
-                )
-                with guard as private_content:
-                    if private_content:
-                        logger.error("Local Transformers generation worker failed; private content redacted")
-                    else:
-                        logger.exception("Local Transformers generation worker failed")
                 try:
-                    streamer.end()
+                    guard = (
+                        runtime_config.transcript_barrier_content_guard()
+                        if runtime_config is not None
+                        else nullcontext(False)
+                    )
+                    with guard as private_content:
+                        if private_content:
+                            logger.error("Local Transformers generation worker failed; private content redacted")
+                        else:
+                            logger.exception("Local Transformers generation worker failed")
                 except BaseException:
-                    # The content-free state remains authoritative; cleanup must
-                    # never escape to threading.excepthook either.
+                    # Logging and privacy-state access are observers here. Their
+                    # own failure must not revive threading.excepthook with the
+                    # still-active private target exception as its context.
                     pass
+                finally:
+                    try:
+                        streamer.end()
+                    except BaseException:
+                        # The content-free state remains authoritative; cleanup
+                        # must never escape to threading.excepthook either.
+                        pass
             finally:
                 if cancel_scope is not None:
                     cancel_scope.response_worker_done()

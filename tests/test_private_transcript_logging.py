@@ -514,3 +514,35 @@ def test_transformers_thread_constructor_failure_releases_activation_lease(monke
 
     with handler.cancel_scope.private_activation_guard() as quiescent:
         assert quiescent is True
+
+
+def test_private_transformers_worker_survives_logger_failure_without_excepthook(monkeypatch, capsys):
+    target_canary = "PRIVATE_LOCAL_WORKER_TARGET_CANARY"
+    logger_canary = "PRIVATE_LOCAL_WORKER_LOGGER_CANARY"
+    handler = object.__new__(_NeverCalledLanguageModelHandler)
+    handler.cancel_scope = CancelScope()
+    streamer = _ImmediateTimeoutStreamer()
+
+    def explode_target() -> None:
+        raise RuntimeError(target_canary)
+
+    def explode_logger(*_args, **_kwargs) -> None:
+        raise RuntimeError(logger_canary)
+
+    monkeypatch.setattr("speech_to_speech.LLM.language_model.logger.error", explode_logger)
+    worker, worker_state = handler._start_transformers_generation(
+        explode_target,
+        streamer,
+        _private_config(),
+    )
+    worker.join(timeout=1.0)
+    stderr = capsys.readouterr().err
+
+    assert not worker.is_alive()
+    assert worker_state.failed is True
+    assert streamer.ended is True
+    assert target_canary not in stderr
+    assert logger_canary not in stderr
+    assert "Exception in thread" not in stderr
+    with handler.cancel_scope.private_activation_guard() as quiescent:
+        assert quiescent is True
