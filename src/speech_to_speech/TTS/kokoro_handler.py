@@ -279,11 +279,16 @@ class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
                 console.print(f"[green]ASSISTANT: {text}")
 
         if self.backend == "mlx":
-            yield from self._process_mlx(text, language_code)
+            yield from self._process_mlx(text, language_code, runtime_config)
         else:
-            yield from self._process_kokoro(text, language_code)
+            yield from self._process_kokoro(text, language_code, runtime_config)
 
-    def _process_mlx(self, llm_sentence: str, language_code: Optional[str] = None) -> Iterator[np.ndarray]:
+    def _process_mlx(
+        self,
+        llm_sentence: str,
+        language_code: Optional[str] = None,
+        runtime_config: object | None = None,
+    ) -> Iterator[np.ndarray]:
         """Process using MLX backend with Apple Silicon optimizations."""
         from scipy.signal import resample_poly
 
@@ -293,9 +298,14 @@ class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
                 new_lang_code = WHISPER_LANGUAGE_TO_KOKORO_LANG.get(language_code, self.lang_code)
                 if new_lang_code != self.lang_code:
                     new_voice = KOKORO_LANG_DEFAULT_VOICES.get(new_lang_code, self.voice)
-                    logger.info(
-                        f"Language change detected: {self.lang_code} -> {new_lang_code}, voice: {self.voice} -> {new_voice}"
-                    )
+                    with self._runtime_config_private_logging_guard(runtime_config) as private_content:
+                        if private_content:
+                            logger.info("Private Kokoro language/voice change; content redacted")
+                        else:
+                            logger.info(
+                                f"Language change detected: {self.lang_code} -> {new_lang_code}, "
+                                f"voice: {self.voice} -> {new_voice}"
+                            )
                     try:
                         new_pipeline = self.model._get_pipeline(new_lang_code)
                         new_voice_tensor = new_pipeline.load_voice(new_voice)
@@ -304,9 +314,13 @@ class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
                         self._pipeline = new_pipeline
                         self._voice_tensor = new_voice_tensor
                     except Exception as e:
-                        logger.warning(
-                            f"Failed to switch language/voice: {e}. Keeping current language: {self.lang_code}"
-                        )
+                        with self._runtime_config_private_logging_guard(runtime_config) as private_content:
+                            if private_content:
+                                logger.warning("Failed to switch private Kokoro language/voice; content redacted")
+                            else:
+                                logger.warning(
+                                    f"Failed to switch language/voice: {e}. Keeping current language: {self.lang_code}"
+                                )
 
             # Generate audio using the preloaded pipeline directly
             # This avoids the voice reload that happens in model.generate()
@@ -355,7 +369,12 @@ class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
                     logger.debug(f"TTS yielding audio chunk: {len(chunk)} samples")
                     yield chunk
 
-    def _process_kokoro(self, llm_sentence: str, language_code: Optional[str] = None) -> Iterator[np.ndarray]:
+    def _process_kokoro(
+        self,
+        llm_sentence: str,
+        language_code: Optional[str] = None,
+        runtime_config: object | None = None,
+    ) -> Iterator[np.ndarray]:
         """Process using native kokoro library."""
         from scipy.signal import resample_poly
 
@@ -364,9 +383,14 @@ class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
             new_lang_code = WHISPER_LANGUAGE_TO_KOKORO_LANG.get(language_code, self.lang_code)
             if new_lang_code != self.lang_code:
                 new_voice = KOKORO_LANG_DEFAULT_VOICES.get(new_lang_code, self.voice)
-                logger.info(
-                    f"Language change detected: {self.lang_code} -> {new_lang_code}, voice: {self.voice} -> {new_voice}"
-                )
+                with self._runtime_config_private_logging_guard(runtime_config) as private_content:
+                    if private_content:
+                        logger.info("Private Kokoro language/voice change; content redacted")
+                    else:
+                        logger.info(
+                            f"Language change detected: {self.lang_code} -> {new_lang_code}, "
+                            f"voice: {self.voice} -> {new_voice}"
+                        )
                 self.lang_code = new_lang_code
                 self.voice = new_voice
                 from kokoro import KPipeline
@@ -412,7 +436,11 @@ class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
                 self._pipeline = self.model._get_pipeline(self.lang_code)
                 self._voice_tensor = self._pipeline.load_voice(self.voice)
             except Exception as e:
-                logger.warning(f"Failed to restore initial voice/language on session end: {e}")
+                with self._input_private_logging_guard(()) as private_content:
+                    if private_content:
+                        logger.warning("Failed to restore Kokoro session state; private content redacted")
+                    else:
+                        logger.warning(f"Failed to restore initial voice/language on session end: {e}")
         else:
             from kokoro import KPipeline
 

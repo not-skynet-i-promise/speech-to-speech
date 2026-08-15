@@ -641,10 +641,11 @@ class Chat:
             try:
                 result = compactor(snapshot)
             except Exception:
-                if self._private_content_logging:
-                    logger.error("Chat compaction failed; private content redacted")
-                else:
-                    logger.exception("Chat compaction failed; chat unchanged")
+                with self._lock:
+                    if self._private_content_logging:
+                        logger.error("Chat compaction failed; private content redacted")
+                    else:
+                        logger.exception("Chat compaction failed; chat unchanged")
                 return
             if not isinstance(result, CompactionResult):
                 logger.error("Compactor must return a CompactionResult, got %r", type(result).__name__)

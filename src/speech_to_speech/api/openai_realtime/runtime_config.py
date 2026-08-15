@@ -153,6 +153,12 @@ class RuntimeConfig(BaseModel):
         with self._transcript_barrier_state_lock:
             yield
 
+    @contextmanager
+    def transcript_barrier_content_guard(self) -> Iterator[bool]:
+        """Atomically select whether a content-bearing side effect is private."""
+        with self.transcript_barrier_state_guard():
+            yield self.transcript_barrier_private
+
     def next_transcript_barrier_sequence(self) -> int:
         """Allocate one monotonic event sequence within the current session."""
         self.transcript_barrier_sequence += 1

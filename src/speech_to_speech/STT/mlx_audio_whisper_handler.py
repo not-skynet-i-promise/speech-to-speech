@@ -126,7 +126,11 @@ class MLXAudioWhisperSTTHandler(BaseSTTHandler):
 
             # Validate language code
             if language_code not in SUPPORTED_LANGUAGES:
-                logger.warning(f"Detected unsupported language: {language_code}")
+                with self.transcript_content_allowed() as content_allowed:
+                    if content_allowed:
+                        logger.warning(f"Detected unsupported language: {language_code}")
+                    else:
+                        logger.warning("Detected unsupported language; private content redacted")
                 if self.last_language in SUPPORTED_LANGUAGES:
                     language_code = self.last_language
                 else:
@@ -147,7 +151,9 @@ class MLXAudioWhisperSTTHandler(BaseSTTHandler):
         with self.transcript_content_allowed() as content_allowed:
             if content_allowed:
                 console.print(f"[yellow]USER: {pred_text}")
-        logger.debug(f"Language Code: {language_code}")
+        with self.transcript_content_allowed() as content_allowed:
+            if content_allowed:
+                logger.debug(f"Language Code: {language_code}")
 
         if self.start_language == "auto":
             language_code += "-auto"

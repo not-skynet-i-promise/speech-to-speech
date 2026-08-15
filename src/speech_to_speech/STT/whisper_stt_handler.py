@@ -120,7 +120,11 @@ class WhisperSTTHandler(BaseSTTHandler):
         language_code = self.processor.tokenizer.decode(pred_ids[0, 1])[2:-2]  # remove "<|" and "|>"
 
         if language_code not in SUPPORTED_LANGUAGES:  # reprocess with the last language
-            logger.warning("Whisper detected unsupported language: %s", language_code)
+            with self.transcript_content_allowed() as content_allowed:
+                if content_allowed:
+                    logger.warning("Whisper detected unsupported language: %s", language_code)
+                else:
+                    logger.warning("Whisper detected unsupported language; private content redacted")
             gen_kwargs = copy(self.gen_kwargs)
             gen_kwargs["language"] = self.last_language
             language_code = self.last_language
@@ -135,7 +139,9 @@ class WhisperSTTHandler(BaseSTTHandler):
         with self.transcript_content_allowed() as content_allowed:
             if content_allowed:
                 console.print(f"[yellow]USER: {pred_text}")
-        logger.debug(f"Language Code Whisper: {language_code}")
+        with self.transcript_content_allowed() as content_allowed:
+            if content_allowed:
+                logger.debug(f"Language Code Whisper: {language_code}")
 
         if self.start_language == "auto":
             language_code += "-auto"

@@ -630,6 +630,145 @@ def test_private_barrier_generation_error_scrubs_exception_content(caplog):
     assert canary not in caplog.text
 
 
+def test_generated_content_log_holds_guard_through_concurrent_poison(monkeypatch):
+    handler = _make_handler(stream=False)
+    chat = Chat(10)
+    chat.add_item(make_user_message("ordinary before poison"))
+    runtime_config = RuntimeConfig(
+        chat=chat,
+        session=RealtimeSessionCreateRequest(type="realtime", instructions="Reply briefly."),
+    )
+    request = GenerateResponseRequest(runtime_config=runtime_config, turn_id="turn", turn_revision=0)
+    poison_attempted = threading.Event()
+    poison_completed = threading.Event()
+    poison_thread: threading.Thread | None = None
+    original_debug = base_mod.logger.debug
+
+    def capture_debug(message, *args, **kwargs):
+        nonlocal poison_thread
+        if message == "Clean text: %s":
+
+            def poison() -> None:
+                poison_attempted.set()
+                with runtime_config.transcript_barrier_state_guard():
+                    runtime_config.transcript_barrier_failed = True
+                    runtime_config.chat.enable_private_content_logging()
+                poison_completed.set()
+
+            poison_thread = threading.Thread(target=poison)
+            poison_thread.start()
+            assert poison_attempted.wait(timeout=1.0)
+            assert not poison_completed.wait(timeout=0.05)
+        original_debug(message, *args, **kwargs)
+
+    monkeypatch.setattr(base_mod.logger, "debug", capture_debug)
+    outputs = list(handler.process(request))
+
+    assert any(isinstance(output, EndOfResponse) for output in outputs)
+    assert poison_thread is not None
+    poison_thread.join(timeout=1.0)
+    assert not poison_thread.is_alive()
+    assert poison_completed.is_set()
+    assert runtime_config.transcript_barrier_failed is True
+
+
+def test_generated_tool_log_holds_guard_through_concurrent_poison(monkeypatch):
+    handler = _make_handler(stream=False)
+    tool_canary = "ORDINARY_TOOL_BEFORE_POISON"
+    handler.client.chat.completions.next_result = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None,
+                    tool_calls=[
+                        SimpleNamespace(
+                            id="call_provider",
+                            function=SimpleNamespace(name=tool_canary, arguments="{}"),
+                        )
+                    ],
+                )
+            )
+        ],
+        usage=None,
+    )
+    chat = Chat(10)
+    chat.add_item(make_user_message("ordinary before poison"))
+    runtime_config = RuntimeConfig(chat=chat, session=RealtimeSessionCreateRequest(type="realtime"))
+    request = GenerateResponseRequest(runtime_config=runtime_config, turn_id="turn", turn_revision=0)
+    poison_attempted = threading.Event()
+    poison_completed = threading.Event()
+    poison_thread: threading.Thread | None = None
+    original_info = base_mod.logger.info
+
+    def capture_info(message, *args, **kwargs):
+        nonlocal poison_thread
+        if message == "Tools: %s":
+
+            def poison() -> None:
+                poison_attempted.set()
+                with runtime_config.transcript_barrier_state_guard():
+                    runtime_config.transcript_barrier_failed = True
+                    runtime_config.chat.enable_private_content_logging()
+                poison_completed.set()
+
+            poison_thread = threading.Thread(target=poison)
+            poison_thread.start()
+            assert poison_attempted.wait(timeout=1.0)
+            assert not poison_completed.wait(timeout=0.05)
+            assert tool_canary in str(args)
+        original_info(message, *args, **kwargs)
+
+    monkeypatch.setattr(base_mod.logger, "info", capture_info)
+    list(handler.process(request))
+
+    assert poison_thread is not None
+    poison_thread.join(timeout=1.0)
+    assert not poison_thread.is_alive()
+    assert poison_completed.is_set()
+
+
+def test_generation_error_log_holds_guard_through_concurrent_poison(monkeypatch):
+    handler = _make_handler(stream=True)
+    error_canary = "ORDINARY_ERROR_BEFORE_POISON"
+    chat = Chat(10)
+    chat.add_item(make_user_message("ordinary before poison"))
+    runtime_config = RuntimeConfig(chat=chat, session=RealtimeSessionCreateRequest(type="realtime"))
+    request = GenerateResponseRequest(runtime_config=runtime_config, turn_id="turn", turn_revision=0)
+    handler.client.chat.completions.create = lambda **_kwargs: (_ for _ in ()).throw(RuntimeError(error_canary))
+    poison_attempted = threading.Event()
+    poison_completed = threading.Event()
+    poison_thread: threading.Thread | None = None
+
+    def capture_exception(message, *_args, **_kwargs):
+        nonlocal poison_thread
+        assert message == "LLM generation failed; ending the current response"
+
+        def poison() -> None:
+            poison_attempted.set()
+            with runtime_config.transcript_barrier_state_guard():
+                runtime_config.transcript_barrier_failed = True
+                runtime_config.chat.enable_private_content_logging()
+            poison_completed.set()
+
+        poison_thread = threading.Thread(target=poison)
+        poison_thread.start()
+        assert poison_attempted.wait(timeout=1.0)
+        assert not poison_completed.wait(timeout=0.05)
+
+    monkeypatch.setattr(base_mod.logger, "exception", capture_exception)
+    outputs = list(handler.process(request))
+
+    assert poison_thread is not None
+    poison_thread.join(timeout=1.0)
+    assert not poison_thread.is_alive()
+    assert poison_completed.is_set()
+    end = next(output for output in outputs if isinstance(output, EndOfResponse))
+    assert end.error in {
+        f"Language model generation failed: {error_canary}",
+        "Language model generation failed in private transcript mode.",
+    }
+
+
 # ── Out-of-band (conversation="none") responses ───────────────────────────────
 
 

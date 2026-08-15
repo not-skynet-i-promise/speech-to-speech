@@ -75,7 +75,11 @@ class LightningWhisperSTTHandler(BaseSTTHandler):
             transcription_dict = self.model.transcribe(audio)
             language_code = transcription_dict["language"]
             if language_code not in SUPPORTED_LANGUAGES:
-                logger.warning(f"Whisper detected unsupported language: {language_code}")
+                with self.transcript_content_allowed() as content_allowed:
+                    if content_allowed:
+                        logger.warning(f"Whisper detected unsupported language: {language_code}")
+                    else:
+                        logger.warning("Whisper detected unsupported language; private content redacted")
                 if self.last_language in SUPPORTED_LANGUAGES:  # reprocess with the last language
                     transcription_dict = self.model.transcribe(audio, language=self.last_language)
                 else:
@@ -91,7 +95,9 @@ class LightningWhisperSTTHandler(BaseSTTHandler):
         with self.transcript_content_allowed() as content_allowed:
             if content_allowed:
                 console.print(f"[yellow]USER: {pred_text}")
-        logger.debug(f"Language Code Whisper: {language_code}")
+        with self.transcript_content_allowed() as content_allowed:
+            if content_allowed:
+                logger.debug(f"Language Code Whisper: {language_code}")
 
         if self.start_language == "auto":
             language_code += "-auto"

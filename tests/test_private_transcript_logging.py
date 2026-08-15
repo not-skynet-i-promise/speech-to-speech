@@ -9,6 +9,7 @@ import numpy as np
 from openai.types.realtime import RealtimeSessionCreateRequest
 from openai.types.responses import ResponseFunctionToolCall
 
+import speech_to_speech.LLM.chat as chat_module
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.api.openai_realtime.service import RealtimeService
 from speech_to_speech.baseHandler import BaseHandler
@@ -315,6 +316,44 @@ def test_compactor_exception_is_content_free_after_private_handshake(caplog):
 
     assert "PRIVATE_COMPACTOR_EXCEPTION_CANARY" not in caplog.text
     assert "private content redacted" in caplog.text
+
+
+def test_compactor_exception_log_is_linearized_with_late_privacy(monkeypatch):
+    chat = Chat(size=2)
+    for index in range(4):
+        chat.add_item(make_user_message(f"ordinary user {index}"))
+        chat.add_item(make_assistant_message(f"ordinary assistant {index}"))
+    privacy_attempted = Event()
+    privacy_completed = Event()
+    privacy_thread: Thread | None = None
+
+    def explode(_snapshot):
+        raise RuntimeError("COMPACTOR_EXCEPTION_BEFORE_PRIVACY")
+
+    def capture_exception(message, *_args, **_kwargs):
+        nonlocal privacy_thread
+        assert message == "Chat compaction failed; chat unchanged"
+
+        def enable_privacy() -> None:
+            privacy_attempted.set()
+            chat.enable_private_content_logging()
+            privacy_completed.set()
+
+        privacy_thread = Thread(target=enable_privacy)
+        privacy_thread.start()
+        assert privacy_attempted.wait(timeout=1.0)
+        assert not privacy_completed.wait(timeout=0.05)
+
+    monkeypatch.setattr(chat_module.logger, "exception", capture_exception)
+    chat.trim_if_needed(explode)
+    assert chat._compact_thread is not None
+    chat._compact_thread.join(timeout=2.0)
+
+    assert not chat._compact_thread.is_alive()
+    assert privacy_thread is not None
+    privacy_thread.join(timeout=1.0)
+    assert not privacy_thread.is_alive()
+    assert privacy_completed.is_set()
 
 
 def test_local_llm_poison_during_generation_blocks_assistant_and_tool_history_writeback():

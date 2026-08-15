@@ -90,16 +90,24 @@ class FacebookMMSTTSHandler(BaseHandler[TTSIn, TTSOut]):
         self.load_model(self.language)
         self.warmup()
 
-    def load_model(self, language_code: str) -> None:
+    def load_model(self, language_code: str, *, runtime_config: object | None = None) -> None:
         try:
             model_name = f"facebook/mms-tts-{WHISPER_LANGUAGE_TO_FACEBOOK_LANGUAGE[language_code]}"
-            logger.info(f"Loading model: {model_name}")
+            with self._runtime_config_private_logging_guard(runtime_config) as private_content:
+                if private_content:
+                    logger.info("Loading private Facebook MMS language model; content redacted")
+                else:
+                    logger.info(f"Loading model: {model_name}")
             self.model = VitsModel.from_pretrained(model_name).to(self.device)  # type: ignore[arg-type]
             self.tokenizer = AutoTokenizer.from_pretrained(model_name)
             self.language = language_code
         except KeyError:
-            logger.warning(f"Unsupported language: {language_code}. Falling back to English.")
-            self.load_model("en")
+            with self._runtime_config_private_logging_guard(runtime_config) as private_content:
+                if private_content:
+                    logger.warning("Unsupported private language; falling back to English")
+                else:
+                    logger.warning(f"Unsupported language: {language_code}. Falling back to English.")
+            self.load_model("en", runtime_config=runtime_config)
 
     def warmup(self) -> None:
         logger.info(f"Warming up {self.__class__.__name__}")
@@ -122,9 +130,9 @@ class FacebookMMSTTSHandler(BaseHandler[TTSIn, TTSOut]):
                     logger.debug("Tokenizing redacted text (characters=%d)", len(text))
                 else:
                     logger.debug("Tokenizing text: %s", text)
-            logger.debug(f"Current language: {self.language}")
             with self._runtime_config_private_logging_guard(runtime_config) as live_private:
                 if not (redact_content or live_private):
+                    logger.debug(f"Current language: {self.language}")
                     logger.debug(f"Tokenizer: {self.tokenizer}")
 
             inputs = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True)
@@ -185,17 +193,26 @@ class FacebookMMSTTSHandler(BaseHandler[TTSIn, TTSOut]):
             else:
                 console.print(f"[green]ASSISTANT: {text}")
                 logger.debug("Processing text: %s", text)
-        logger.debug(f"Language code: {language_code}")
+                logger.debug(f"Language code: {language_code}")
 
         if language_code is not None and self.language != language_code:
             try:
-                logger.info(f"Switching language from {self.language} to {language_code}")
-                self.load_model(language_code)
+                with self._runtime_config_private_logging_guard(tts_input.runtime_config) as live_private:
+                    if live_private:
+                        logger.info("Switching private Facebook MMS language; content redacted")
+                    else:
+                        logger.info(f"Switching language from {self.language} to {language_code}")
+                self.load_model(language_code, runtime_config=tts_input.runtime_config)
             except KeyError:
-                console.print(
-                    f"[red]Language {language_code} not supported by Facebook MMS. Using {self.language} instead."
-                )
-                logger.warning(f"Unsupported language: {language_code}")
+                with self._runtime_config_private_logging_guard(tts_input.runtime_config) as live_private:
+                    if live_private:
+                        logger.warning("Unsupported private Facebook MMS language; content redacted")
+                    else:
+                        console.print(
+                            f"[red]Language {language_code} not supported by Facebook MMS. "
+                            f"Using {self.language} instead."
+                        )
+                        logger.warning(f"Unsupported language: {language_code}")
 
         audio_output = self.generate_audio(
             text,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator, Sized
+from contextlib import nullcontext
 from queue import Empty
 from threading import Lock, Thread
 from typing import Any, Literal, Optional, Protocol, runtime_checkable
@@ -342,45 +343,49 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             block_end = code_and_after.index(ctx.end_code) + len(ctx.end_code)
             complete_block = code_and_after[:block_end]
             printable_text = code_and_after[block_end:]
-            private_content = runtime_config is not None and runtime_config.transcript_barrier_private
-            _, func_calls = extract_function_calls_from_text(
-                complete_block,
-                ctx.block_regex,
-                redact_private_content=private_content,
+            content_guard = (
+                runtime_config.transcript_barrier_content_guard() if runtime_config is not None else nullcontext(False)
             )
-            parsed_tools: list[ResponseFunctionToolCall] = []
-            for fc in func_calls:
-                try:
-                    tool_call = fc.to_realtime_function_tool_call(
-                        ctx.function_tools,
-                        redact_private_content=private_content,
-                    )
-                except ValueError as e:
-                    if runtime_config is not None and runtime_config.transcript_barrier_private:
-                        logger.warning("Skipping invalid private tool call; content redacted")
-                    else:
-                        logger.warning("Skipping invalid tool call: %s", e)
-                    continue
-                if any(
-                    previous.name == tool_call.name and previous.arguments == tool_call.arguments for previous in tools
-                ):
-                    if runtime_config is not None and runtime_config.transcript_barrier_private:
-                        logger.warning("Skipping duplicate private tool call; content redacted")
-                    else:
-                        logger.warning("Skipping duplicate tool call '%s'", tool_call.name)
-                    continue
-                if len(tools) >= MAX_TOOL_CALLS_PER_RESPONSE:
-                    if runtime_config is not None and runtime_config.transcript_barrier_private:
-                        logger.warning("Skipping extra private tool call; content redacted")
-                    else:
-                        logger.warning(
-                            "Skipping extra tool call '%s'; at most %d tool calls are allowed per response",
-                            tool_call.name,
-                            MAX_TOOL_CALLS_PER_RESPONSE,
+            with content_guard as private_content:
+                _, func_calls = extract_function_calls_from_text(
+                    complete_block,
+                    ctx.block_regex,
+                    redact_private_content=private_content,
+                )
+                parsed_tools: list[ResponseFunctionToolCall] = []
+                for fc in func_calls:
+                    try:
+                        tool_call = fc.to_realtime_function_tool_call(
+                            ctx.function_tools,
+                            redact_private_content=private_content,
                         )
-                    continue
-                tools.append(tool_call)
-                parsed_tools.append(tool_call)
+                    except ValueError as e:
+                        if private_content:
+                            logger.warning("Skipping invalid private tool call; content redacted")
+                        else:
+                            logger.warning("Skipping invalid tool call: %s", e)
+                        continue
+                    if any(
+                        previous.name == tool_call.name and previous.arguments == tool_call.arguments
+                        for previous in tools
+                    ):
+                        if private_content:
+                            logger.warning("Skipping duplicate private tool call; content redacted")
+                        else:
+                            logger.warning("Skipping duplicate tool call '%s'", tool_call.name)
+                        continue
+                    if len(tools) >= MAX_TOOL_CALLS_PER_RESPONSE:
+                        if private_content:
+                            logger.warning("Skipping extra private tool call; content redacted")
+                        else:
+                            logger.warning(
+                                "Skipping extra tool call '%s'; at most %d tool calls are allowed per response",
+                                tool_call.name,
+                                MAX_TOOL_CALLS_PER_RESPONSE,
+                            )
+                        continue
+                    tools.append(tool_call)
+                    parsed_tools.append(tool_call)
             if parsed_tools:
                 chunks.append(
                     LLMResponseChunk(
@@ -544,17 +549,18 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             try:
                 active_chat = build_active_chat(original_chat, response)
             except ChatItemError as exc:
-                if runtime_config.transcript_barrier_private:
-                    error_message = "Private out-of-band response rejected."
-                    logger.info("Out-of-band response rejected; private content redacted")
-                else:
-                    error_message = str(exc)
-                    logger.info("Out-of-band response rejected: %s", error_message)
-                yield EndOfResponse(
-                    turn_id=ctx.turn_id,
-                    turn_revision=ctx.turn_revision,
-                    error=error_message,
-                )
+                with runtime_config.transcript_barrier_content_guard() as private_content:
+                    if private_content:
+                        error_message = "Private out-of-band response rejected."
+                        logger.info("Out-of-band response rejected; private content redacted")
+                    else:
+                        error_message = str(exc)
+                        logger.info("Out-of-band response rejected: %s", error_message)
+                    yield EndOfResponse(
+                        turn_id=ctx.turn_id,
+                        turn_revision=ctx.turn_revision,
+                        error=error_message,
+                    )
                 return
         else:
             active_chat = original_chat.copy()
@@ -610,12 +616,13 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                             )
                         original_chat.strip_images(consumed_image_ids)
                         original_chat.trim_if_needed(self.compactor)
-            if runtime_config.transcript_barrier_private:
-                logger.debug("Generated text redacted (characters=%d)", len(ctx.generated_text))
-                logger.info("Generated tools redacted (count=%d)", len(ctx.tools))
-            else:
-                logger.debug("Clean text: %s", ctx.generated_text)
-                logger.info("Tools: %s", ctx.tools)
+            with runtime_config.transcript_barrier_content_guard() as private_content:
+                if private_content:
+                    logger.debug("Generated text redacted (characters=%d)", len(ctx.generated_text))
+                    logger.info("Generated tools redacted (count=%d)", len(ctx.tools))
+                else:
+                    logger.debug("Clean text: %s", ctx.generated_text)
+                    logger.info("Tools: %s", ctx.tools)
 
             if turn_output_allowed and ctx.printable_text.strip():
                 yield LLMResponseChunk(
@@ -641,20 +648,21 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             # Any generation failure must still terminate the response. Without this
             # the exception would escape process() and no EndOfResponse would be
             # emitted, leaving st.in_response stuck and locking every later response.
-            if runtime_config.transcript_barrier_private:
-                logger.error("LLM generation failed; private content redacted")
-            else:
-                logger.exception("LLM generation failed; ending the current response")
-            yield EndOfResponse(
-                turn_id=ctx.turn_id,
-                turn_revision=ctx.turn_revision,
-                cancel_generation=ctx.cancel_generation,
-                error=(
-                    "Language model generation failed in private transcript mode."
-                    if runtime_config.transcript_barrier_private
-                    else f"Language model generation failed: {exc}"
-                ),
-            )
+            with runtime_config.transcript_barrier_content_guard() as private_content:
+                if private_content:
+                    logger.error("LLM generation failed; private content redacted")
+                else:
+                    logger.exception("LLM generation failed; ending the current response")
+                yield EndOfResponse(
+                    turn_id=ctx.turn_id,
+                    turn_revision=ctx.turn_revision,
+                    cancel_generation=ctx.cancel_generation,
+                    error=(
+                        "Language model generation failed in private transcript mode."
+                        if private_content
+                        else f"Language model generation failed: {exc}"
+                    ),
+                )
             return
         yield EndOfResponse(
             turn_id=ctx.turn_id,
