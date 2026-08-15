@@ -546,6 +546,7 @@ def _build_realtime_pipeline_unit(
             "should_listen": should_listen,
             "transcript_barrier_enabled": service.transcript_barrier_private,
             "transcript_barrier_failed": service.transcript_barrier_poisoned,
+            "transcript_barrier_state_guard": service.transcript_barrier_pipeline_state_guard,
         },
         module_kwargs=module_kwargs,
         vad_handler_kwargs=vad_kw,

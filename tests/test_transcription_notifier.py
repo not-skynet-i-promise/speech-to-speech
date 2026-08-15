@@ -1,8 +1,9 @@
 import logging
 from queue import Queue
-from threading import Event
+from threading import Event, Thread
 
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
+from speech_to_speech.api.openai_realtime.service import RealtimeService
 from speech_to_speech.pipeline.events import (
     PartialTranscriptionEvent,
     TranscriptBarrierCompletedEvent,
@@ -127,6 +128,83 @@ def test_poisoned_private_session_keeps_stt_redaction_sticky_while_work_drains(c
 
     assert text_output_queue.empty()
     assert canary not in caplog.text
+
+
+def test_realtime_state_guard_linearizes_notifier_side_effects_before_later_poison(caplog):
+    service = RealtimeService()
+    connection_id = service.register()
+    poison_attempted = Event()
+    poison_completed = Event()
+    poison_thread: Thread | None = None
+
+    class PoisoningQueue(Queue):
+        def put(self, item, block=True, timeout=None):
+            nonlocal poison_thread
+
+            def poison() -> None:
+                poison_attempted.set()
+                service.poison_transcript_barrier(connection_id, "test_failure")
+                poison_completed.set()
+
+            poison_thread = Thread(target=poison)
+            poison_thread.start()
+            assert poison_attempted.wait(timeout=1.0)
+            assert not poison_completed.wait(timeout=0.05)
+            return super().put(item, block=block, timeout=timeout)
+
+    text_output_queue = PoisoningQueue()
+    notifier = object.__new__(TranscriptionNotifier)
+    notifier.setup(
+        text_output_queue=text_output_queue,
+        transcript_barrier_state_guard=service.transcript_barrier_pipeline_state_guard,
+    )
+
+    with caplog.at_level(logging.INFO, logger="speech_to_speech.STT.transcription_notifier"):
+        assert list(notifier.process(Transcription(text="ordinary before poison", language_code="en"))) == []
+
+    assert poison_thread is not None
+    poison_thread.join(timeout=1.0)
+    assert not poison_thread.is_alive()
+    assert poison_completed.is_set()
+    assert service.transcript_barrier_failed(connection_id)
+    assert isinstance(text_output_queue.get_nowait(), TranscriptionCompletedEvent)
+
+
+def test_broken_realtime_state_guard_fails_closed_without_content(caplog):
+    text_output_queue = Queue()
+    notifier = object.__new__(TranscriptionNotifier)
+
+    def broken_guard():
+        raise RuntimeError("PRIVATE_GUARD_FAILURE_CANARY")
+
+    notifier.setup(
+        text_output_queue=text_output_queue,
+        transcript_barrier_state_guard=broken_guard,
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="speech_to_speech.STT.transcription_notifier"):
+        assert list(notifier.process(Transcription(text="PRIVATE_TRANSCRIPT_CANARY", language_code="en"))) == []
+
+    assert text_output_queue.empty()
+    assert "PRIVATE_GUARD_FAILURE_CANARY" not in caplog.text
+    assert "PRIVATE_TRANSCRIPT_CANARY" not in caplog.text
+    assert "private content redacted" in caplog.text
+
+
+def test_realtime_state_guard_without_one_live_connection_drops_stale_content(caplog):
+    text_output_queue = Queue()
+    service = RealtimeService()
+    notifier = object.__new__(TranscriptionNotifier)
+    notifier.setup(
+        text_output_queue=text_output_queue,
+        transcript_barrier_state_guard=service.transcript_barrier_pipeline_state_guard,
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="speech_to_speech.STT.transcription_notifier"):
+        assert list(notifier.process(Transcription(text="STALE_TRANSCRIPT_CANARY", language_code="en"))) == []
+
+    assert text_output_queue.empty()
+    assert "STALE_TRANSCRIPT_CANARY" not in caplog.text
 
 
 def test_private_barrier_discards_whitespace_without_a_placeholder_or_response():

@@ -1,8 +1,9 @@
 import logging
 from collections.abc import Mapping
+from contextlib import contextmanager
 from queue import Queue
 from threading import Event as ThreadingEvent
-from typing import Any, Callable, Literal, Optional, TypeVar, Union
+from typing import Any, Callable, Iterator, Literal, Optional, TypeVar, Union
 
 from openai.types.realtime import (
     ConversationItem,
@@ -350,6 +351,18 @@ class RealtimeService:
         if len(self._conns) != 1:
             return False
         return next(iter(self._conns.values())).runtime_config.transcript_barrier_failed
+
+    @contextmanager
+    def transcript_barrier_pipeline_state_guard(self) -> Iterator[tuple[bool, bool]]:
+        """Linearize notifier content side effects with barrier poison."""
+        if len(self._conns) != 1:
+            # A pipeline transcription without its one live connection is
+            # stale work, never an ordinary turn for a future session.
+            yield True, True
+            return
+        cfg = next(iter(self._conns.values())).runtime_config
+        with cfg.transcript_barrier_state_guard():
+            yield cfg.transcript_barrier_private, cfg.transcript_barrier_failed
 
     def transcript_barrier_audio_allowed(self, conn_id: str) -> bool:
         cfg = self._state(conn_id).runtime_config
