@@ -57,6 +57,18 @@ class _FakeStream:
         pass
 
 
+class _PoisoningStream(_FakeStream):
+    """Flip the barrier after provider iteration but before normalized events commit."""
+
+    def __init__(self, chunks, runtime_config: RuntimeConfig):
+        super().__init__(chunks)
+        self._runtime_config = runtime_config
+
+    def __iter__(self):
+        yield from self._chunks
+        self._runtime_config.transcript_barrier_failed = True
+
+
 # Make the handler's ``isinstance(resp, Stream)`` check recognise our fake as a
 # stream. Non-streaming fakes stay plain SimpleNamespace, so they still take the
 # non-stream branch.
@@ -355,6 +367,41 @@ def test_tool_call_recorded_before_chunk_is_emitted():
             )
     assert emitted_call_id is not None, "a tool call should have been emitted"
     assert chat._has_call_id_in_buffer(emitted_call_id), "call+output should be paired in the buffer"
+
+
+def test_private_poison_during_provider_stream_blocks_text_and_tool_history_writeback():
+    """A post-handshake poison may race provider completion on another thread.
+
+    Provider text and a tool call are normalized only after the streaming iterator
+    finishes, so poisoning at that boundary must prevent both the trailing message
+    commit and the eager function-call commit.
+    """
+    handler = _make_handler(stream=True)
+    chat = Chat(10)
+    chat.add_item(make_user_message("private request"))
+    session = RealtimeSessionCreateRequest(type="realtime", instructions="Be concise.")
+    session.tools = [{"type": "function", "name": "private_tool", "parameters": {"type": "object"}}]
+    runtime_config = RuntimeConfig(
+        chat=chat,
+        session=session,
+        transcript_barrier_version=1,
+        transcript_barrier_nonce="ab" * 32,
+    )
+    request = GenerateResponseRequest(runtime_config=runtime_config, turn_id="private", turn_revision=0)
+    handler.client.chat.completions.create = lambda **_kwargs: _PoisoningStream(
+        [
+            _chunk(content="PRIVATE_ASSISTANT_HISTORY_CANARY"),
+            _chunk(tool_calls=[_tc_delta(0, id="srv_private", name="private_tool", arguments="{}")]),
+        ],
+        runtime_config,
+    )
+
+    outputs = list(handler.process(request))
+
+    assert runtime_config.transcript_barrier_failed is True
+    assert not any(getattr(item, "role", None) == "assistant" for item in chat.buffer)
+    assert not any(getattr(item, "type", None) == "function_call" for item in chat.buffer)
+    assert not any(isinstance(output, LLMResponseChunk) and output.tools for output in outputs)
 
 
 def test_non_streaming_tool_call():

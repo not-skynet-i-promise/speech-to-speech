@@ -358,14 +358,15 @@ class RealtimeService:
     def poison_transcript_barrier(self, conn_id: str, error_type: str) -> RealtimeErrorEvent:
         st = self._state(conn_id)
         cfg = st.runtime_config
-        handshake_completed = cfg.transcript_barrier_enabled
-        cfg.clear_transcript_barrier_pending()
-        cfg.transcript_barrier_failed = True
-        if not handshake_completed:
-            cfg.chat.reset()
-        cfg.chat.enable_private_content_logging()
-        cfg.chat.suspend_compaction()
-        st.deferred_items.clear()
+        with cfg.transcript_barrier_state_guard():
+            handshake_completed = cfg.transcript_barrier_enabled
+            cfg.clear_transcript_barrier_pending()
+            cfg.transcript_barrier_failed = True
+            if not handshake_completed:
+                cfg.chat.reset()
+            cfg.chat.enable_private_content_logging()
+            cfg.chat.suspend_compaction()
+            st.deferred_items.clear()
         return self.make_error("Private transcript barrier protocol violation.", error_type)
 
     def scrub_transcript_barrier_for_disconnect(self, conn_id: str) -> None:
@@ -376,14 +377,15 @@ class RealtimeService:
         cfg = st.runtime_config
         if not cfg.transcript_barrier_private and not cfg.transcript_barrier_pending:
             return
-        handshake_completed = cfg.transcript_barrier_enabled
-        cfg.clear_transcript_barrier_pending()
-        cfg.transcript_barrier_failed = True
-        if not handshake_completed:
-            cfg.chat.reset()
-        cfg.chat.enable_private_content_logging()
-        cfg.chat.suspend_compaction()
-        st.deferred_items.clear()
+        with cfg.transcript_barrier_state_guard():
+            handshake_completed = cfg.transcript_barrier_enabled
+            cfg.clear_transcript_barrier_pending()
+            cfg.transcript_barrier_failed = True
+            if not handshake_completed:
+                cfg.chat.reset()
+            cfg.chat.enable_private_content_logging()
+            cfg.chat.suspend_compaction()
+            st.deferred_items.clear()
 
     def handle_audio_append(self, conn_id: str, event: InputAudioBufferAppendEvent) -> list[bytes]:
         if not self.transcript_barrier_audio_allowed(conn_id):

@@ -19,7 +19,7 @@ from openai.types.realtime.realtime_response_status import RealtimeResponseStatu
 from openai.types.realtime.realtime_response_usage import RealtimeResponseUsage
 
 from speech_to_speech.api.openai_realtime.handlers.base import RealtimeBaseHandler
-from speech_to_speech.LLM.chat import ChatItemError, add_supported_items_atomically
+from speech_to_speech.LLM.chat import ChatItemError, add_supported_item, add_supported_items_atomically
 from speech_to_speech.pipeline.events import AssistantTextEvent
 from speech_to_speech.pipeline.messages import AssistantTextPart, AssistantToolCallPart, GenerateResponseRequest
 from speech_to_speech.utils.utils import _generate_id, is_out_of_band, response_wants_audio
@@ -209,7 +209,14 @@ class ResponseHandler(RealtimeBaseHandler):
         # the input rides along on the request and seeds a throwaway chat in the LM.
         if not out_of_band and event.response and event.response.input:
             try:
-                add_supported_items_atomically(st.runtime_config.chat, list(event.response.input))
+                if st.runtime_config.transcript_barrier_private:
+                    add_supported_items_atomically(st.runtime_config.chat, list(event.response.input))
+                else:
+                    # Preserve the default Realtime behavior: accepted prefix items
+                    # remain in ordinary history if a later item is rejected. Private
+                    # sessions need the stronger all-or-nothing retention boundary.
+                    for item in event.response.input:
+                        add_supported_item(st.runtime_config.chat, item)
             except ChatItemError as exc:
                 return self.make_client_content_error(conn_id, str(exc), "invalid_input_item")
 

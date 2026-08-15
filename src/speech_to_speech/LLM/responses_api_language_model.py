@@ -21,10 +21,12 @@ from speech_to_speech.LLM.base_openai_compatible_language_model import (
     WARMUP_MAX_RETRIES,
     AssistantMessage,
     BaseOpenAICompatibleHandler,
+    PrivateContentGuard,
     ProviderEvent,
     TextDelta,
     ToolCall,
     Usage,
+    private_content_redaction,
 )
 from speech_to_speech.LLM.chat import Chat
 from speech_to_speech.LLM.compaction_prompt import CompactGenerateFn
@@ -114,7 +116,7 @@ class ResponsesApiModelHandler(BaseOpenAICompatibleHandler):
         self,
         api_response: Stream,
         *,
-        redact_private_content: bool = False,
+        redact_private_content: PrivateContentGuard = False,
     ) -> Iterator[ProviderEvent]:
         for raw_event in api_response:
             if isinstance(raw_event, ResponseTextDeltaEvent):
@@ -136,7 +138,7 @@ class ResponsesApiModelHandler(BaseOpenAICompatibleHandler):
         self,
         api_response: Any,
         *,
-        redact_private_content: bool = False,
+        redact_private_content: PrivateContentGuard = False,
     ) -> Iterator[ProviderEvent]:
         usage = api_response.usage
         if usage:
@@ -153,10 +155,11 @@ class ResponsesApiModelHandler(BaseOpenAICompatibleHandler):
                 raw = "".join(c.text for c in message.content if c.type == "output_text")
                 yield TextDelta(text=raw)
             else:
-                if redact_private_content:
-                    logger.warning("Unsupported private response item; content redacted")
-                else:
-                    logger.warning(f"Not supported message type: {message.type}")
+                with private_content_redaction(redact_private_content) as redact:
+                    if redact:
+                        logger.warning("Unsupported private response item; content redacted")
+                    else:
+                        logger.warning(f"Not supported message type: {message.type}")
 
     def on_session_end(self) -> None:
         logger.debug("OpenAI API language model session state reset")

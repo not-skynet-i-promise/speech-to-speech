@@ -28,6 +28,7 @@ from speech_to_speech.LLM.base_openai_compatible_language_model import (
     WARMUP_MAX_RETRIES,
     AssistantMessage,
     BaseOpenAICompatibleHandler,
+    PrivateContentGuard,
     ProviderEvent,
     TextDelta,
     ToolCall,
@@ -207,7 +208,7 @@ class ChatCompletionsApiModelHandler(BaseOpenAICompatibleHandler):
         self,
         api_response: Stream[ChatCompletionChunk],
         *,
-        redact_private_content: bool = False,
+        redact_private_content: PrivateContentGuard = False,
     ) -> Iterator[ProviderEvent]:
         # Accumulate streamed tool-call deltas, keyed by their stream index, and the
         # raw assistant text, then emit assistant message + tool calls + usage once
@@ -251,7 +252,7 @@ class ChatCompletionsApiModelHandler(BaseOpenAICompatibleHandler):
         self,
         api_response: Any,
         *,
-        redact_private_content: bool = False,
+        redact_private_content: PrivateContentGuard = False,
     ) -> Iterator[ProviderEvent]:
         usage = api_response.usage
         if usage:

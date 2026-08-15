@@ -382,6 +382,28 @@ def test_private_unsupported_response_item_type_is_redacted(caplog):
     assert "Unsupported private response item; content redacted" in caplog.text
 
 
+def test_poison_during_provider_iteration_redacts_later_unsupported_item(caplog):
+    handler = _make_handler(stream=False)
+    canary = "PRIVATE_LATE_RESPONSES_TYPE_CANARY"
+    request = _make_request("ordinary request already in flight")
+
+    class _PoisoningOutput:
+        def __iter__(self):
+            request.runtime_config.transcript_barrier_failed = True
+            yield SimpleNamespace(type=canary)
+
+    handler.client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **_kwargs: _make_response(_PoisoningOutput()))
+    )
+
+    with caplog.at_level(logging.WARNING):
+        list(handler.process(request))
+
+    assert request.runtime_config.transcript_barrier_failed is True
+    assert canary not in caplog.text
+    assert "Unsupported private response item; content redacted" in caplog.text
+
+
 def test_ordinary_unsupported_response_item_type_retains_diagnostics(caplog):
     handler = _make_handler(stream=False)
     canary = "ORDINARY_RESPONSES_ITEM_TYPE_CANARY"

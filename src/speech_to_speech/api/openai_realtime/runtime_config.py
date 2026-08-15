@@ -1,8 +1,13 @@
+from collections.abc import Iterator
+from contextlib import contextmanager
+from threading import RLock
+from typing import Any
+
 from openai.types.realtime import RealtimeSessionCreateRequest
 from openai.types.realtime.realtime_audio_config import RealtimeAudioConfig
 from openai.types.realtime.realtime_audio_config_input import RealtimeAudioConfigInput
 from openai.types.realtime.realtime_audio_config_output import RealtimeAudioConfigOutput
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
 
 from speech_to_speech.LLM.chat import Chat
 
@@ -50,6 +55,7 @@ class RuntimeConfig(BaseModel):
     transcript_barrier_pending_sequence: int | None = Field(default=None, exclude=True)
     transcript_barrier_pending_item_id: str | None = Field(default=None, exclude=True)
     transcript_barrier_pending_transcript: str | None = Field(default=None, exclude=True, repr=False)
+    _transcript_barrier_state_lock: Any = PrivateAttr(default_factory=RLock)
 
     @field_validator("session", mode="after")
     @classmethod
@@ -133,6 +139,19 @@ class RuntimeConfig(BaseModel):
     def transcript_barrier_operational(self) -> bool:
         """Whether the negotiated barrier may still accept protocol work."""
         return self.transcript_barrier_enabled and not self.transcript_barrier_failed
+
+    @contextmanager
+    def transcript_barrier_state_guard(self) -> Iterator[None]:
+        """Serialize barrier failure transitions with conversation write-back.
+
+        A provider iterator may still be running on a pipeline thread while the
+        websocket thread poisons the session.  Callers that either latch failure
+        or persist model output must hold this guard so those operations have a
+        single ordering: a history write completes before poison, or observes the
+        poison and is discarded.
+        """
+        with self._transcript_barrier_state_lock:
+            yield
 
     def next_transcript_barrier_sequence(self) -> int:
         """Allocate one monotonic event sequence within the current session."""

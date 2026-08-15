@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, Optional
 
 import httpx
@@ -18,6 +19,7 @@ from openai.types.realtime.realtime_conversation_item_assistant_message import (
 from openai.types.responses import ResponseFunctionToolCall
 from pydantic import BaseModel, ConfigDict, Field
 
+from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.LLM.chat import (
     Chat,
@@ -81,6 +83,17 @@ class Usage(BaseModel):
 
 
 ProviderEvent = TextDelta | AssistantMessage | ToolCall | Usage
+PrivateContentGuard = bool | RuntimeConfig
+
+
+@contextmanager
+def private_content_redaction(guard: PrivateContentGuard) -> Iterator[bool]:
+    """Read sticky privacy state atomically with a content-sensitive operation."""
+    if isinstance(guard, RuntimeConfig):
+        with guard.transcript_barrier_state_guard():
+            yield guard.transcript_barrier_private
+        return
+    yield guard
 
 
 class _Turn(BaseModel):
@@ -225,7 +238,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         self,
         api_response: Any,
         *,
-        redact_private_content: bool = False,
+        redact_private_content: PrivateContentGuard = False,
     ) -> Iterator[ProviderEvent]:
         """Map a streaming response to normalised :data:`ProviderEvent`s."""
         ...
@@ -235,7 +248,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         self,
         api_response: Any,
         *,
-        redact_private_content: bool = False,
+        redact_private_content: PrivateContentGuard = False,
     ) -> Iterator[ProviderEvent]:
         """Map a non-streaming response to normalised :data:`ProviderEvent`s."""
         ...
@@ -244,7 +257,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         self,
         api_response: Any,
         *,
-        redact_private_content: bool = False,
+        redact_private_content: PrivateContentGuard = False,
     ) -> Iterator[ProviderEvent]:
         """Dispatch to the stream/non-stream mapper. ``self.stream`` is the single
         source of truth (it set the request's ``stream=`` flag), so the response
@@ -352,15 +365,18 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         if self._generation_is_stale(turn.gen) or not self._turn_output_allowed(turn.turn_id, turn.turn_revision):
             logger.info("LLM generation cancelled (stale speculative turn)")
             return
-        if not is_out_of_band(turn.response):
-            # Flush assistant text accumulated before this call first (so history
-            # order matches what the client received), then persist the call —
-            # all before the chunk leaves for the client.
-            chat = turn.runtime_config.chat
-            for pending_item in state.pending:
-                chat.add_item(pending_item)
-            state.pending.clear()
-            chat.add_item(fc_item)
+        with turn.runtime_config.transcript_barrier_state_guard():
+            if turn.runtime_config.transcript_barrier_failed:
+                return
+            if not is_out_of_band(turn.response):
+                # Flush assistant text accumulated before this call first (so history
+                # order matches what the client received), then persist the call —
+                # all before the chunk leaves for the client.
+                chat = turn.runtime_config.chat
+                for pending_item in state.pending:
+                    chat.add_item(pending_item)
+                state.pending.clear()
+                chat.add_item(fc_item)
         yield self._chunk(turn, tools=[item])
 
     # ── consumption ─────────────────────────────────────────────────────────--
@@ -514,7 +530,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             if api_response is not None:
                 events = self._iter_events(
                     api_response,
-                    redact_private_content=turn.runtime_config.transcript_barrier_private,
+                    redact_private_content=turn.runtime_config,
                 )
                 if self.stream:
                     yield from self._consume_streaming(events, state, turn)
@@ -566,12 +582,14 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             # Out-of-band responses emit output and usage but never write back to the
             # default conversation (their context was a throwaway chat).
             if not is_out_of_band(turn.response):
-                # Tool calls (and any assistant text preceding them) were already
-                # written eagerly in _record_tool_call; only trailing items remain.
-                for item in state.pending:
-                    original_chat.add_item(item)
-                original_chat.strip_images(consumed_image_ids)
-                original_chat.trim_if_needed(self.compactor)
+                with turn.runtime_config.transcript_barrier_state_guard():
+                    if not turn.runtime_config.transcript_barrier_failed:
+                        # Tool calls (and any assistant text preceding them) were already
+                        # written eagerly in _record_tool_call; only trailing items remain.
+                        for item in state.pending:
+                            original_chat.add_item(item)
+                        original_chat.strip_images(consumed_image_ids)
+                        original_chat.trim_if_needed(self.compactor)
             if state.input_tokens or state.output_tokens:
                 yield TokenUsage(
                     input_tokens=state.input_tokens,

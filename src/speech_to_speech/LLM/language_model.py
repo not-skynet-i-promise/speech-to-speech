@@ -594,22 +594,22 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             # conversation (their context was a throwaway chat).
             commit_allowed = turn_output_allowed and not out_of_band
             if commit_allowed:
-                original_chat.add_item(make_assistant_message(ctx.generated_text))
-            if commit_allowed and ctx.tools:
-                for t in ctx.tools:
-                    original_chat.add_item(
-                        RealtimeConversationItemFunctionCall(
-                            type="function_call",
-                            id=t.id,
-                            call_id=t.call_id,
-                            name=t.name,
-                            arguments=t.arguments,
-                            status=t.status,
-                        )
-                    )
-            if commit_allowed:
-                original_chat.strip_images(consumed_image_ids)
-                original_chat.trim_if_needed(self.compactor)
+                with runtime_config.transcript_barrier_state_guard():
+                    if not runtime_config.transcript_barrier_failed:
+                        original_chat.add_item(make_assistant_message(ctx.generated_text))
+                        for t in ctx.tools:
+                            original_chat.add_item(
+                                RealtimeConversationItemFunctionCall(
+                                    type="function_call",
+                                    id=t.id,
+                                    call_id=t.call_id,
+                                    name=t.name,
+                                    arguments=t.arguments,
+                                    status=t.status,
+                                )
+                            )
+                        original_chat.strip_images(consumed_image_ids)
+                        original_chat.trim_if_needed(self.compactor)
             if runtime_config.transcript_barrier_private:
                 logger.debug("Generated text redacted (characters=%d)", len(ctx.generated_text))
                 logger.info("Generated tools redacted (count=%d)", len(ctx.tools))

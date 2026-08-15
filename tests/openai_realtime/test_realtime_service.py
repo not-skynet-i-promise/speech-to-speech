@@ -835,6 +835,30 @@ class TestHandleResponseCreate:
         assert "call_bogus" in result.error.message
         assert service._state(conn_id).in_response is False
 
+    def test_ordinary_response_input_rejection_retains_valid_prefix(self, service, conn_id):
+        event = ResponseCreateEvent(
+            type="response.create",
+            response={
+                "input": [
+                    self._user_input("ordinary prefix"),
+                    {
+                        "id": "INVALID_SECOND_ITEM",
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "invalid"}],
+                    },
+                ]
+            },
+        )
+
+        result = service.handle_response_create(conn_id, event)
+
+        assert isinstance(result, RealtimeErrorEvent)
+        assert service._state(conn_id).in_response is False
+        assert [item.content[0].text for item in service._state(conn_id).runtime_config.chat.buffer] == [
+            "ordinary prefix"
+        ]
+
     def test_private_response_input_rejection_retains_no_valid_prefix(self, service, conn_id):
         state = service._state(conn_id)
         state.runtime_config.transcript_barrier_version = 1
