@@ -423,6 +423,43 @@ def test_apply_session_voice_override_redacts_private_invalid_value(caplog):
     assert "private Qwen3-TTS voice override; content redacted" in caplog.text
 
 
+def test_apply_session_voice_override_rechecks_privacy_after_speaker_lookup(caplog):
+    handler = object.__new__(Qwen3TTSHandler)
+    runtime_config = RuntimeConfig()
+    canary = "PRIVATE_INFLIGHT_QWEN_VOICE_CANARY"
+    assert runtime_config.session.audio is not None
+    assert runtime_config.session.audio.output is not None
+    runtime_config.session.audio.output.voice = canary
+    handler.ref_audio = None
+    handler.speaker = "Aiden"
+    started = Event()
+    release = Event()
+
+    def supported_speakers():
+        started.set()
+        assert release.wait(timeout=2.0)
+        return ["aiden", "vivian"]
+
+    handler.model = SimpleNamespace(model=SimpleNamespace(get_supported_speakers=supported_speakers))
+    worker = Thread(
+        target=handler._apply_session_voice_override,
+        args=("custom_voice", runtime_config),
+    )
+
+    with caplog.at_level("WARNING"):
+        worker.start()
+        assert started.wait(timeout=2.0)
+        with runtime_config.transcript_barrier_state_guard():
+            runtime_config.transcript_barrier_failed = True
+            runtime_config.chat.enable_private_content_logging()
+        release.set()
+        worker.join(timeout=2.0)
+
+    assert worker.is_alive() is False
+    assert canary not in caplog.text
+    assert "private Qwen3-TTS voice override; content redacted" in caplog.text
+
+
 def test_process_only_reenables_listening_after_end_of_response(monkeypatch):
     handler = object.__new__(Qwen3TTSHandler)
     handler.should_listen = Event()

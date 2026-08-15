@@ -118,7 +118,12 @@ class BaseHandler(Generic[InT, OutT]):
         with stack:
             for runtime_config in runtime_configs:
                 try:
-                    if bool(getattr(runtime_config, "transcript_barrier_private", False)):
+                    private_state = getattr(
+                        runtime_config,
+                        "transcript_barrier_private",
+                        getattr(runtime_config, "transcript_barrier_enabled", False),
+                    )
+                    if bool(private_state):
                         yield True
                         return
                 except Exception:
@@ -145,7 +150,13 @@ class BaseHandler(Generic[InT, OutT]):
             return
         with guard:
             try:
-                private_content = bool(getattr(runtime_config, "transcript_barrier_private", False))
+                private_content = bool(
+                    getattr(
+                        runtime_config,
+                        "transcript_barrier_private",
+                        getattr(runtime_config, "transcript_barrier_enabled", False),
+                    )
+                )
             except Exception:
                 private_content = True
             yield bool(getattr(self, "_private_content_logging", False)) or private_content
