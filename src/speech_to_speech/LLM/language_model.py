@@ -86,6 +86,7 @@ except ImportError:
     HAS_MLX_VLM = False
 
 logger = logging.getLogger(__name__)
+_NATIVE_THREAD_TYPE = Thread
 
 
 @runtime_checkable
@@ -320,11 +321,19 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         try:
             thread.start()
         except BaseException as exc:
-            # ``Thread.start()`` can be interrupted after the OS thread has
-            # actually launched. In that case ``run`` still owns the lease and
-            # releases it from its ``finally`` block. Only a provably unstarted
-            # thread is balanced here.
-            if not state.started.is_set() and getattr(thread, "ident", None) is None and cancel_scope is not None:
+            # A non-``Exception`` interruption can arrive after CPython has
+            # launched the native thread but before its bootstrap publishes
+            # ``ident`` or enters ``run``. That state is ambiguous and must
+            # retain the fail-closed reservation for the eventual worker to
+            # release. Ordinary ``Exception`` failures have completed
+            # ``Thread.start``'s pre-launch cleanup; test doubles that are not
+            # native Thread instances are conclusively unlaunched as well.
+            conclusively_unstarted = (
+                not state.started.is_set()
+                and getattr(thread, "ident", None) is None
+                and (isinstance(exc, Exception) or not isinstance(thread, _NATIVE_THREAD_TYPE))
+            )
+            if conclusively_unstarted and cancel_scope is not None:
                 try:
                     cancel_scope.response_worker_done()
                 except BaseException:
