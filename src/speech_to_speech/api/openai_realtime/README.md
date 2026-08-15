@@ -129,8 +129,10 @@ resolution, failure, and synchronously at disconnect before handler drain.
 Pending private input also freezes deferred history application and chat
 compaction until exact resolution. Privacy-mode exception and content logging
 remains sticky after poison until the session is unregistered, so draining work
-cannot downgrade into ordinary logging. Clients that do not request this
-extension keep the standard Realtime behavior described above.
+cannot downgrade into ordinary logging. Parse-time and semantic client-event
+failures use content-free wire errors rather than echoing client-controlled
+values while that mode is active. Clients that do not request this extension
+keep the standard Realtime behavior described above.
 
 ---
 

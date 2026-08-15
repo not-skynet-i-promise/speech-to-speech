@@ -55,3 +55,9 @@ class RealtimeBaseHandler:
 
     def make_error(self, message: str, _type: str) -> RealtimeErrorEvent:
         return self._service.make_error(message, _type)
+
+    def make_client_content_error(self, conn_id: str, message: str, _type: str) -> RealtimeErrorEvent:
+        """Hide client-controlled semantic error details in sticky private mode."""
+        if self._state(conn_id).runtime_config.transcript_barrier_enabled:
+            message = "Invalid private client event."
+        return self.make_error(message, _type)

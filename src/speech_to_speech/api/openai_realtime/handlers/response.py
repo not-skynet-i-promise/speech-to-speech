@@ -212,7 +212,7 @@ class ResponseHandler(RealtimeBaseHandler):
                 try:
                     self._service.conversation._append_item(conn_id, input_item)
                 except ChatItemError as exc:
-                    return self.make_error(message=str(exc), _type="invalid_input_item")
+                    return self.make_client_content_error(conn_id, str(exc), "invalid_input_item")
 
         st.in_response = True
         st.response_pending = False

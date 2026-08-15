@@ -294,6 +294,69 @@ class TestClientEventDispatch:
         assert canary not in str(error)
         assert canary not in caplog.text
 
+    @pytest.mark.parametrize(
+        ("event", "error_type"),
+        [
+            (
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "id": "PRIVATE_SEMANTIC_CONV_CANARY",
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "private"}],
+                    },
+                },
+                "invalid_conversation_item",
+            ),
+            (
+                {
+                    "type": "response.create",
+                    "response": {
+                        "input": [
+                            {
+                                "id": "PRIVATE_SEMANTIC_RESP_CANARY",
+                                "type": "message",
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": "private"}],
+                            }
+                        ]
+                    },
+                },
+                "invalid_input_item",
+            ),
+        ],
+    )
+    def test_private_handshake_redacts_semantic_client_errors_on_wire(self, setup, event, error_type):
+        app, _service, *_ = setup
+        nonce = "cf" * 32
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "realtime",
+                            "reachy_private_transcript_barrier": {"version": 1, "nonce": nonce},
+                        },
+                    }
+                )
+                assert ws.receive_json()["type"] == "reachy.transcript_barrier.ready"
+
+                ws.send_json(event)
+                error = ws.receive_json()
+
+        assert error["type"] == "error"
+        assert error["error"] == {
+            "code": None,
+            "event_id": None,
+            "message": "Invalid private client event.",
+            "param": None,
+            "type": error_type,
+        }
+        assert "CANARY" not in str(error)
+
     def test_private_transcript_barrier_exact_resolution_round_trip(self, setup):
         app, service, _, _, text_output_queue, *_ = setup
         nonce = "ef" * 32
