@@ -21,10 +21,12 @@ from speech_to_speech.LLM.base_openai_compatible_language_model import (
     WARMUP_MAX_RETRIES,
     AssistantMessage,
     BaseOpenAICompatibleHandler,
+    PrivateContentGuard,
     ProviderEvent,
     TextDelta,
     ToolCall,
     Usage,
+    private_content_redaction,
 )
 from speech_to_speech.LLM.chat import Chat
 from speech_to_speech.LLM.compaction_prompt import CompactGenerateFn
@@ -110,7 +112,12 @@ class ResponsesApiModelHandler(BaseOpenAICompatibleHandler):
             AssistantContent(type="output_text", text=c.text if c.type == "output_text" else c.refusal) for c in content
         ]
 
-    def _iter_stream_events(self, api_response: Stream) -> Iterator[ProviderEvent]:
+    def _iter_stream_events(
+        self,
+        api_response: Stream,
+        *,
+        redact_private_content: PrivateContentGuard = False,
+    ) -> Iterator[ProviderEvent]:
         for raw_event in api_response:
             if isinstance(raw_event, ResponseTextDeltaEvent):
                 yield TextDelta(text=raw_event.delta)
@@ -127,7 +134,12 @@ class ResponsesApiModelHandler(BaseOpenAICompatibleHandler):
                 if usage:
                     yield Usage(input_tokens=usage.input_tokens or 0, output_tokens=usage.output_tokens or 0)
 
-    def _iter_response_events(self, api_response: Any) -> Iterator[ProviderEvent]:
+    def _iter_response_events(
+        self,
+        api_response: Any,
+        *,
+        redact_private_content: PrivateContentGuard = False,
+    ) -> Iterator[ProviderEvent]:
         usage = api_response.usage
         if usage:
             yield Usage(input_tokens=usage.input_tokens or 0, output_tokens=usage.output_tokens or 0)
@@ -143,7 +155,11 @@ class ResponsesApiModelHandler(BaseOpenAICompatibleHandler):
                 raw = "".join(c.text for c in message.content if c.type == "output_text")
                 yield TextDelta(text=raw)
             else:
-                logger.warning(f"Not supported message type: {message.type}")
+                with private_content_redaction(redact_private_content) as redact:
+                    if redact:
+                        logger.warning("Unsupported private response item; content redacted")
+                    else:
+                        logger.warning(f"Not supported message type: {message.type}")
 
     def on_session_end(self) -> None:
         logger.debug("OpenAI API language model session state reset")

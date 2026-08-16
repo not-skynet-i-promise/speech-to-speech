@@ -118,12 +118,15 @@ class PocketTTSHandler(BaseHandler[TTSIn, TTSOut]):
         gen = self.cancel_scope.generation if self.cancel_scope else None
         language_code = tts_input.language_code
         text = tts_input.text
-        logger.debug(f"Received language code: {language_code}")
 
-        console.print(f"[green]ASSISTANT: {text}")
-
-        # Generate audio stream
-        logger.debug(f"Generating audio for: {text[:50]}...")
+        with self._runtime_config_private_logging_guard(tts_input.runtime_config) as private_barrier:
+            if private_barrier:
+                console.print("[green]ASSISTANT: [private content redacted]")
+                logger.debug("Generating audio for redacted content (characters=%d)", len(text))
+            else:
+                logger.debug(f"Received language code: {language_code}")
+                console.print(f"[green]ASSISTANT: {text}")
+                logger.debug("Generating audio for: %s...", text[:50])
 
         pipeline_start = perf_counter()
         first_chunk = True

@@ -422,20 +422,23 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
             session_voice = str(sess_voice) if sess_voice else None
         if not session_voice:
             return
-
         if model_type == "custom_voice":
             supported_speakers = self._supported_speakers()
             if supported_speakers is not None:
                 speakers_by_lower = {speaker.lower(): speaker for speaker in supported_speakers}
                 speaker = speakers_by_lower.get(session_voice.lower())
                 if speaker is None:
-                    supported_text = ", ".join(sorted(supported_speakers, key=str.lower)) or "unknown"
-                    logger.warning(
-                        "Ignoring Qwen3-TTS session voice override %r because it is not a supported "
-                        "CustomVoice speaker. Supported speakers: %s",
-                        session_voice,
-                        supported_text,
-                    )
+                    with self._runtime_config_private_logging_guard(runtime_config) as private_content:
+                        if private_content:
+                            logger.warning("Ignoring private Qwen3-TTS voice override; content redacted")
+                        else:
+                            supported_text = ", ".join(sorted(supported_speakers, key=str.lower)) or "unknown"
+                            logger.warning(
+                                "Ignoring Qwen3-TTS session voice override %r because it is not a supported "
+                                "CustomVoice speaker. Supported speakers: %s",
+                                session_voice,
+                                supported_text,
+                            )
                     return
                 session_voice = speaker
 
@@ -447,10 +450,14 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
             self.ref_audio = session_voice
             return
 
-        logger.warning(
-            "Ignoring Qwen3-TTS session voice override because it is not an audio file path: %r",
-            session_voice,
-        )
+        with self._runtime_config_private_logging_guard(runtime_config) as private_content:
+            if private_content:
+                logger.warning("Ignoring private Qwen3-TTS voice override; content redacted")
+            else:
+                logger.warning(
+                    "Ignoring Qwen3-TTS session voice override because it is not an audio file path: %r",
+                    session_voice,
+                )
 
     def warmup(self) -> None:
         logger.info(f"Warming up {self.__class__.__name__}")
@@ -714,7 +721,11 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         model_type = self._model_type()
         self._apply_session_voice_override(model_type, runtime_config, response)
 
-        console.print(f"[green]ASSISTANT: {text}")
+        with self._runtime_config_private_logging_guard(runtime_config) as private_barrier:
+            if private_barrier:
+                console.print("[green]ASSISTANT: [private content redacted]")
+            else:
+                console.print(f"[green]ASSISTANT: {text}")
 
         try:
             if self.ref_audio:
@@ -735,7 +746,11 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                     first_audio = False
                 yield audio_chunk
         except Exception as e:
-            logger.error(f"Error during Qwen3-TTS generation: {e}", exc_info=True)
+            with self._runtime_config_private_logging_guard(runtime_config) as private_barrier:
+                if private_barrier:
+                    logger.error("Qwen3-TTS generation failed; private content redacted")
+                else:
+                    logger.error("Error during Qwen3-TTS generation: %s", e, exc_info=True)
 
     def _log_first_audio_latency(self, tts_input: TTSInput) -> None:
         if tts_input.speech_stopped_at_s is None:

@@ -57,7 +57,7 @@ class ConversationHandler(RealtimeBaseHandler):
         try:
             self._append_item(conn_id, item)
         except ChatItemError as exc:
-            return [self.make_error(str(exc), "invalid_conversation_item")]
+            return [self.make_client_content_error(conn_id, str(exc), "invalid_conversation_item")]
 
         if not item:
             return []

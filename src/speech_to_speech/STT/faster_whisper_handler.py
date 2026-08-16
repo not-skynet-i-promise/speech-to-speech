@@ -40,14 +40,18 @@ class FasterWhisperSTTHandler(BaseSTTHandler):
         output_text = []
 
         for segment in segments:
-            logger.debug("[%.2fs -> %.2fs] %s" % (segment.start, segment.end, segment.text))
+            with self.transcript_content_allowed() as content_allowed:
+                if content_allowed:
+                    logger.debug("[%.2fs -> %.2fs] %s" % (segment.start, segment.end, segment.text))
             output_text.append(segment.text)
 
         pred_text = " ".join(output_text).strip()
 
         logger.debug("finished whisper inference")
         if pred_text:
-            console.print(f"[yellow]USER: {pred_text}")
+            with self.transcript_content_allowed() as content_allowed:
+                if content_allowed:
+                    console.print(f"[yellow]USER: {pred_text}")
 
             yield Transcription(
                 text=pred_text,

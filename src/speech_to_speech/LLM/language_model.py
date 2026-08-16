@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Iterator, Sized
+from collections.abc import Callable, Iterable, Iterator, Sized
+from contextlib import nullcontext
+from dataclasses import dataclass, field
 from queue import Empty
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from typing import Any, Literal, Optional, Protocol, runtime_checkable
 
 import torch
@@ -84,6 +86,7 @@ except ImportError:
     HAS_MLX_VLM = False
 
 logger = logging.getLogger(__name__)
+_NATIVE_THREAD_TYPE = Thread
 
 
 @runtime_checkable
@@ -117,6 +120,15 @@ class _CancelCriteria(StoppingCriteria):
 
     def __call__(self, input_ids: Any, scores: Any, **kwargs: Any) -> bool:
         return self._cancelled
+
+
+@dataclass
+class _TransformersWorkerState:
+    """Content-free completion state shared with one local generation worker."""
+
+    failed: bool = False
+    started: Event = field(default_factory=Event)
+    completed: Event = field(default_factory=Event)
 
 
 class StreamContext(BaseModel):
@@ -242,15 +254,124 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         """Close the MLX generator to release resources immediately."""
         token_iter.close()
 
-    def _finish_transformers_generation(self, thread: Thread) -> None:
-        """Signal the stopping criteria, drain the streamer, and join the thread."""
-        self._cancel_criteria.cancel()
+    def _start_transformers_generation(
+        self,
+        target: Callable[[], None],
+        streamer: TextIteratorStreamer,
+        runtime_config: RuntimeConfig | None,
+    ) -> tuple[Thread, _TransformersWorkerState]:
+        """Start a redacted worker whose activation lease lasts through thread exit."""
+        cancel_scope = self.cancel_scope
+        state = _TransformersWorkerState()
+        if cancel_scope is not None:
+            cancel_scope.response_worker_started()
+
+        def run() -> None:
+            state.started.set()
+            try:
+                target()
+            except BaseException:
+                # Without this boundary the default threading excepthook writes
+                # the raw exception and traceback to stderr. Serialize the
+                # decision and log with sticky session privacy, retain no
+                # exception object, and wake this generation's consumer.
+                state.failed = True
+                try:
+                    guard = (
+                        runtime_config.transcript_barrier_content_guard()
+                        if runtime_config is not None
+                        else nullcontext(False)
+                    )
+                    with guard as private_content:
+                        if private_content:
+                            logger.error("Local Transformers generation worker failed; private content redacted")
+                        else:
+                            logger.exception("Local Transformers generation worker failed")
+                except BaseException:
+                    # Logging and privacy-state access are observers here. Their
+                    # own failure must not revive threading.excepthook with the
+                    # still-active private target exception as its context.
+                    pass
+                finally:
+                    try:
+                        streamer.end()
+                    except BaseException:
+                        # The content-free state remains authoritative; cleanup
+                        # must never escape to threading.excepthook either.
+                        pass
+            finally:
+                state.completed.set()
+                if cancel_scope is not None:
+                    try:
+                        cancel_scope.response_worker_done()
+                    except BaseException:
+                        pass
+
         try:
-            for _ in self.streamer:
+            thread = Thread(target=run)
+        except BaseException as exc:
+            if cancel_scope is not None:
+                try:
+                    cancel_scope.response_worker_done()
+                except BaseException:
+                    pass
+            if isinstance(exc, Exception):
+                raise
+            raise RuntimeError("Local Transformers generation worker could not start") from None
+        try:
+            thread.start()
+        except BaseException as exc:
+            # A non-``Exception`` interruption can arrive after CPython has
+            # launched the native thread but before its bootstrap publishes
+            # ``ident`` or enters ``run``. That state is ambiguous and must
+            # retain the fail-closed reservation for the eventual worker to
+            # release. Ordinary ``Exception`` failures have completed
+            # ``Thread.start``'s pre-launch cleanup; test doubles that are not
+            # native Thread instances are conclusively unlaunched as well.
+            conclusively_unstarted = (
+                not state.started.is_set()
+                and getattr(thread, "ident", None) is None
+                and (isinstance(exc, Exception) or not isinstance(thread, _NATIVE_THREAD_TYPE))
+            )
+            if conclusively_unstarted and cancel_scope is not None:
+                try:
+                    cancel_scope.response_worker_done()
+                except BaseException:
+                    pass
+            if isinstance(exc, Exception):
+                raise
+            raise RuntimeError("Local Transformers generation worker could not start") from None
+        return thread, state
+
+    def _new_transformers_streaming_state(self) -> tuple[TextIteratorStreamer, _CancelCriteria]:
+        """Return per-generation channels that cannot receive an older worker's tokens."""
+        return (
+            TextIteratorStreamer(
+                self.tokenizer,  # type: ignore[arg-type]
+                skip_prompt=True,
+                skip_special_tokens=True,
+                timeout=1.0,
+            ),
+            _CancelCriteria(),
+        )
+
+    def _finish_transformers_generation(
+        self,
+        thread: Thread,
+        streamer: Iterable[str],
+        cancel_criteria: _CancelCriteria,
+        worker_state: _TransformersWorkerState,
+    ) -> None:
+        """Signal the stopping criteria, drain the streamer, and join the thread."""
+        cancel_criteria.cancel()
+        try:
+            for _ in streamer:
                 pass
         except Empty:
             pass
         thread.join(timeout=5.0)
+        if worker_state.failed:
+            raise RuntimeError("Local Transformers generation worker failed")
 
     # ------------------------------------------------------------------
     # Shared helpers
@@ -342,28 +463,49 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             block_end = code_and_after.index(ctx.end_code) + len(ctx.end_code)
             complete_block = code_and_after[:block_end]
             printable_text = code_and_after[block_end:]
-            _, func_calls = extract_function_calls_from_text(complete_block, ctx.block_regex)
-            parsed_tools: list[ResponseFunctionToolCall] = []
-            for fc in func_calls:
-                try:
-                    tool_call = fc.to_realtime_function_tool_call(ctx.function_tools)
-                except ValueError as e:
-                    logger.warning("Skipping invalid tool call: %s", e)
-                    continue
-                if any(
-                    previous.name == tool_call.name and previous.arguments == tool_call.arguments for previous in tools
-                ):
-                    logger.warning("Skipping duplicate tool call '%s'", tool_call.name)
-                    continue
-                if len(tools) >= MAX_TOOL_CALLS_PER_RESPONSE:
-                    logger.warning(
-                        "Skipping extra tool call '%s'; at most %d tool calls are allowed per response",
-                        tool_call.name,
-                        MAX_TOOL_CALLS_PER_RESPONSE,
-                    )
-                    continue
-                tools.append(tool_call)
-                parsed_tools.append(tool_call)
+            content_guard = (
+                runtime_config.transcript_barrier_content_guard() if runtime_config is not None else nullcontext(False)
+            )
+            with content_guard as private_content:
+                _, func_calls = extract_function_calls_from_text(
+                    complete_block,
+                    ctx.block_regex,
+                    redact_private_content=private_content,
+                )
+                parsed_tools: list[ResponseFunctionToolCall] = []
+                for fc in func_calls:
+                    try:
+                        tool_call = fc.to_realtime_function_tool_call(
+                            ctx.function_tools,
+                            redact_private_content=private_content,
+                        )
+                    except ValueError as e:
+                        if private_content:
+                            logger.warning("Skipping invalid private tool call; content redacted")
+                        else:
+                            logger.warning("Skipping invalid tool call: %s", e)
+                        continue
+                    if any(
+                        previous.name == tool_call.name and previous.arguments == tool_call.arguments
+                        for previous in tools
+                    ):
+                        if private_content:
+                            logger.warning("Skipping duplicate private tool call; content redacted")
+                        else:
+                            logger.warning("Skipping duplicate tool call '%s'", tool_call.name)
+                        continue
+                    if len(tools) >= MAX_TOOL_CALLS_PER_RESPONSE:
+                        if private_content:
+                            logger.warning("Skipping extra private tool call; content redacted")
+                        else:
+                            logger.warning(
+                                "Skipping extra tool call '%s'; at most %d tool calls are allowed per response",
+                                tool_call.name,
+                                MAX_TOOL_CALLS_PER_RESPONSE,
+                            )
+                        continue
+                    tools.append(tool_call)
+                    parsed_tools.append(tool_call)
             if parsed_tools:
                 chunks.append(
                     LLMResponseChunk(
@@ -444,6 +586,7 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         ctx: StreamContext,
         runtime_config: RuntimeConfig | None = None,
         response: RealtimeResponseCreateParams | None = None,
+        worker_state: _TransformersWorkerState | None = None,
     ) -> Iterator[LLMResponseChunk]:
         """Consume *token_iter*, accumulate text in *ctx*, yield sentence chunks."""
         # Text-only output keeps every character; only audio strips TTS-unfriendly
@@ -455,6 +598,8 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             except StopIteration:
                 break
             except Empty:
+                if worker_state is not None and worker_state.completed.is_set():
+                    break
                 if self._check_stop(gen, ctx):
                     break
                 continue
@@ -505,6 +650,43 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
     # Main pipeline entry point
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _generation_failure_response(
+        runtime_config: RuntimeConfig,
+        ctx: StreamContext,
+        exc: BaseException,
+    ) -> EndOfResponse:
+        """Build one terminal response even when privacy observers also fail."""
+        private_content = True
+        try:
+            with runtime_config.transcript_barrier_content_guard() as observed_private:
+                private_content = observed_private
+                try:
+                    if private_content:
+                        logger.error("LLM generation failed; private content redacted")
+                    else:
+                        logger.exception("LLM generation failed; ending the current response")
+                except BaseException:
+                    pass
+        except BaseException:
+            # Privacy-state access is itself optional observation. If it fails,
+            # retain no secondary exception and choose the content-free result.
+            private_content = True
+        return EndOfResponse(
+            turn_id=ctx.turn_id,
+            turn_revision=ctx.turn_revision,
+            cancel_generation=ctx.cancel_generation,
+            error=(
+                "Language model generation failed in private transcript mode."
+                if private_content
+                else (
+                    f"Language model generation failed: {exc}"
+                    if isinstance(exc, Exception)
+                    else "Language model generation failed."
+                )
+            ),
+        )
+
     def process(self, request: LLMIn) -> Iterator[LLMOut]:
         ctx = StreamContext()
 
@@ -514,6 +696,19 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         ctx.turn_id = request.turn_id
         ctx.turn_revision = request.turn_revision
         ctx.speech_stopped_at_s = request.speech_stopped_at_s
+        request_generation = request.cancel_generation
+        if (
+            request_generation is not None
+            and self.cancel_scope is not None
+            and self.cancel_scope.is_stale(request_generation)
+        ):
+            logger.info("Skipping cancelled LLM request before provider execution")
+            yield EndOfResponse(
+                turn_id=ctx.turn_id,
+                turn_revision=ctx.turn_revision,
+                cancel_generation=request_generation,
+            )
+            return
         if not self._turn_is_latest(ctx.turn_id, ctx.turn_revision):
             logger.info("Skipping stale LLM request for turn=%s rev=%s", ctx.turn_id, ctx.turn_revision)
             yield EndOfResponse(turn_id=ctx.turn_id, turn_revision=ctx.turn_revision)
@@ -527,8 +722,18 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             try:
                 active_chat = build_active_chat(original_chat, response)
             except ChatItemError as exc:
-                logger.info("Out-of-band response rejected: %s", exc)
-                yield EndOfResponse(turn_id=ctx.turn_id, turn_revision=ctx.turn_revision, error=str(exc))
+                with runtime_config.transcript_barrier_content_guard() as private_content:
+                    if private_content:
+                        error_message = "Private out-of-band response rejected."
+                        logger.info("Out-of-band response rejected; private content redacted")
+                    else:
+                        error_message = str(exc)
+                        logger.info("Out-of-band response rejected: %s", error_message)
+                    yield EndOfResponse(
+                        turn_id=ctx.turn_id,
+                        turn_revision=ctx.turn_revision,
+                        error=error_message,
+                    )
                 return
         else:
             active_chat = original_chat.copy()
@@ -550,7 +755,9 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         if lang_name and self.enable_lang_prompt:
             active_chat.add_item(make_user_message(f"Please reply to my message in {lang_name}."))
 
-        gen = self.cancel_scope.generation if self.cancel_scope else None
+        gen = request_generation
+        if gen is None and self.cancel_scope is not None:
+            gen = self.cancel_scope.generation
         ctx.cancel_generation = gen
         # Images the model sees this turn; only these are stripped on write-back,
         # so an image a fast client injects mid-generation for the next turn
@@ -558,7 +765,27 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         consumed_image_ids = active_chat.image_message_ids()
 
         try:
-            yield from self._generate(active_chat, language_code, gen, ctx, runtime_config, response)
+            if self.cancel_scope is None:
+                yield from self._generate(active_chat, language_code, gen, ctx, runtime_config, response)
+            else:
+                with self.cancel_scope.response_admission(gen) as (admitted, admitted_generation):
+                    ctx.cancel_generation = admitted_generation
+                    if not admitted:
+                        logger.info("Skipping cancelled LLM request before model execution")
+                        yield EndOfResponse(
+                            turn_id=ctx.turn_id,
+                            turn_revision=ctx.turn_revision,
+                            cancel_generation=admitted_generation,
+                        )
+                        return
+                    yield from self._generate(
+                        active_chat,
+                        language_code,
+                        admitted_generation,
+                        ctx,
+                        runtime_config,
+                        response,
+                    )
 
             if ctx.stopped:
                 return
@@ -568,24 +795,29 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             # conversation (their context was a throwaway chat).
             commit_allowed = turn_output_allowed and not out_of_band
             if commit_allowed:
-                original_chat.add_item(make_assistant_message(ctx.generated_text))
-            if commit_allowed and ctx.tools:
-                for t in ctx.tools:
-                    original_chat.add_item(
-                        RealtimeConversationItemFunctionCall(
-                            type="function_call",
-                            id=t.id,
-                            call_id=t.call_id,
-                            name=t.name,
-                            arguments=t.arguments,
-                            status=t.status,
-                        )
-                    )
-            if commit_allowed:
-                original_chat.strip_images(consumed_image_ids)
-                original_chat.trim_if_needed(self.compactor)
-            logger.debug("Clean text: %s", ctx.generated_text)
-            logger.info(f"Tools: {ctx.tools}")
+                with runtime_config.transcript_barrier_state_guard():
+                    if not runtime_config.transcript_barrier_failed:
+                        original_chat.add_item(make_assistant_message(ctx.generated_text))
+                        for t in ctx.tools:
+                            original_chat.add_item(
+                                RealtimeConversationItemFunctionCall(
+                                    type="function_call",
+                                    id=t.id,
+                                    call_id=t.call_id,
+                                    name=t.name,
+                                    arguments=t.arguments,
+                                    status=t.status,
+                                )
+                            )
+                        original_chat.strip_images(consumed_image_ids)
+                        original_chat.trim_if_needed(self.compactor)
+            with runtime_config.transcript_barrier_content_guard() as private_content:
+                if private_content:
+                    logger.debug("Generated text redacted (characters=%d)", len(ctx.generated_text))
+                    logger.info("Generated tools redacted (count=%d)", len(ctx.tools))
+                else:
+                    logger.debug("Clean text: %s", ctx.generated_text)
+                    logger.info("Tools: %s", ctx.tools)
 
             if turn_output_allowed and ctx.printable_text.strip():
                 yield LLMResponseChunk(
@@ -607,17 +839,13 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     turn_id=ctx.turn_id,
                     turn_revision=ctx.turn_revision,
                 )
-        except Exception as exc:
+        except GeneratorExit:
+            raise
+        except BaseException as exc:
             # Any generation failure must still terminate the response. Without this
             # the exception would escape process() and no EndOfResponse would be
             # emitted, leaving st.in_response stuck and locking every later response.
-            logger.exception("LLM generation failed; ending the current response")
-            yield EndOfResponse(
-                turn_id=ctx.turn_id,
-                turn_revision=ctx.turn_revision,
-                cancel_generation=ctx.cancel_generation,
-                error=f"Language model generation failed: {exc}",
-            )
+            yield self._generation_failure_response(runtime_config, ctx, exc)
             return
         yield EndOfResponse(
             turn_id=ctx.turn_id,
@@ -715,17 +943,29 @@ class LanguageModelHandler(BaseLanguageModelHandler):
                 pass
             torch.mps.empty_cache()
         else:
-            self._cancel_criteria.reset()
+            streamer, cancel_criteria = self._new_transformers_streaming_state()
+            generation_kwargs = {
+                **self.gen_kwargs,
+                "streamer": streamer,
+                "stopping_criteria": StoppingCriteriaList([cancel_criteria]),
+            }
             lock = self._transformers_lock
 
             def _locked_pipe() -> None:
                 with lock:
-                    self.pipe(chat_prompt, **self.gen_kwargs)
+                    self.pipe(chat_prompt, **generation_kwargs)
 
-            thread = Thread(target=_locked_pipe)
-            thread.start()
-            yield from self._stream_tokens(self.streamer, gen, language_code, ctx, runtime_config, response)
-            self._finish_transformers_generation(thread)
+            thread, worker_state = self._start_transformers_generation(_locked_pipe, streamer, runtime_config)
+            yield from self._stream_tokens(
+                streamer,
+                gen,
+                language_code,
+                ctx,
+                runtime_config,
+                response,
+                worker_state,
+            )
+            self._finish_transformers_generation(thread, streamer, cancel_criteria, worker_state)
             if self.device == "mps":
                 torch.mps.empty_cache()
 
@@ -891,12 +1131,12 @@ class VisionLanguageModelHandler(BaseLanguageModelHandler):
             ctx.input_tokens += input_tokens
             logger.debug("VLM prompt token count: %d", ctx.input_tokens)
 
-            self._cancel_criteria.reset()
+            streamer, cancel_criteria = self._new_transformers_streaming_state()
             generate_kwargs = {
                 **inputs,
                 "max_new_tokens": self.gen_kwargs.get("max_new_tokens", 1024),
-                "streamer": self.streamer,
-                "stopping_criteria": StoppingCriteriaList([self._cancel_criteria]),
+                "streamer": streamer,
+                "stopping_criteria": StoppingCriteriaList([cancel_criteria]),
             }
             lock = self._transformers_lock
 
@@ -904,10 +1144,17 @@ class VisionLanguageModelHandler(BaseLanguageModelHandler):
                 with lock:
                     self.model.generate(**generate_kwargs)  # type: ignore[union-attr,operator]
 
-            thread = Thread(target=_locked_generate)
-            thread.start()
-            yield from self._stream_tokens(self.streamer, gen, language_code, ctx, runtime_config, response)
-            self._finish_transformers_generation(thread)
+            thread, worker_state = self._start_transformers_generation(_locked_generate, streamer, runtime_config)
+            yield from self._stream_tokens(
+                streamer,
+                gen,
+                language_code,
+                ctx,
+                runtime_config,
+                response,
+                worker_state,
+            )
+            self._finish_transformers_generation(thread, streamer, cancel_criteria, worker_state)
             if self.device == "mps":
                 torch.mps.empty_cache()
 

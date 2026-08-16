@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, Optional
 
 import httpx
@@ -18,6 +19,7 @@ from openai.types.realtime.realtime_conversation_item_assistant_message import (
 from openai.types.responses import ResponseFunctionToolCall
 from pydantic import BaseModel, ConfigDict, Field
 
+from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.LLM.chat import (
     Chat,
@@ -81,6 +83,17 @@ class Usage(BaseModel):
 
 
 ProviderEvent = TextDelta | AssistantMessage | ToolCall | Usage
+PrivateContentGuard = bool | RuntimeConfig
+
+
+@contextmanager
+def private_content_redaction(guard: PrivateContentGuard) -> Iterator[bool]:
+    """Read sticky privacy state atomically with a content-sensitive operation."""
+    if isinstance(guard, RuntimeConfig):
+        with guard.transcript_barrier_content_guard() as private_content:
+            yield private_content
+        return
+    yield guard
 
 
 class _Turn(BaseModel):
@@ -221,23 +234,44 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         ...
 
     @abstractmethod
-    def _iter_stream_events(self, api_response: Any) -> Iterator[ProviderEvent]:
+    def _iter_stream_events(
+        self,
+        api_response: Any,
+        *,
+        redact_private_content: PrivateContentGuard = False,
+    ) -> Iterator[ProviderEvent]:
         """Map a streaming response to normalised :data:`ProviderEvent`s."""
         ...
 
     @abstractmethod
-    def _iter_response_events(self, api_response: Any) -> Iterator[ProviderEvent]:
+    def _iter_response_events(
+        self,
+        api_response: Any,
+        *,
+        redact_private_content: PrivateContentGuard = False,
+    ) -> Iterator[ProviderEvent]:
         """Map a non-streaming response to normalised :data:`ProviderEvent`s."""
         ...
 
-    def _iter_events(self, api_response: Any) -> Iterator[ProviderEvent]:
+    def _iter_events(
+        self,
+        api_response: Any,
+        *,
+        redact_private_content: PrivateContentGuard = False,
+    ) -> Iterator[ProviderEvent]:
         """Dispatch to the stream/non-stream mapper. ``self.stream`` is the single
         source of truth (it set the request's ``stream=`` flag), so the response
         type always matches it."""
         if self.stream:
-            yield from self._iter_stream_events(api_response)
+            yield from self._iter_stream_events(
+                api_response,
+                redact_private_content=redact_private_content,
+            )
         else:
-            yield from self._iter_response_events(api_response)
+            yield from self._iter_response_events(
+                api_response,
+                redact_private_content=redact_private_content,
+            )
 
     @abstractmethod
     def _build_optional_kwargs(self, req_tools: Any, req_tool_choice: Any) -> dict[str, Any]:
@@ -304,14 +338,22 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         Out-of-band turns never touch the default conversation, and a stale turn
         records nothing (it is not forwarded to the client either)."""
         if any(previous.name == item.name and previous.arguments == item.arguments for previous in state.tools):
-            logger.warning("Skipping duplicate tool call '%s'", item.name)
+            with private_content_redaction(turn.runtime_config) as private_content:
+                if private_content:
+                    logger.warning("Skipping duplicate private tool call; content redacted")
+                else:
+                    logger.warning("Skipping duplicate tool call '%s'", item.name)
             return
         if len(state.tools) >= MAX_TOOL_CALLS_PER_RESPONSE:
-            logger.warning(
-                "Skipping extra tool call '%s'; at most %d tool calls are allowed per response",
-                item.name,
-                MAX_TOOL_CALLS_PER_RESPONSE,
-            )
+            with private_content_redaction(turn.runtime_config) as private_content:
+                if private_content:
+                    logger.warning("Skipping extra private tool call; content redacted")
+                else:
+                    logger.warning(
+                        "Skipping extra tool call '%s'; at most %d tool calls are allowed per response",
+                        item.name,
+                        MAX_TOOL_CALLS_PER_RESPONSE,
+                    )
             return
         state.tools.append(item)
         fc_item = RealtimeConversationItemFunctionCall(
@@ -325,15 +367,18 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         if self._generation_is_stale(turn.gen) or not self._turn_output_allowed(turn.turn_id, turn.turn_revision):
             logger.info("LLM generation cancelled (stale speculative turn)")
             return
-        if not is_out_of_band(turn.response):
-            # Flush assistant text accumulated before this call first (so history
-            # order matches what the client received), then persist the call —
-            # all before the chunk leaves for the client.
-            chat = turn.runtime_config.chat
-            for pending_item in state.pending:
-                chat.add_item(pending_item)
-            state.pending.clear()
-            chat.add_item(fc_item)
+        with turn.runtime_config.transcript_barrier_state_guard():
+            if turn.runtime_config.transcript_barrier_failed:
+                return
+            if not is_out_of_band(turn.response):
+                # Flush assistant text accumulated before this call first (so history
+                # order matches what the client received), then persist the call —
+                # all before the chunk leaves for the client.
+                chat = turn.runtime_config.chat
+                for pending_item in state.pending:
+                    chat.add_item(pending_item)
+                state.pending.clear()
+                chat.add_item(fc_item)
         yield self._chunk(turn, tools=[item])
 
     # ── consumption ─────────────────────────────────────────────────────────--
@@ -415,9 +460,17 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 if self._generation_is_stale(turn.gen):
                     logger.info("LLM generation cancelled (interruption)")
                 else:
-                    logger.debug(f"Clean text: {state.clean_text}")
+                    with private_content_redaction(turn.runtime_config) as private_content:
+                        if private_content:
+                            logger.debug("Generated text redacted (characters=%d)", len(state.clean_text))
+                        else:
+                            logger.debug("Clean text: %s", state.clean_text)
                     yield from _flush(sentence_batch)
-            logger.info(f"Tools: {state.tools}")
+            with private_content_redaction(turn.runtime_config) as private_content:
+                if private_content:
+                    logger.info("Generated tools redacted (count=%d)", len(state.tools))
+                else:
+                    logger.info("Tools: %s", state.tools)
 
     def _consume_nonstreaming(self, events: Iterator[ProviderEvent], state: _GenState, turn: _Turn) -> Iterator[LLMOut]:
         if self._generation_is_stale(turn.gen) or not self._turn_is_latest(turn.turn_id, turn.turn_revision):
@@ -445,8 +498,13 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     and self._turn_output_allowed(turn.turn_id, turn.turn_revision)
                 ):
                     yield self._chunk(turn, text=out)
-        logger.debug(f"Clean text: {state.clean_text}")
-        logger.info(f"Tools: {state.tools}")
+        with private_content_redaction(turn.runtime_config) as private_content:
+            if private_content:
+                logger.debug("Generated text redacted (characters=%d)", len(state.clean_text))
+                logger.info("Generated tools redacted (count=%d)", len(state.tools))
+            else:
+                logger.debug("Clean text: %s", state.clean_text)
+                logger.info("Tools: %s", state.tools)
 
     # ── orchestration ─────────────────────────────────────────────────────────
 
@@ -475,7 +533,10 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             if error_message is None:
                 api_response = self._request(api_input, optional_kwargs)
             if api_response is not None:
-                events = self._iter_events(api_response)
+                events = self._iter_events(
+                    api_response,
+                    redact_private_content=turn.runtime_config,
+                )
                 if self.stream:
                     yield from self._consume_streaming(events, state, turn)
                 else:
@@ -501,9 +562,17 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             # the error and fall through to the EndOfResponse below. Without this the
             # exception would escape process() and no EndOfResponse would be emitted,
             # leaving st.in_response stuck and locking every subsequent response.
-            logger.exception("LLM generation failed; ending the current response")
-            if error_message is None:
-                error_message = f"Language model generation failed: {exc}"
+            with private_content_redaction(turn.runtime_config) as private_content:
+                if private_content:
+                    logger.error("LLM generation failed; private content redacted")
+                else:
+                    logger.exception("LLM generation failed; ending the current response")
+                if error_message is None:
+                    error_message = (
+                        "Language model generation failed in private transcript mode."
+                        if private_content
+                        else f"Language model generation failed: {exc}"
+                    )
         finally:
             if api_response is not None and hasattr(api_response, "close"):
                 try:
@@ -519,12 +588,14 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             # Out-of-band responses emit output and usage but never write back to the
             # default conversation (their context was a throwaway chat).
             if not is_out_of_band(turn.response):
-                # Tool calls (and any assistant text preceding them) were already
-                # written eagerly in _record_tool_call; only trailing items remain.
-                for item in state.pending:
-                    original_chat.add_item(item)
-                original_chat.strip_images(consumed_image_ids)
-                original_chat.trim_if_needed(self.compactor)
+                with turn.runtime_config.transcript_barrier_state_guard():
+                    if not turn.runtime_config.transcript_barrier_failed:
+                        # Tool calls (and any assistant text preceding them) were already
+                        # written eagerly in _record_tool_call; only trailing items remain.
+                        for item in state.pending:
+                            original_chat.add_item(item)
+                        original_chat.strip_images(consumed_image_ids)
+                        original_chat.trim_if_needed(self.compactor)
             if state.input_tokens or state.output_tokens:
                 yield TokenUsage(
                     input_tokens=state.input_tokens,
@@ -532,9 +603,15 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     turn_id=turn.turn_id,
                     turn_revision=turn.turn_revision,
                 )
-        yield EndOfResponse(
-            turn_id=turn.turn_id, turn_revision=turn.turn_revision, cancel_generation=turn.gen, error=error_message
-        )
+        with private_content_redaction(turn.runtime_config) as private_content:
+            if private_content and error_message is not None:
+                error_message = "Language model generation failed in private transcript mode."
+            yield EndOfResponse(
+                turn_id=turn.turn_id,
+                turn_revision=turn.turn_revision,
+                cancel_generation=turn.gen,
+                error=error_message,
+            )
 
     def process(self, request: LLMIn) -> Iterator[LLMOut]:
         """Process a language model request and yield LLMResponseChunks."""
@@ -543,6 +620,19 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         turn_id = request.turn_id
         turn_revision = request.turn_revision
         speech_stopped_at_s = request.speech_stopped_at_s
+        request_generation = request.cancel_generation
+        if (
+            request_generation is not None
+            and self.cancel_scope is not None
+            and self.cancel_scope.is_stale(request_generation)
+        ):
+            logger.info("Skipping cancelled LLM request before provider execution")
+            yield EndOfResponse(
+                turn_id=turn_id,
+                turn_revision=turn_revision,
+                cancel_generation=request_generation,
+            )
+            return
         if not self._turn_is_latest(turn_id, turn_revision):
             logger.info("Skipping stale LLM request for turn=%s rev=%s", turn_id, turn_revision)
             yield EndOfResponse(turn_id=turn_id, turn_revision=turn_revision)
@@ -553,8 +643,18 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             try:
                 active_chat = build_active_chat(original_chat, response)
             except ChatItemError as exc:
-                logger.info("Out-of-band response rejected: %s", exc)
-                yield EndOfResponse(turn_id=turn_id, turn_revision=turn_revision, error=str(exc))
+                with private_content_redaction(runtime_config) as private_content:
+                    if private_content:
+                        error_message = "Private out-of-band response rejected."
+                        logger.info("Out-of-band response rejected; private content redacted")
+                    else:
+                        error_message = str(exc)
+                        logger.info("Out-of-band response rejected: %s", error_message)
+                    yield EndOfResponse(
+                        turn_id=turn_id,
+                        turn_revision=turn_revision,
+                        error=error_message,
+                    )
                 return
         else:
             active_chat = original_chat.copy()
@@ -577,7 +677,9 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         # CancelScope.is_stale(gen) is checked when the stream iterator advances; a
         # blocked read inside httpx cannot be aborted by cancel_scope.cancel() from
         # the websocket router. Mitigations: request_timeout_s / ReadTimeout.
-        gen = self.cancel_scope.generation if self.cancel_scope else None
+        gen = request_generation
+        if gen is None and self.cancel_scope is not None:
+            gen = self.cancel_scope.generation
 
         turn = _Turn(
             language_code=language_code,
@@ -589,7 +691,21 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             speech_stopped_at_s=speech_stopped_at_s,
             wants_audio=wants_audio,
         )
-        yield from self._generate(active_chat, original_chat, turn, optional_kwargs)
+        if self.cancel_scope is None:
+            yield from self._generate(active_chat, original_chat, turn, optional_kwargs)
+            return
+
+        with self.cancel_scope.response_admission(gen) as (admitted, admitted_generation):
+            turn.gen = admitted_generation
+            if not admitted:
+                logger.info("Skipping cancelled LLM request before provider execution")
+                yield EndOfResponse(
+                    turn_id=turn_id,
+                    turn_revision=turn_revision,
+                    cancel_generation=admitted_generation,
+                )
+                return
+            yield from self._generate(active_chat, original_chat, turn, optional_kwargs)
 
     @property
     def timing_log_level(self) -> int:

@@ -8,6 +8,7 @@ old tests) so there is no cross-test state.
 
 import asyncio
 import base64
+import logging
 import time
 from queue import Empty, Queue
 from threading import Event as ThreadingEvent
@@ -22,7 +23,12 @@ from speech_to_speech.api.openai_realtime.service import CHUNK_SIZE_BYTES, Realt
 from speech_to_speech.api.openai_realtime.websocket_router import create_app
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.control import SESSION_END, PipelineControlMessage, is_control_message
-from speech_to_speech.pipeline.events import AssistantTextEvent, SpeechStartedEvent, TokenUsageEvent
+from speech_to_speech.pipeline.events import (
+    AssistantTextEvent,
+    SpeechStartedEvent,
+    TokenUsageEvent,
+    TranscriptBarrierCompletedEvent,
+)
 from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, PIPELINE_END, AudioOutput
 
 # ---------------------------------------------------------------------------
@@ -55,16 +61,18 @@ def setup():
     text_prompt_queue: Queue = Queue()
     should_listen = ThreadingEvent()
     should_listen.set()
+    cancel_scope = CancelScope()
     service = RealtimeService(
         text_prompt_queue=text_prompt_queue,
         should_listen=should_listen,
+        cancel_scope=cancel_scope,
     )
+    assert service.verify_cancel_scope_wiring(cancel_scope, cancel_scope)
     input_queue: Queue = Queue()
     output_queue: Queue = Queue()
     text_output_queue: Queue = Queue()
     stop_event = ThreadingEvent()
     response_playing = ThreadingEvent()
-    cancel_scope = CancelScope()
     unit = PipelineUnit(
         index=0,
         service=service,
@@ -118,9 +126,28 @@ class _FakeWebSocket:
 
     def __init__(self):
         self.sent: list[dict] = []
+        self.scope: dict[str, object] = {}
 
     async def send_json(self, payload: dict) -> None:
         self.sent.append(payload)
+
+
+def test_private_websocket_transport_exception_is_content_free(caplog):
+    canary = "PRIVATE_WEBSOCKET_TRANSPORT_CANARY"
+    websocket = _FakeWebSocket()
+    router_module._mark_websocket_private(websocket)
+
+    async def fail(_payload: dict) -> None:
+        raise RuntimeError(canary)
+
+    websocket.send_json = fail
+    event = router_module.build_error_event("fixed", error_type="fixed")
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(router_module._send_event(websocket, event))
+
+    assert canary not in caplog.text
+    assert "Failed to send private event to client; content redacted" in caplog.text
 
 
 # ===================================================================
@@ -193,6 +220,501 @@ class TestClientEventDispatch:
                 time.sleep(0.1)
                 cid = service.connection_ids[0]
                 assert service._state(cid).runtime_config.session.audio.output.voice == "coral"
+
+    def test_private_transcript_barrier_handshake_is_exact_and_acknowledged(self, setup):
+        app, service, *_ = setup
+        nonce = "ab" * 32
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "realtime",
+                            "reachy_private_transcript_barrier": {"version": 1, "nonce": nonce},
+                        },
+                    }
+                )
+
+                ready = ws.receive_json()
+                assert ready == {
+                    "type": "reachy.transcript_barrier.ready",
+                    "event_id": ready["event_id"],
+                    "version": 1,
+                    "nonce": nonce,
+                }
+                assert service.transcript_barrier_enabled() is True
+
+    def test_private_transcript_barrier_malformed_or_duplicate_handshake_fails_closed(self, setup):
+        app, service, *_ = setup
+        nonce = "cd" * 32
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "realtime",
+                            "reachy_private_transcript_barrier": {"version": 1, "nonce": nonce},
+                        },
+                    }
+                )
+                assert ws.receive_json()["type"] == "reachy.transcript_barrier.ready"
+
+                ws.send_json(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "realtime",
+                            "reachy_private_transcript_barrier": {"version": 1, "nonce": nonce},
+                        },
+                    }
+                )
+                error = ws.receive_json()
+                assert error["type"] == "error"
+                assert error["error"]["type"] == "invalid_transcript_barrier"
+                cid = service.connection_ids[0]
+                assert service.transcript_barrier_failed(cid) is True
+
+    def test_malformed_first_private_handshake_is_redacted_poisoned_and_closed(
+        self,
+        setup,
+        caplog,
+    ):
+        app, service, input_queue, *_ = setup
+        nonce = "c1" * 32
+        canary = "PRIVATE_INVALID_ACTIVATION_MODEL_CANARY"
+        with caplog.at_level(logging.ERROR):
+            with TestClient(app) as client:
+                with client.websocket_connect("/v1/realtime") as ws:
+                    ws.receive_json()
+                    ws.send_json(
+                        {
+                            "type": "session.update",
+                            "session": {
+                                "type": "realtime",
+                                "model": {"private": canary},
+                                "reachy_private_transcript_barrier": {
+                                    "version": 1,
+                                    "nonce": nonce,
+                                },
+                            },
+                        }
+                    )
+                    error = ws.receive_json()
+                    conn_id = service.connection_ids[0]
+                    assert service.transcript_barrier_failed(conn_id)
+
+        assert error["error"]["type"] == "invalid_transcript_barrier"
+        assert error["error"]["message"] == "Private transcript barrier protocol violation."
+        assert canary not in str(error)
+        assert canary not in caplog.text
+        assert not any(isinstance(item, tuple) for item in tuple(input_queue.queue))
+
+    def test_private_activation_cannot_return_before_ready_and_admit_later_audio(
+        self,
+        setup,
+        caplog,
+    ):
+        app, service, input_queue, *_ = setup
+        canary = "PRIVATE_TRANSCRIPTION_ACTIVATION_MODEL_CANARY"
+        with caplog.at_level(logging.INFO):
+            with TestClient(app) as client:
+                with client.websocket_connect("/v1/realtime") as ws:
+                    ws.receive_json()
+                    ws.send_json(
+                        {
+                            "type": "session.update",
+                            "session": {
+                                "type": "transcription",
+                                "model": canary,
+                                "reachy_private_transcript_barrier": {
+                                    "version": 1,
+                                    "nonce": "c4" * 32,
+                                },
+                            },
+                        }
+                    )
+                    error = ws.receive_json()
+                    conn_id = service.connection_ids[0]
+
+                    assert error["error"]["type"] == "invalid_transcript_barrier"
+                    assert error["error"]["message"] == ("Private transcript barrier protocol violation.")
+                    assert service.transcript_barrier_failed(conn_id)
+
+        assert canary not in caplog.text
+        assert canary not in str(error)
+        assert not any(isinstance(item, tuple) for item in tuple(input_queue.queue))
+
+    def test_private_route_and_send_loop_exceptions_are_content_free(
+        self,
+        setup,
+        monkeypatch,
+        caplog,
+    ):
+        app, service, _input_queue, _output_queue, text_output_queue, *_ = setup
+        nonce = "c2" * 32
+        route_canary = "PRIVATE_ROUTE_FAILURE_CANARY"
+        send_canary = "PRIVATE_SEND_LOOP_FAILURE_CANARY"
+        with caplog.at_level(logging.ERROR):
+            with TestClient(app) as client:
+                with client.websocket_connect("/v1/realtime") as ws:
+                    ws.receive_json()
+                    ws.send_json(
+                        {
+                            "type": "session.update",
+                            "session": {
+                                "type": "realtime",
+                                "reachy_private_transcript_barrier": {
+                                    "version": 1,
+                                    "nonce": nonce,
+                                },
+                            },
+                        }
+                    )
+                    assert ws.receive_json()["type"] == "reachy.transcript_barrier.ready"
+
+                    def fail_route(*_args, **_kwargs):
+                        raise RuntimeError(route_canary)
+
+                    monkeypatch.setattr(service, "handle_audio_append", fail_route)
+                    audio_b64 = base64.b64encode(_pcm_bytes(512)).decode("ascii")
+                    ws.send_json({"type": "input_audio_buffer.append", "audio": audio_b64})
+
+                # Use a fresh session for the separately-owned send-loop exception.
+                _simulate_session_end_drain(setup[2], setup[3])
+                deadline = time.monotonic() + 1.0
+                while service.connection_ids and time.monotonic() < deadline:
+                    time.sleep(0.01)
+
+                with client.websocket_connect("/v1/realtime") as ws:
+                    ws.receive_json()
+                    ws.send_json(
+                        {
+                            "type": "session.update",
+                            "session": {
+                                "type": "realtime",
+                                "reachy_private_transcript_barrier": {
+                                    "version": 1,
+                                    "nonce": "c3" * 32,
+                                },
+                            },
+                        }
+                    )
+                    assert ws.receive_json()["type"] == "reachy.transcript_barrier.ready"
+
+                    def fail_send(*_args, **_kwargs):
+                        raise RuntimeError(send_canary)
+
+                    monkeypatch.setattr(service, "dispatch_pipeline_event", fail_send)
+                    text_output_queue.put(AssistantTextEvent(text="private"))
+                    time.sleep(0.1)
+
+        assert route_canary not in caplog.text
+        assert send_canary not in caplog.text
+        assert "Private client pipeline error; content redacted" in caplog.text
+        assert "Private pipeline send loop error; content redacted" in caplog.text
+
+    def test_private_handshake_redacts_malformed_client_event_on_wire(self, setup, caplog):
+        app, _service, *_ = setup
+        nonce = "ce" * 32
+        canary = "PII_JOSH"
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "realtime",
+                            "reachy_private_transcript_barrier": {"version": 1, "nonce": nonce},
+                        },
+                    }
+                )
+                assert ws.receive_json()["type"] == "reachy.transcript_barrier.ready"
+
+                with caplog.at_level(logging.ERROR):
+                    ws.send_json(
+                        {
+                            "type": "conversation.item.create",
+                            "item": {
+                                "id": canary,
+                                "type": "message",
+                                "role": "invalid",
+                                "content": [{"type": "input_text", "text": canary}],
+                            },
+                        }
+                    )
+                    error = ws.receive_json()
+
+        assert error["type"] == "error"
+        assert error["error"]["message"] == "Unknown or invalid private client event."
+        assert canary not in str(error)
+        assert canary not in caplog.text
+
+    @pytest.mark.parametrize(
+        ("event", "error_type"),
+        [
+            (
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "id": "PRIVATE_SEMANTIC_CONV_CANARY",
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "private"}],
+                    },
+                },
+                "invalid_conversation_item",
+            ),
+            (
+                {
+                    "type": "response.create",
+                    "response": {
+                        "input": [
+                            {
+                                "id": "PRIVATE_SEMANTIC_RESP_CANARY",
+                                "type": "message",
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": "private"}],
+                            }
+                        ]
+                    },
+                },
+                "invalid_input_item",
+            ),
+        ],
+    )
+    def test_private_handshake_redacts_semantic_client_errors_on_wire(self, setup, event, error_type):
+        app, _service, *_ = setup
+        nonce = "cf" * 32
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "realtime",
+                            "reachy_private_transcript_barrier": {"version": 1, "nonce": nonce},
+                        },
+                    }
+                )
+                assert ws.receive_json()["type"] == "reachy.transcript_barrier.ready"
+
+                ws.send_json(event)
+                error = ws.receive_json()
+
+        assert error["type"] == "error"
+        assert error["error"] == {
+            "code": None,
+            "event_id": None,
+            "message": "Invalid private client event.",
+            "param": None,
+            "type": error_type,
+        }
+        assert "CANARY" not in str(error)
+
+    def test_private_response_input_semantic_failure_is_atomic(self, setup):
+        app, service, *_ = setup
+        nonce = "d0" * 32
+        canary = "PRIVATE_REJECTED_PREFIX_CANARY"
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "realtime",
+                            "reachy_private_transcript_barrier": {"version": 1, "nonce": nonce},
+                        },
+                    }
+                )
+                assert ws.receive_json()["type"] == "reachy.transcript_barrier.ready"
+
+                ws.send_json(
+                    {
+                        "type": "response.create",
+                        "response": {
+                            "input": [
+                                {
+                                    "id": "msg_private_prefix",
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [{"type": "input_text", "text": canary}],
+                                },
+                                {
+                                    "id": "PRIVATE_INVALID_SECOND_ITEM",
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [{"type": "input_text", "text": "invalid"}],
+                                },
+                            ]
+                        },
+                    }
+                )
+                error = ws.receive_json()
+                state = service._state(service.connection_ids[0])
+
+                assert error["error"]["message"] == "Invalid private client event."
+                assert "CANARY" not in str(error)
+                assert state.runtime_config.chat.buffer == []
+                assert canary not in str(state.runtime_config.chat.to_responses_api_chat())
+
+    def test_private_session_updates_redact_model_values(self, setup, caplog):
+        app, _service, *_ = setup
+        nonce = "d1" * 32
+        activation_canary = "PRIVATE_ACTIVATION_MODEL_CANARY"
+        update_canary = "PRIVATE_POST_HANDSHAKE_MODEL_CANARY"
+        with caplog.at_level(logging.INFO):
+            with TestClient(app) as client:
+                with client.websocket_connect("/v1/realtime") as ws:
+                    ws.receive_json()
+                    ws.send_json(
+                        {
+                            "type": "session.update",
+                            "session": {
+                                "type": "realtime",
+                                "model": activation_canary,
+                                "reachy_private_transcript_barrier": {"version": 1, "nonce": nonce},
+                            },
+                        }
+                    )
+                    assert ws.receive_json()["type"] == "reachy.transcript_barrier.ready"
+                    ws.send_json(
+                        {
+                            "type": "session.update",
+                            "session": {"type": "realtime", "model": update_canary},
+                        }
+                    )
+                    time.sleep(0.01)
+
+        assert activation_canary not in caplog.text
+        assert update_canary not in caplog.text
+        assert caplog.text.count("Private session model updated; content redacted") == 2
+
+    def test_private_transcript_barrier_exact_resolution_round_trip(self, setup):
+        app, service, _, _, text_output_queue, *_ = setup
+        nonce = "ef" * 32
+        transcript = "Who am I?"
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "realtime",
+                            "reachy_private_transcript_barrier": {"version": 1, "nonce": nonce},
+                        },
+                    }
+                )
+                assert ws.receive_json()["type"] == "reachy.transcript_barrier.ready"
+
+                text_output_queue.put(TranscriptBarrierCompletedEvent(transcript=transcript))
+                completed = ws.receive_json()
+                assert completed["type"] == "reachy.transcript_barrier.completed"
+                assert completed["transcript"] == transcript
+
+                ws.send_json(
+                    {
+                        "type": "reachy.transcript_barrier.resolve",
+                        "version": 1,
+                        "nonce": nonce,
+                        "sequence": completed["sequence"],
+                        "input_item_id": completed["item_id"],
+                        "action": "accept",
+                        "item": {
+                            "id": "msg_barrier_1",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": transcript}],
+                        },
+                    }
+                )
+                assert ws.receive_json()["type"] == "conversation.item.created"
+                resolved = ws.receive_json()
+                assert resolved["type"] == "reachy.transcript_barrier.resolved"
+                assert resolved["action"] == "accepted"
+                assert resolved["replacement_item_id"] == "msg_barrier_1"
+                cid = service.connection_ids[0]
+                assert service._state(cid).runtime_config.chat.buffer[-1].content[0].text == transcript
+
+    def test_private_transcript_barrier_invalid_resolution_closes_without_echo(self, setup):
+        app, service, _, _, text_output_queue, *_ = setup
+        nonce = "01" * 32
+        canary = "PRIVATE_TRANSCRIPT_CANARY"
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "realtime",
+                            "reachy_private_transcript_barrier": {"version": 1, "nonce": nonce},
+                        },
+                    }
+                )
+                ws.receive_json()
+                text_output_queue.put(TranscriptBarrierCompletedEvent(transcript=canary))
+                completed = ws.receive_json()
+
+                ws.send_json(
+                    {
+                        "type": "reachy.transcript_barrier.resolve",
+                        "version": 1,
+                        "nonce": nonce,
+                        "sequence": completed["sequence"],
+                        "input_item_id": completed["item_id"],
+                        "action": "accept",
+                        "item": {
+                            "id": "invalid-id",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": canary}],
+                        },
+                    }
+                )
+                error = ws.receive_json()
+                assert error["type"] == "error"
+                assert canary not in str(error)
+                cid = service.connection_ids[0]
+                cfg = service._state(cid).runtime_config
+                assert cfg.transcript_barrier_failed is True
+                assert cfg.transcript_barrier_pending_transcript is None
+
+    def test_disconnect_scrubs_pending_private_transcript_before_handler_drain(self, setup):
+        app, service, _, _, text_output_queue, *_ = setup
+        nonce = "02" * 32
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "realtime",
+                            "reachy_private_transcript_barrier": {"version": 1, "nonce": nonce},
+                        },
+                    }
+                )
+                ws.receive_json()
+                text_output_queue.put(TranscriptBarrierCompletedEvent(transcript="DISCONNECT_PRIVATE_CANARY"))
+                assert ws.receive_json()["type"] == "reachy.transcript_barrier.completed"
+                conn_id = service.connection_ids[0]
+                cfg = service._state(conn_id).runtime_config
+                assert cfg.transcript_barrier_pending is True
+
+            # The handler chain has not consumed SESSION_END in this fixture,
+            # so unregister is deliberately still pending. Scrubbing is not.
+            assert conn_id in service.connection_ids
+            assert cfg.transcript_barrier_pending is False
+            assert cfg.transcript_barrier_pending_transcript is None
+            assert cfg.transcript_barrier_failed is True
 
     def test_conversation_item_create_returns_events(self, setup):
         app, *_ = setup
@@ -716,10 +1238,17 @@ def _make_unit(index: int) -> PipelineUnit:
     text_prompt_queue: Queue = Queue()
     should_listen = ThreadingEvent()
     should_listen.set()
+    cancel_scope = CancelScope()
+    service = RealtimeService(
+        text_prompt_queue=text_prompt_queue,
+        should_listen=should_listen,
+        cancel_scope=cancel_scope,
+    )
+    assert service.verify_cancel_scope_wiring(cancel_scope, cancel_scope)
     return PipelineUnit(
         index=index,
-        service=RealtimeService(text_prompt_queue=text_prompt_queue, should_listen=should_listen),
-        cancel_scope=CancelScope(),
+        service=service,
+        cancel_scope=cancel_scope,
         should_listen=should_listen,
         response_playing=ThreadingEvent(),
         input_queue=Queue(),

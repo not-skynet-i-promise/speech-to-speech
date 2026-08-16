@@ -86,6 +86,63 @@ should begin.
 | `response.function_call_arguments.done` | Tool call with `call_id`, `name`, and JSON `arguments`. |
 | `response.done` | Response finished (`completed`, `cancelled` with reason `turn_detected` or `client_cancelled`). |
 
+### Opt-in private transcript barrier
+
+Trusted local clients that must route a completed transcript before it enters
+ordinary model history can request the versioned `reachy` extension in their
+first `session.update`:
+
+```json
+{
+  "type": "session.update",
+  "session": {
+    "type": "realtime",
+    "reachy_private_transcript_barrier": {
+      "version": 1,
+      "nonce": "<64 lowercase hexadecimal characters>"
+    }
+  }
+}
+```
+
+The client must wait for an exact `reachy.transcript_barrier.ready` event with
+the same version and nonce before sending microphone audio. In this mode the
+server suppresses partial transcript events and transcript-content logs. A
+non-empty final is emitted only as `reachy.transcript_barrier.completed` and is
+held outside model history. While that final is pending, new audio,
+`conversation.item.create`, and `response.create` fail closed.
+
+The client must answer once with `reachy.transcript_barrier.resolve`, matching
+the explicitly supplied integer version, positive integer sequence, nonce, and
+input item ID; booleans, coercions, omitted fields, explicit nulls, and extra
+fields are rejected. `action="accept"` must include exactly
+one `msg_` user message whose sole `input_text` is byte-for-byte equal to the
+pending final and whose ID has not previously resolved a private final; the
+server then inserts that one message and acknowledges it as
+`accepted`. `action="discard"` includes no item and scrubs the final without a
+history entry. Empty or whitespace-only STT results produce a content-free
+`reachy.transcript_barrier.discarded` event and require no resolution.
+
+Any first `session.update` that contains the barrier field is privacy-sensitive
+even if another field makes the update invalid: it is logged content-free,
+poisons the barrier, and closes before audio is accepted. Malformed, duplicate,
+overlapping, stale, or mismatched later barrier events do the same. Pending
+transcript text is scrubbed on resolution, failure, and synchronously at
+disconnect before handler drain.
+Pending private input also freezes deferred history application and chat
+compaction until exact resolution. Privacy-mode exception and content logging
+remains sticky after poison until the session is unregistered, so draining work
+cannot downgrade into ordinary logging. This includes an activation rejected
+before `ready`: already queued audio and every later pipeline output remain
+private, are scrubbed or dropped, and cannot enter history or trigger a
+response while the connection closes. Parse-time and semantic client-event
+failures use content-free wire errors rather than echoing client-controlled
+values while that mode is active. Rejected multi-item in-band `response.input`
+batches retain no accepted prefix in history. Low-level tool-parser, provider,
+session-voice, WebSocket-route, and send-loop failures use the same sticky
+redaction boundary. Clients that do not request this extension keep the
+standard Realtime behavior described above.
+
 ---
 
 ## Tool Calling Design
@@ -180,7 +237,7 @@ Barge-in (user speaks while the assistant is playing audio) is handled cooperati
 
 `CancelScope` replaces the old two-signal pattern (`cancel_response` Event + `discard_stale_output` boolean) with a single object that manages:
 
-- **Generation counter** (`cancel_scope.generation`): pipeline threads (LLM, TTS) capture the current generation at the start of each response and check `cancel_scope.is_stale(gen)` on every streaming token. When `cancel()` is called, the generation increments and all prior generations become stale -- no timing games required.
+- **Generation counter** (`cancel_scope.generation`): each response request is stamped when it enters the LLM queue, and pipeline threads carry that generation through LLM and TTS while checking `cancel_scope.is_stale(gen)` on every streaming token. When `cancel()` is called, the generation increments, so both already-running work and a prior request dequeued only afterward are stale before provider execution -- no timing games required.
 - **Discard flag** (`cancel_scope.discarding`): set by `cancel()`, checked by the async `_send_loop` to drop output from superseded generations that arrives between `cancel()` and `response_done()`. Cleared by `response_done(generation)` (only when the sentinel's generation matches the discarded or current one -- sentinels from unrelated older generations are ignored), by `new_response()` on an explicit `response.create`, or by `reset()` on session claim/release.
 
 Pipeline output is **generation-tagged**: `AudioOutput` chunks and `AssistantTextEvent`s carry a `cancel_generation` field stamped by the handler that produced them. The send loop's `_generation_is_discardable` drops an item if its generation is stale, or if `discarding` is set and the item is not from the current generation. Output from the *current* generation always passes through, so a fresh response is never swallowed by a lingering discard window (e.g. a superseded speculative turn whose TTS never emitted a `__RESPONSE_DONE__` sentinel).
@@ -215,7 +272,7 @@ sequenceDiagram
 2. **`_send_loop` processes text events first** (priority over audio): translates `speech_started` into protocol events. If an active response was in progress, `RealtimeService.dispatch_pipeline_event` emits `response.done` with `status="cancelled"` and `reason="turn_detected"`; it first emits `response.output_audio.done` only when at least one audio delta was sent.
 3. **Cancel + queue flush**: if a response is active (`in_response`) *or* pending (`response_pending` -- accepted `response.create`, no audio yet), and interrupts are enabled (see step 4), the send loop calls `cancel_scope.cancel()` (increments generation, enables discard), clears `response_pending`, drains `output_queue` (preserving `__RESPONSE_DONE__` sentinels) and `text_output_queue` (preserving user-side events: `speech_stopped`, partial/completed transcriptions, token usage), then clears `response_playing`.
 4. **Interrupt gating**: the cancel only fires if the `SpeechStartedEvent.interrupt_response` flag is set *and* the session config allows it (`turn_detection.interrupt_response`, read via `RuntimeConfig.interrupt_response_enabled`, default true). When disabled, user speech during a response is transcribed but the response keeps playing.
-5. **LLM/TTS cancellation**: handlers capture `gen = cancel_scope.generation` at the start of each response and check `cancel_scope.is_stale(gen)` on every streaming token, aborting early when stale.
+5. **LLM/TTS cancellation**: each response carries the generation stamped when it entered the LLM queue. Immediately before local-model/provider execution, the LLM atomically admits only that exact generation and remains visible as active until its generator exits. A local Transformers worker that survives the bounded join retains a second activation lease until the thread actually exits, and every generation owns a distinct streamer/stopping criterion, so private-barrier activation cannot race past live work or reuse its token channel. Worker exceptions are caught before Python's default thread exception hook, redacted under the same live session guard, and reduced to one content-free generation failure while waking the matching streamer. LLM and TTS also check `cancel_scope.is_stale(gen)` on every streaming token and abort early when stale.
 6. **Discard guard**: while `cancel_scope.discarding` is True, the send loop drops audio chunks and assistant text whose `cancel_generation` is not current (see `_generation_is_discardable` above). The guard clears when a `__RESPONSE_DONE__` with a matching generation arrives (via `cancel_scope.response_done(gen)`), or when an explicit `response.create` starts a new response (`cancel_scope.new_response()`).
 7. **Client-initiated cancel**: `response.cancel` calls `cancel_scope.cancel()` (only if a response was active), flushes both queues with the same preservation rules, triggers `finish_response(status="cancelled", reason="client_cancelled")`, re-enables `should_listen`, and clears `response_playing`.
 8. **Spurious cancel safety**: if no response is active, `cancel_scope.cancel()` is not called, preventing the discard guard from being set without a `__RESPONSE_DONE__` to clear it.

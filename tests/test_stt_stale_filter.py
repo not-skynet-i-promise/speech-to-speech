@@ -64,6 +64,17 @@ def _handler(
     )
 
 
+def test_stt_handler_drops_queued_input_and_output_after_private_barrier_failure():
+    tracker = SpeculativeTurnTracker()
+    tracker.observe("turn_1", 0)
+    handler = _handler(tracker, Queue(), Queue())
+    handler.set_transcript_barrier_failed(lambda: True)
+
+    assert handler.should_process_input(_vad_audio()) is False
+    assert handler.should_emit_output(Transcription(text="private")) is False
+    assert handler.processed == []
+
+
 def test_stt_handler_drops_stale_queued_audio_without_processing():
     tracker = SpeculativeTurnTracker()
     tracker.observe("turn_1", 1)

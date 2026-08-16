@@ -8,6 +8,7 @@ functions (make_user_message, make_assistant_message, make_system_message).
 
 from __future__ import annotations
 
+import logging
 import threading
 
 import pytest
@@ -216,6 +217,32 @@ class TestAddItemEviction:
         chat.add_item(fc)
         assert fc.call_id is not None
         assert fc.call_id.startswith("call_")
+
+    def test_private_function_call_logs_hide_client_ids(self, caplog):
+        chat = Chat(size=5)
+        chat.enable_private_content_logging()
+        call_id = "call_PRIVATE_CHAT_LOG_CANARY"
+
+        with caplog.at_level(logging.DEBUG, logger="speech_to_speech.LLM.chat"):
+            chat.add_item(_fc(call_id))
+            chat.append_tool_output(call_id, _fco(call_id))
+
+        assert "PRIVATE_CHAT_LOG_CANARY" not in caplog.text
+        assert "content redacted" in caplog.text
+
+    def test_atomic_batch_restores_function_status_and_history_on_failure(self):
+        chat = Chat(size=5)
+        function_call = _fc("atomic")
+        chat.add_item(function_call)
+        invalid = _user("invalid")
+        invalid.id = "PRIVATE_INVALID_BATCH_ID"
+
+        with pytest.raises(ChatItemError):
+            chat.add_items_atomically([_fco("atomic"), invalid])
+
+        assert function_call.status is None
+        assert chat.buffer == []
+        assert chat._pending_tool_calls == {"call_atomic": function_call}
 
     def test_eviction_when_exceeding_size(self):
         chat = Chat(size=1)
@@ -804,6 +831,16 @@ class TestCopyAndReset:
         chat.reset()
         assert chat.size == 3
 
+    def test_reset_can_atomically_enter_private_suspended_state(self):
+        chat = Chat(size=3)
+        chat.add_item(_user("sensitive"))
+
+        chat.reset(private_content_logging=True, suspend_compaction=True)
+
+        assert chat.buffer == []
+        assert chat._private_content_logging is True
+        assert chat._compaction_suspended is True
+
 
 # ===================================================================
 # 10. TestStripImages
@@ -1153,6 +1190,47 @@ class TestCompaction:
 
         # Buffer was not spliced.
         assert chat.buffer == before
+
+    def test_suppress_inflight_compaction_preserves_buffer_and_allows_future_work(self):
+        chat = Chat(size=2)
+        gate = threading.Event()
+        started = threading.Event()
+        compactor = _make_stub_compactor(gate=gate, started=started)
+        for i in range(3):
+            chat.add_item(_user(f"u{i}"))
+            chat.add_item(_assistant(f"a{i}"))
+        chat.add_item(_user("u3"))
+        chat.trim_if_needed(compactor)
+        assert started.wait(timeout=2.0)
+
+        before = list(chat.buffer)
+        chat.suppress_inflight_compaction()
+        gate.set()
+        _wait_thread(chat)
+
+        assert chat.buffer == before
+        assert chat._shutdown.is_set() is False
+
+    def test_suspended_compaction_stays_frozen_until_explicit_resume(self):
+        chat = Chat(size=2)
+        started = threading.Event()
+
+        def compactor(_snapshot):
+            started.set()
+            return CompactionResult(user_summary="u", assistant_summary="a")
+
+        for i in range(4):
+            chat.add_item(_user(f"u{i}"))
+            chat.add_item(_assistant(f"a{i}"))
+
+        chat.suspend_compaction()
+        chat.trim_if_needed(compactor)
+        assert started.wait(timeout=0.05) is False
+
+        chat.resume_compaction()
+        chat.trim_if_needed(compactor)
+        assert started.wait(timeout=2.0) is True
+        _wait_thread(chat)
 
     def test_compactor_exception_leaves_buffer_unchanged(self):
         chat = Chat(size=2)

@@ -69,6 +69,25 @@ class TranscriptionCompletedEvent(PipelineEvent):
     speech_stopped_at_s: float | None = Field(default=None, exclude=True)
 
 
+class TranscriptBarrierCompletedEvent(PipelineEvent):
+    """Final transcript reserved for the private opt-in barrier path."""
+
+    type: Literal["transcript_barrier_completed"] = "transcript_barrier_completed"
+    transcript: str
+    language_code: Optional[str] = None
+    turn_id: str | None = None
+    turn_revision: int | None = None
+    speech_stopped_at_s: float | None = Field(default=None, exclude=True)
+
+
+class TranscriptBarrierDiscardedEvent(PipelineEvent):
+    """Content-free empty-final marker reserved for the barrier path."""
+
+    type: Literal["transcript_barrier_discarded"] = "transcript_barrier_discarded"
+    turn_id: str | None = None
+    turn_revision: int | None = None
+
+
 # ── LLM output events (LMOutputProcessor) ────────────────────────────
 
 

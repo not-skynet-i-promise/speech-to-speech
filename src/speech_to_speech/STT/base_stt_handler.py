@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 from collections import Counter, OrderedDict
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from time import perf_counter
-from typing import Any
+from typing import Any, Callable, Iterator
 
 from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.pipeline.handler_types import STTIn, STTOut
@@ -20,8 +21,81 @@ class BaseSTTHandler(BaseHandler[STTIn, STTOut]):
 
     speculative_turns: SpeculativeTurnTracker | None = None
     final_revision_settle_s: float = 0.0
+    _transcript_barrier_enabled: Callable[[], bool] = staticmethod(lambda: False)
+    _transcript_barrier_failed: Callable[[], bool] = staticmethod(lambda: False)
+    _transcript_barrier_state_guard: Callable[[], AbstractContextManager[tuple[bool, bool]]] | None = None
+
+    def set_transcript_barrier_enabled(self, enabled: Callable[[], bool]) -> None:
+        """Install the single-session content-redaction gate after construction."""
+        self._transcript_barrier_enabled = enabled
+
+    def set_transcript_barrier_failed(self, failed: Callable[[], bool]) -> None:
+        """Install the single-session fail-closed output gate."""
+        self._transcript_barrier_failed = failed
+
+    def set_transcript_barrier_state_guard(
+        self,
+        state_guard: Callable[[], AbstractContextManager[tuple[bool, bool]]],
+    ) -> None:
+        """Install the live barrier lock used around raw-content side effects."""
+        self._transcript_barrier_state_guard = state_guard
+
+    @property
+    def transcript_barrier_enabled(self) -> bool:
+        return self._transcript_barrier_enabled()
+
+    @contextmanager
+    def _transcript_barrier_state(self) -> Iterator[tuple[bool, bool]]:
+        """Read one fail-closed state while holding the live barrier lock."""
+        stack = ExitStack()
+        try:
+            if self._transcript_barrier_state_guard is None:
+                state = (self._transcript_barrier_enabled(), self._transcript_barrier_failed())
+            else:
+                state = stack.enter_context(self._transcript_barrier_state_guard())
+            if (
+                not isinstance(state, tuple)
+                or len(state) != 2
+                or type(state[0]) is not bool
+                or type(state[1]) is not bool
+            ):
+                raise ValueError("invalid transcript barrier state")
+        except Exception:
+            try:
+                stack.close()
+            except Exception:
+                pass
+            logger.error("STT transcript barrier state unavailable; private content redacted")
+            yield True, True
+            return
+
+        with stack:
+            yield state
+
+    @contextmanager
+    def transcript_content_allowed(self) -> Iterator[bool]:
+        """Hold the live barrier lock from policy selection through one content sink."""
+        with self._transcript_barrier_state() as (private, failed):
+            yield not private and not failed
+
+    @contextmanager
+    def _input_private_logging_guard(self, item: object) -> Iterator[bool]:
+        """Use the same live state for generic STT exception and cleanup logs."""
+        if self._transcript_barrier_state_guard is None:
+            with super()._input_private_logging_guard(item) as private:
+                try:
+                    failed = self._transcript_barrier_failed()
+                except Exception:
+                    failed = True
+                yield private or failed
+            return
+        with self._transcript_barrier_state() as (private, failed):
+            yield self._private_content_logging or private or failed
 
     def should_process_input(self, item: STTIn) -> bool:
+        if self._transcript_barrier_failed():
+            logger.debug("Dropping STT input after private barrier failure")
+            return False
         mode = getattr(item, "mode", None)
         turn_id = getattr(item, "turn_id", None)
         turn_revision = getattr(item, "turn_revision", None)
@@ -61,6 +135,9 @@ class BaseSTTHandler(BaseHandler[STTIn, STTOut]):
         return True
 
     def should_emit_output(self, output: STTOut) -> bool:
+        if self._transcript_barrier_failed():
+            logger.debug("Dropping STT output after private barrier failure")
+            return False
         if isinstance(output, PartialTranscription) and self._is_completed_final_revision(output):
             self._log_stale_turn_item(output, "output-after-final")
             return False

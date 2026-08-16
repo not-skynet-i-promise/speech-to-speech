@@ -118,7 +118,15 @@ class LMOutputProcessor(BaseHandler[LLMOut, TTSIn]):
             logger.debug("Dropping stale LLM chunk for turn=%s rev=%s", lm_output.turn_id, lm_output.turn_revision)
             return
 
-        logger.debug("LM processor: parts=%s", lm_output.parts)
+        runtime_config = lm_output.runtime_config
+        with self._runtime_config_private_logging_guard(runtime_config) as private_barrier:
+            if runtime_config is not None and runtime_config.transcript_barrier_failed:
+                logger.debug("Dropping LM processor content after private barrier failure")
+                return
+            if private_barrier:
+                logger.debug("LM processor content redacted (parts=%d)", len(lm_output.parts))
+            else:
+                logger.debug("LM processor: parts=%s", lm_output.parts)
 
         if self.text_output_queue is not None:
             event = AssistantTextEvent(
@@ -127,24 +135,50 @@ class LMOutputProcessor(BaseHandler[LLMOut, TTSIn]):
                 turn_revision=lm_output.turn_revision,
                 cancel_generation=lm_output.cancel_generation,
             )
-            if lm_output.tools:
-                logger.info(f"Sending to clients: text='{lm_output.text}', tools={[t.name for t in lm_output.tools]}")
-            else:
-                logger.debug(f"Sending to clients: text='{lm_output.text}' (no tools)")
-            self.text_output_queue.put(event)
+            with self._runtime_config_private_logging_guard(runtime_config) as private_barrier:
+                if runtime_config is not None and runtime_config.transcript_barrier_failed:
+                    logger.debug("Dropping client text after private barrier failure")
+                    return
+                if private_barrier:
+                    logger.debug(
+                        "Sending redacted content to client (parts=%d, tools=%d)",
+                        len(lm_output.parts),
+                        len(lm_output.tools),
+                    )
+                elif lm_output.tools:
+                    logger.info(
+                        "Sending to clients: text='%s', tools=%s",
+                        lm_output.text,
+                        [tool.name for tool in lm_output.tools],
+                    )
+                else:
+                    logger.debug("Sending to clients: text='%s' (no tools)", lm_output.text)
+                self.text_output_queue.put(event)
 
         if response_wants_audio(lm_output.response):
             for part in lm_output.parts:
                 if not isinstance(part, AssistantTextPart) or not part.text:
                     continue
-                logger.debug("Forwarding to TTS: '%s'", part.text)
-                yield TTSInput(
-                    text=part.text,
-                    language_code=lm_output.language_code,
-                    runtime_config=lm_output.runtime_config,
-                    response=lm_output.response,
-                    turn_id=lm_output.turn_id,
-                    turn_revision=lm_output.turn_revision,
-                    speech_stopped_at_s=lm_output.speech_stopped_at_s,
-                    cancel_generation=lm_output.cancel_generation,
-                )
+                pending_tts_input: TTSInput | None = None
+                with self._runtime_config_private_logging_guard(runtime_config) as private_barrier:
+                    if runtime_config is not None and runtime_config.transcript_barrier_failed:
+                        logger.debug("Dropping TTS text after private barrier failure")
+                        return
+                    if private_barrier:
+                        logger.debug("Forwarding redacted content to TTS (characters=%d)", len(part.text))
+                    else:
+                        logger.debug("Forwarding to TTS: '%s'", part.text)
+                    pending_tts_input = TTSInput(
+                        text=part.text,
+                        language_code=lm_output.language_code,
+                        runtime_config=lm_output.runtime_config,
+                        response=lm_output.response,
+                        turn_id=lm_output.turn_id,
+                        turn_revision=lm_output.turn_revision,
+                        speech_stopped_at_s=lm_output.speech_stopped_at_s,
+                        cancel_generation=lm_output.cancel_generation,
+                    )
+                # Never suspend a generator while holding the shared barrier
+                # lock. BaseHandler and the downstream TTS handler both
+                # re-check the same RuntimeConfig before queueing or speaking.
+                yield pending_tts_input

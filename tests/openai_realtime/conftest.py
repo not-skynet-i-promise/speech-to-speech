@@ -10,6 +10,7 @@ from openai.types.realtime.realtime_audio_formats import AudioPCM
 
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.api.openai_realtime.service import RealtimeService
+from speech_to_speech.pipeline.cancel_scope import CancelScope
 
 
 def _session_16k() -> RealtimeSessionCreateRequest:
@@ -44,11 +45,18 @@ def should_listen():
 
 
 @pytest.fixture
-def service(runtime_config, text_prompt_queue, should_listen):
+def cancel_scope():
+    return CancelScope()
+
+
+@pytest.fixture
+def service(runtime_config, text_prompt_queue, should_listen, cancel_scope):
     svc = RealtimeService(
         text_prompt_queue=text_prompt_queue,
         should_listen=should_listen,
+        cancel_scope=cancel_scope,
     )
+    assert svc.verify_cancel_scope_wiring(cancel_scope, cancel_scope)
     return svc
 
 

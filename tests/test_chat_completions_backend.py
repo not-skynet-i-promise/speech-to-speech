@@ -10,10 +10,12 @@ Run with pytest, or standalone:  python tests/test_chat_completions_backend.py
 from __future__ import annotations
 
 import json
+import logging
 import queue
 import threading
 from types import SimpleNamespace
 
+from openai.types.realtime import ResponseCreatedEvent, ResponseCreateEvent, SessionUpdateEvent
 from openai.types.realtime.conversation_item import (
     RealtimeConversationItemFunctionCall,
     RealtimeConversationItemFunctionCallOutput,
@@ -27,12 +29,15 @@ from openai.types.responses import ResponseFunctionToolCall
 import speech_to_speech.LLM.base_openai_compatible_language_model as base_mod
 import speech_to_speech.LLM.chat_completions_language_model as ccm
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
+from speech_to_speech.api.openai_realtime.service import RealtimeService
+from speech_to_speech.api.openai_realtime.transcript_barrier import TranscriptBarrierReadyEvent
 from speech_to_speech.LLM.chat import Chat, make_user_message
 from speech_to_speech.LLM.chat_completions_language_model import (
     ChatCompletionsApiModelHandler,
     _to_chat_tool_choice,
     _to_chat_tools,
 )
+from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.messages import (
     EndOfResponse,
     GenerateResponseRequest,
@@ -54,6 +59,18 @@ class _FakeStream:
 
     def close(self):
         pass
+
+
+class _PoisoningStream(_FakeStream):
+    """Flip the barrier after provider iteration but before normalized events commit."""
+
+    def __init__(self, chunks, runtime_config: RuntimeConfig):
+        super().__init__(chunks)
+        self._runtime_config = runtime_config
+
+    def __iter__(self):
+        yield from self._chunks
+        self._runtime_config.transcript_barrier_failed = True
 
 
 # Make the handler's ``isinstance(resp, Stream)`` check recognise our fake as a
@@ -90,7 +107,7 @@ class _FakeClient:
         return self
 
 
-def _make_handler(stream=True):
+def _make_handler(stream=True, *, cancel_scope: CancelScope | None = None):
     """Build a handler whose warmup hits the fake client (no network)."""
     orig_openai = base_mod.OpenAI
     base_mod.OpenAI = _FakeClient
@@ -106,6 +123,7 @@ def _make_handler(stream=True):
                 stream=stream,
                 disable_thinking=True,
                 compact_history=False,
+                cancel_scope=cancel_scope,
             ),
         )
     finally:
@@ -117,6 +135,62 @@ def test_warmup_uses_request_scoped_sdk_retries():
     handler = _make_handler()
 
     assert handler.client.last_options == {"max_retries": base_mod.WARMUP_MAX_RETRIES}
+
+
+def test_cancelled_queued_request_cannot_start_after_private_barrier_ready():
+    text_prompt_queue: queue.Queue = queue.Queue()
+    cancel_scope = CancelScope()
+    service = RealtimeService(text_prompt_queue=text_prompt_queue, cancel_scope=cancel_scope)
+    assert service.verify_cancel_scope_wiring(cancel_scope, cancel_scope)
+    conn_id = service.register()
+
+    created = service.handle_response_create(
+        conn_id,
+        ResponseCreateEvent(type="response.create", response={"conversation": "none"}),
+    )
+    assert isinstance(created, ResponseCreatedEvent)
+    request = text_prompt_queue.get(timeout=1.0)
+    assert isinstance(request, GenerateResponseRequest)
+    assert request.cancel_generation == 0
+
+    cancel_scope.cancel()
+    service.handle_response_cancel(conn_id)
+    ready = service.handle_session_update(
+        conn_id,
+        SessionUpdateEvent(
+            type="session.update",
+            session={
+                "type": "realtime",
+                "reachy_private_transcript_barrier": {"version": 1, "nonce": "cd" * 32},
+            },
+        ),
+    )
+    assert isinstance(ready, TranscriptBarrierReadyEvent)
+
+    handler = _make_handler(stream=False, cancel_scope=cancel_scope)
+    handler.client.chat.completions.last_kwargs = None
+    outputs = list(handler.process(request))
+
+    assert handler.client.chat.completions.last_kwargs is None
+    assert outputs == [EndOfResponse(cancel_generation=0)]
+    service.unregister(conn_id)
+
+
+def test_cancel_scope_serializes_response_admission_cancel_and_private_activation():
+    scope = CancelScope()
+
+    with scope.response_admission(0) as (admitted, generation):
+        assert admitted is True
+        assert generation == 0
+        with scope.private_activation_guard() as quiescent:
+            assert quiescent is False
+        scope.cancel()
+
+    with scope.response_admission(0) as (admitted, generation):
+        assert admitted is False
+        assert generation == 0
+    with scope.private_activation_guard() as quiescent:
+        assert quiescent is True
 
 
 def _chunk(content=None, tool_calls=None, usage=None):
@@ -139,6 +213,7 @@ def _drive(
     chat=None,
     response=None,
     instructions="Du bist ein Roboter.",
+    private_barrier=False,
 ):
     chat = chat or Chat(10)
     if user:
@@ -148,7 +223,12 @@ def _drive(
         session.tools = tools
     if tool_choice is not None:
         session.tool_choice = tool_choice
-    rc = RuntimeConfig(chat=chat, session=session)
+    rc = RuntimeConfig(
+        chat=chat,
+        session=session,
+        transcript_barrier_version=1 if private_barrier else None,
+        transcript_barrier_nonce="ab" * 32 if private_barrier else None,
+    )
     req = GenerateResponseRequest(
         runtime_config=rc, response=response, language_code="de", turn_id="t", turn_revision=0
     )
@@ -348,6 +428,41 @@ def test_tool_call_recorded_before_chunk_is_emitted():
             )
     assert emitted_call_id is not None, "a tool call should have been emitted"
     assert chat._has_call_id_in_buffer(emitted_call_id), "call+output should be paired in the buffer"
+
+
+def test_private_poison_during_provider_stream_blocks_text_and_tool_history_writeback():
+    """A post-handshake poison may race provider completion on another thread.
+
+    Provider text and a tool call are normalized only after the streaming iterator
+    finishes, so poisoning at that boundary must prevent both the trailing message
+    commit and the eager function-call commit.
+    """
+    handler = _make_handler(stream=True)
+    chat = Chat(10)
+    chat.add_item(make_user_message("private request"))
+    session = RealtimeSessionCreateRequest(type="realtime", instructions="Be concise.")
+    session.tools = [{"type": "function", "name": "private_tool", "parameters": {"type": "object"}}]
+    runtime_config = RuntimeConfig(
+        chat=chat,
+        session=session,
+        transcript_barrier_version=1,
+        transcript_barrier_nonce="ab" * 32,
+    )
+    request = GenerateResponseRequest(runtime_config=runtime_config, turn_id="private", turn_revision=0)
+    handler.client.chat.completions.create = lambda **_kwargs: _PoisoningStream(
+        [
+            _chunk(content="PRIVATE_ASSISTANT_HISTORY_CANARY"),
+            _chunk(tool_calls=[_tc_delta(0, id="srv_private", name="private_tool", arguments="{}")]),
+        ],
+        runtime_config,
+    )
+
+    outputs = list(handler.process(request))
+
+    assert runtime_config.transcript_barrier_failed is True
+    assert not any(getattr(item, "role", None) == "assistant" for item in chat.buffer)
+    assert not any(getattr(item, "type", None) == "function_call" for item in chat.buffer)
+    assert not any(isinstance(output, LLMResponseChunk) and output.tools for output in outputs)
 
 
 def test_non_streaming_tool_call():
@@ -560,6 +675,161 @@ def test_generation_error_emits_failed_end_of_response():
     assert "kaboom" in end.error
 
 
+def test_private_barrier_generation_error_scrubs_exception_content(caplog):
+    h = _make_handler(stream=True)
+    canary = "PRIVATE_GENERATION_CANARY"
+
+    def boom(**kwargs):
+        raise RuntimeError(canary)
+
+    h.client.chat.completions.create = boom
+    with caplog.at_level(logging.DEBUG):
+        _text, _tools, _usage, _chat, end = _drive(h, private_barrier=True)
+
+    assert end is not None
+    assert end.error == "Language model generation failed in private transcript mode."
+    assert canary not in caplog.text
+
+
+def test_generated_content_log_holds_guard_through_concurrent_poison(monkeypatch):
+    handler = _make_handler(stream=False)
+    chat = Chat(10)
+    chat.add_item(make_user_message("ordinary before poison"))
+    runtime_config = RuntimeConfig(
+        chat=chat,
+        session=RealtimeSessionCreateRequest(type="realtime", instructions="Reply briefly."),
+    )
+    request = GenerateResponseRequest(runtime_config=runtime_config, turn_id="turn", turn_revision=0)
+    poison_attempted = threading.Event()
+    poison_completed = threading.Event()
+    poison_thread: threading.Thread | None = None
+    original_debug = base_mod.logger.debug
+
+    def capture_debug(message, *args, **kwargs):
+        nonlocal poison_thread
+        if message == "Clean text: %s":
+
+            def poison() -> None:
+                poison_attempted.set()
+                with runtime_config.transcript_barrier_state_guard():
+                    runtime_config.transcript_barrier_failed = True
+                    runtime_config.chat.enable_private_content_logging()
+                poison_completed.set()
+
+            poison_thread = threading.Thread(target=poison)
+            poison_thread.start()
+            assert poison_attempted.wait(timeout=1.0)
+            assert not poison_completed.wait(timeout=0.05)
+        original_debug(message, *args, **kwargs)
+
+    monkeypatch.setattr(base_mod.logger, "debug", capture_debug)
+    outputs = list(handler.process(request))
+
+    assert any(isinstance(output, EndOfResponse) for output in outputs)
+    assert poison_thread is not None
+    poison_thread.join(timeout=1.0)
+    assert not poison_thread.is_alive()
+    assert poison_completed.is_set()
+    assert runtime_config.transcript_barrier_failed is True
+
+
+def test_generated_tool_log_holds_guard_through_concurrent_poison(monkeypatch):
+    handler = _make_handler(stream=False)
+    tool_canary = "ORDINARY_TOOL_BEFORE_POISON"
+    handler.client.chat.completions.next_result = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None,
+                    tool_calls=[
+                        SimpleNamespace(
+                            id="call_provider",
+                            function=SimpleNamespace(name=tool_canary, arguments="{}"),
+                        )
+                    ],
+                )
+            )
+        ],
+        usage=None,
+    )
+    chat = Chat(10)
+    chat.add_item(make_user_message("ordinary before poison"))
+    runtime_config = RuntimeConfig(chat=chat, session=RealtimeSessionCreateRequest(type="realtime"))
+    request = GenerateResponseRequest(runtime_config=runtime_config, turn_id="turn", turn_revision=0)
+    poison_attempted = threading.Event()
+    poison_completed = threading.Event()
+    poison_thread: threading.Thread | None = None
+    original_info = base_mod.logger.info
+
+    def capture_info(message, *args, **kwargs):
+        nonlocal poison_thread
+        if message == "Tools: %s":
+
+            def poison() -> None:
+                poison_attempted.set()
+                with runtime_config.transcript_barrier_state_guard():
+                    runtime_config.transcript_barrier_failed = True
+                    runtime_config.chat.enable_private_content_logging()
+                poison_completed.set()
+
+            poison_thread = threading.Thread(target=poison)
+            poison_thread.start()
+            assert poison_attempted.wait(timeout=1.0)
+            assert not poison_completed.wait(timeout=0.05)
+            assert tool_canary in str(args)
+        original_info(message, *args, **kwargs)
+
+    monkeypatch.setattr(base_mod.logger, "info", capture_info)
+    list(handler.process(request))
+
+    assert poison_thread is not None
+    poison_thread.join(timeout=1.0)
+    assert not poison_thread.is_alive()
+    assert poison_completed.is_set()
+
+
+def test_generation_error_log_holds_guard_through_concurrent_poison(monkeypatch):
+    handler = _make_handler(stream=True)
+    error_canary = "ORDINARY_ERROR_BEFORE_POISON"
+    chat = Chat(10)
+    chat.add_item(make_user_message("ordinary before poison"))
+    runtime_config = RuntimeConfig(chat=chat, session=RealtimeSessionCreateRequest(type="realtime"))
+    request = GenerateResponseRequest(runtime_config=runtime_config, turn_id="turn", turn_revision=0)
+    handler.client.chat.completions.create = lambda **_kwargs: (_ for _ in ()).throw(RuntimeError(error_canary))
+    poison_attempted = threading.Event()
+    poison_completed = threading.Event()
+    poison_thread: threading.Thread | None = None
+
+    def capture_exception(message, *_args, **_kwargs):
+        nonlocal poison_thread
+        assert message == "LLM generation failed; ending the current response"
+
+        def poison() -> None:
+            poison_attempted.set()
+            with runtime_config.transcript_barrier_state_guard():
+                runtime_config.transcript_barrier_failed = True
+                runtime_config.chat.enable_private_content_logging()
+            poison_completed.set()
+
+        poison_thread = threading.Thread(target=poison)
+        poison_thread.start()
+        assert poison_attempted.wait(timeout=1.0)
+        assert not poison_completed.wait(timeout=0.05)
+
+    monkeypatch.setattr(base_mod.logger, "exception", capture_exception)
+    outputs = list(handler.process(request))
+
+    assert poison_thread is not None
+    poison_thread.join(timeout=1.0)
+    assert not poison_thread.is_alive()
+    assert poison_completed.is_set()
+    end = next(output for output in outputs if isinstance(output, EndOfResponse))
+    assert end.error in {
+        f"Language model generation failed: {error_canary}",
+        "Language model generation failed in private transcript mode.",
+    }
+
+
 # ── Out-of-band (conversation="none") responses ───────────────────────────────
 
 
@@ -576,6 +846,28 @@ def test_out_of_band_does_not_commit_to_default_conversation():
     assert "Background note." in text
     # Default conversation keeps only the seeded user turn — no assistant commit.
     assert not any(getattr(i, "role", None) == "assistant" for i in chat.buffer)
+
+
+def test_private_out_of_band_validation_error_is_content_free(caplog):
+    handler = _make_handler(stream=True)
+    canary = "PRIVATE_OOB_LLM_EXCEPTION_CANARY"
+    orphan = RealtimeConversationItemFunctionCallOutput(
+        type="function_call_output",
+        call_id=canary,
+        output="{}",
+    )
+    response = RealtimeResponseCreateParams(conversation="none", input=[orphan])
+
+    with caplog.at_level(logging.INFO):
+        _text, _tools, _usage, _chat, end = _drive(
+            handler,
+            response=response,
+            private_barrier=True,
+        )
+
+    assert end is not None
+    assert end.error == "Private out-of-band response rejected."
+    assert canary not in caplog.text
 
 
 # ── Standalone runner (no pytest required) ────────────────────────────────────

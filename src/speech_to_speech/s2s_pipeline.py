@@ -524,6 +524,7 @@ def _build_realtime_pipeline_unit(
         should_listen=should_listen,
         chat_size=chat_size,
         speculative_turns=speculative_turns,
+        cancel_scope=cancel_scope,
     )
 
     if module_kwargs.enable_live_transcription:
@@ -544,6 +545,9 @@ def _build_realtime_pipeline_unit(
         transcription_notifier_setup={
             "text_output_queue": text_output_queue,
             "should_listen": should_listen,
+            "transcript_barrier_enabled": service.transcript_barrier_private,
+            "transcript_barrier_failed": service.transcript_barrier_poisoned,
+            "transcript_barrier_state_guard": service.transcript_barrier_pipeline_state_guard,
         },
         module_kwargs=module_kwargs,
         vad_handler_kwargs=vad_kw,
@@ -561,8 +565,23 @@ def _build_realtime_pipeline_unit(
         qwen3_tts_handler_kwargs=qwen3_tts_kw,
         speculative_turns=speculative_turns,
     )
+    from speech_to_speech.STT.base_stt_handler import BaseSTTHandler
+
     for h in handlers:
         h.pipeline_index = index
+        if isinstance(h, BaseSTTHandler):
+            h.set_transcript_barrier_enabled(service.transcript_barrier_private)
+            h.set_transcript_barrier_failed(service.transcript_barrier_poisoned)
+            h.set_transcript_barrier_state_guard(service.transcript_barrier_pipeline_state_guard)
+
+    cancellation_consumers = tuple(
+        getattr(handler, "cancel_scope") for handler in handlers if hasattr(handler, "cancel_scope")
+    )
+    if len(cancellation_consumers) < 2 or not service.verify_cancel_scope_wiring(
+        cancel_scope,
+        *cancellation_consumers,
+    ):
+        raise RuntimeError("Realtime cancellation consumers do not share one CancelScope")
 
     return PipelineUnit(
         index=index,

@@ -1,3 +1,6 @@
+import logging
+
+from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.LLM.language_model import LanguageModelHandler, StreamContext
 from speech_to_speech.LLM.tool_call.function_tool import FunctionTool
 from speech_to_speech.LLM.tool_call.tool_prompt import END_CODE, ENTER_CODE, build_block_regex, build_tool_system_prompt
@@ -185,6 +188,133 @@ def test_local_tool_parser_caps_distinct_calls_at_two():
     assert [[tool.name for tool in chunk.tools] for chunk in chunks] == [["dance"], ["camera"]]
     assert [tool.name for tool in tools] == ["dance", "camera"]
     assert remaining == ""
+
+
+def test_local_tool_parser_redacts_invalid_private_tool_identity(caplog):
+    handler = object.__new__(LanguageModelHandler)
+    context = StreamContext(
+        function_tools=[],
+        block_regex=build_block_regex(),
+        enter_code=ENTER_CODE,
+        end_code=END_CODE,
+    )
+    runtime_config = RuntimeConfig()
+    runtime_config.transcript_barrier_version = 1
+    runtime_config.transcript_barrier_nonce = "cd" * 32
+
+    with caplog.at_level(logging.WARNING, logger="speech_to_speech.LLM.language_model"):
+        chunks, tools, remaining = handler._process_printable_text(
+            f"{ENTER_CODE}PRIVATE_LLM_TOOL_CANARY(){END_CODE}",
+            None,
+            [],
+            context,
+            runtime_config,
+        )
+
+    assert chunks == []
+    assert tools == []
+    assert remaining == ""
+    assert "PRIVATE_LLM_TOOL_CANARY" not in caplog.text
+    assert "content redacted" in caplog.text
+
+
+def test_local_tool_parser_redacts_malformed_recovered_identity_in_low_level_logs(caplog):
+    handler = object.__new__(LanguageModelHandler)
+    context = StreamContext(
+        function_tools=[],
+        block_regex=build_block_regex(),
+        enter_code=ENTER_CODE,
+        end_code=END_CODE,
+    )
+    runtime_config = RuntimeConfig()
+    runtime_config.transcript_barrier_version = 1
+    runtime_config.transcript_barrier_nonce = "ce" * 32
+    canary = "PRIVATE_MALFORMED_MODEL_CANARY"
+
+    with caplog.at_level(logging.WARNING):
+        chunks, tools, remaining = handler._process_printable_text(
+            f"{ENTER_CODE}{canary}('private') broken({END_CODE}",
+            None,
+            [],
+            context,
+            runtime_config,
+        )
+
+    assert chunks == []
+    assert tools == []
+    assert remaining == ""
+    assert canary not in caplog.text
+    assert "content redacted" in caplog.text
+
+
+def test_local_tool_parser_redacts_dropped_argument_keys_in_low_level_logs(caplog):
+    handler = object.__new__(LanguageModelHandler)
+    tool = FunctionTool(
+        type="function",
+        name="safe_tool",
+        description="Run safely.",
+        parameters={
+            "type": "object",
+            "properties": {"allowed": {"type": "string"}},
+            "required": ["allowed"],
+        },
+    )
+    context = StreamContext(
+        function_tools=[tool],
+        block_regex=build_block_regex(),
+        enter_code=ENTER_CODE,
+        end_code=END_CODE,
+    )
+    runtime_config = RuntimeConfig()
+    runtime_config.transcript_barrier_version = 1
+    runtime_config.transcript_barrier_nonce = "cf" * 32
+    canary = "PRIVATE_DROPPED_ARGUMENT_CANARY"
+
+    with caplog.at_level(logging.WARNING):
+        chunks, tools, remaining = handler._process_printable_text(
+            f"{ENTER_CODE}safe_tool(allowed='ok', {canary}='private'){END_CODE}",
+            None,
+            [],
+            context,
+            runtime_config,
+        )
+
+    assert remaining == ""
+    assert [tool_call.name for tool_call in tools] == ["safe_tool"]
+    assert len(chunks) == 1
+    assert canary not in caplog.text
+    assert "content redacted" in caplog.text
+
+
+def test_local_tool_parser_preserves_detailed_default_dropped_argument_log(caplog):
+    handler = object.__new__(LanguageModelHandler)
+    tool = FunctionTool(
+        type="function",
+        name="safe_tool",
+        description="Run safely.",
+        parameters={
+            "type": "object",
+            "properties": {"allowed": {"type": "string"}},
+            "required": ["allowed"],
+        },
+    )
+    context = StreamContext(
+        function_tools=[tool],
+        block_regex=build_block_regex(),
+        enter_code=ENTER_CODE,
+        end_code=END_CODE,
+    )
+    canary = "DEFAULT_DROPPED_ARGUMENT_CANARY"
+
+    with caplog.at_level(logging.WARNING):
+        handler._process_printable_text(
+            f"{ENTER_CODE}safe_tool(allowed='ok', {canary}='ordinary'){END_CODE}",
+            None,
+            [],
+            context,
+        )
+
+    assert canary in caplog.text
 
 
 def test_local_tool_parser_cap_and_dedup_hold_across_streaming_invocations():
