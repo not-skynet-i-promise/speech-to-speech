@@ -136,6 +136,36 @@ def test_private_barrier_redacts_generated_content_from_processor_logs(caplog):
     assert "redacted" in caplog.text
 
 
+def test_home_assistant_guard_failure_drops_all_content_but_preserves_terminal() -> None:
+    tracker = SpeculativeTurnTracker()
+    tracker.observe("turn_1", 0)
+    processor = _processor(tracker)
+    runtime_config = RuntimeConfig(
+        home_assistant_guard_version=1,
+        home_assistant_guard_nonce="ab" * 32,
+        home_assistant_guard_contract_sha256="cd" * 32,
+        home_assistant_guard_tool_count=1,
+        home_assistant_guard_tool_names=("home_assistant__GetLiveContext",),
+        home_assistant_guard_failed=True,
+    )
+
+    outputs = list(
+        processor.process(
+            LLMResponseChunk(
+                text="private selector canary",
+                runtime_config=runtime_config,
+                turn_id="turn_1",
+                turn_revision=0,
+            )
+        )
+    )
+    terminal = list(processor.process(EndOfResponse(turn_id="turn_1", turn_revision=0)))
+
+    assert outputs == []
+    assert processor.text_output_queue.empty()
+    assert terminal == [EndOfResponse(turn_id="turn_1", turn_revision=0)]
+
+
 def test_ordered_parts_reach_clients_and_only_text_reaches_tts():
     tracker = SpeculativeTurnTracker()
     tracker.observe("turn_1", 0)

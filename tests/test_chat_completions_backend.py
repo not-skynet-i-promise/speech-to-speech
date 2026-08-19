@@ -15,6 +15,7 @@ import queue
 import threading
 from types import SimpleNamespace
 
+import pytest
 from openai.types.realtime import ResponseCreatedEvent, ResponseCreateEvent, SessionUpdateEvent
 from openai.types.realtime.conversation_item import (
     RealtimeConversationItemFunctionCall,
@@ -28,6 +29,7 @@ from openai.types.responses import ResponseFunctionToolCall
 
 import speech_to_speech.LLM.base_openai_compatible_language_model as base_mod
 import speech_to_speech.LLM.chat_completions_language_model as ccm
+from speech_to_speech.api.openai_realtime.home_assistant_guard import session_contract
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.api.openai_realtime.service import RealtimeService
 from speech_to_speech.api.openai_realtime.transcript_barrier import TranscriptBarrierReadyEvent
@@ -214,6 +216,8 @@ def _drive(
     response=None,
     instructions="Du bist ein Roboter.",
     private_barrier=False,
+    home_assistant_guard=False,
+    runtime_capture=None,
 ):
     chat = chat or Chat(10)
     if user:
@@ -229,6 +233,15 @@ def _drive(
         transcript_barrier_version=1 if private_barrier else None,
         transcript_barrier_nonce="ab" * 32 if private_barrier else None,
     )
+    if home_assistant_guard:
+        digest, tool_count, tool_names = session_contract(session.instructions, session.tools)
+        rc.home_assistant_guard_version = 1
+        rc.home_assistant_guard_nonce = "cd" * 32
+        rc.home_assistant_guard_contract_sha256 = digest
+        rc.home_assistant_guard_tool_count = tool_count
+        rc.home_assistant_guard_tool_names = tool_names
+    if runtime_capture is not None:
+        runtime_capture.append(rc)
     req = GenerateResponseRequest(
         runtime_config=rc, response=response, language_code="de", turn_id="t", turn_revision=0
     )
@@ -242,6 +255,276 @@ def _drive(
         elif isinstance(out, EndOfResponse):
             end = out
     return text, tools_out, usage, chat, end
+
+
+def _guard_tools():
+    return [
+        {
+            "type": "function",
+            "name": "home_assistant__GetLiveContext",
+            "parameters": {"type": "object", "properties": {"area": {"type": "string"}}},
+        },
+        {
+            "type": "function",
+            "name": "get_local_time",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    ]
+
+
+def _complete_response(
+    *,
+    content="",
+    calls=(),
+    finish_reason="stop",
+    choice_index=0,
+    choices=None,
+):
+    if choices is None:
+        choices = [
+            SimpleNamespace(
+                index=choice_index,
+                message=SimpleNamespace(content=content, refusal=None, tool_calls=list(calls)),
+                finish_reason=finish_reason,
+            )
+        ]
+    return SimpleNamespace(
+        choices=choices,
+        usage=SimpleNamespace(prompt_tokens=7, completion_tokens=4),
+    )
+
+
+def _complete_call(name, arguments="{}", *, provider_id="provider_call"):
+    return SimpleNamespace(
+        id=provider_id,
+        function=SimpleNamespace(name=name, arguments=arguments),
+    )
+
+
+def test_guarded_turn_forces_one_complete_response_before_releasing_native_call():
+    handler = _make_handler(stream=True)
+    handler.client.chat.completions.next_result = _complete_response(
+        content="Let me check.",
+        calls=[_complete_call("home_assistant__GetLiveContext", '{"area":"bedroom"}')],
+        finish_reason="tool_calls",
+    )
+    capture = []
+
+    text, tools, usage, chat, end = _drive(
+        handler,
+        tools=_guard_tools(),
+        tool_choice="auto",
+        home_assistant_guard=True,
+        runtime_capture=capture,
+    )
+
+    assert handler.client.chat.completions.last_kwargs["stream"] is False
+    assert text == "Let me check."
+    assert [(tool.name, json.loads(tool.arguments)) for tool in tools] == [
+        ("home_assistant__GetLiveContext", {"area": "bedroom"})
+    ]
+    assert usage == (7, 4)
+    assert end is not None and end.error is None
+    assert capture[0].home_assistant_guard_operational
+    assert len(chat._pending_tool_calls) == 1
+
+
+def test_guarded_turn_preserves_safe_ordinary_speech_and_registered_non_ha_call():
+    handler = _make_handler(stream=True)
+    handler.client.chat.completions.next_result = _complete_response(content="Hello there.")
+    capture = []
+
+    text, tools, _usage, _chat, end = _drive(
+        handler,
+        tools=_guard_tools(),
+        tool_choice="auto",
+        home_assistant_guard=True,
+        runtime_capture=capture,
+    )
+
+    assert text == "Hello there."
+    assert tools == []
+    assert end is not None and end.error is None
+    assert capture[0].home_assistant_guard_operational
+
+    handler.client.chat.completions.next_result = _complete_response(
+        content="One moment.",
+        calls=[_complete_call("get_local_time")],
+        finish_reason="tool_calls",
+    )
+    text, tools, _usage, _chat, end = _drive(
+        handler,
+        tools=_guard_tools(),
+        tool_choice="auto",
+        home_assistant_guard=True,
+    )
+    assert text == "One moment."
+    assert [tool.name for tool in tools] == ["get_local_time"]
+    assert end is not None and end.error is None
+
+
+@pytest.mark.parametrize(
+    "response,tool_choice",
+    [
+        (_complete_response(content=""), "auto"),
+        (_complete_response(content="I used Get Live Context."), "auto"),
+        (_complete_response(content="tool name: unknown"), "auto"),
+        (
+            _complete_response(
+                content="Checking.",
+                calls=[_complete_call("home_assistant__GetLiveContext", '{"area":NaN}')],
+                finish_reason="tool_calls",
+            ),
+            "auto",
+        ),
+        (
+            _complete_response(
+                content="Checking.",
+                calls=[_complete_call("home_assistant__GetLiveContext", '{"area":"bedroom","area":"garage"}')],
+                finish_reason="tool_calls",
+            ),
+            "auto",
+        ),
+        (
+            _complete_response(
+                content="Checking.",
+                calls=[_complete_call("home_assistant__GetLiveContext", "[]")],
+                finish_reason="tool_calls",
+            ),
+            "auto",
+        ),
+        (
+            _complete_response(
+                content="Checking.",
+                calls=[
+                    _complete_call("home_assistant__GetLiveContext"),
+                    _complete_call("get_local_time", provider_id="p2"),
+                ],
+                finish_reason="tool_calls",
+            ),
+            "auto",
+        ),
+        (
+            _complete_response(
+                content="Checking.",
+                calls=[_complete_call("home_assistant__GetLiveContext")],
+                finish_reason="length",
+            ),
+            "auto",
+        ),
+        (
+            _complete_response(
+                content="Checking.",
+                calls=[_complete_call("home_assistant__GetLiveContext")],
+                finish_reason="tool_calls",
+                choice_index=1,
+            ),
+            "auto",
+        ),
+        (
+            _complete_response(
+                content="Checking.",
+                calls=[_complete_call("home_assistant__GetLiveContext")],
+                finish_reason="tool_calls",
+            ),
+            "none",
+        ),
+    ],
+    ids=[
+        "empty",
+        "spoken-tool-name",
+        "protocol-label",
+        "nonfinite-json",
+        "duplicate-json-key",
+        "nonobject-json",
+        "mixed-ha-call",
+        "truncated",
+        "wrong-choice",
+        "tools-disabled-call",
+    ],
+)
+def test_guarded_turn_rejects_complete_unsafe_response_before_every_sink(response, tool_choice):
+    handler = _make_handler(stream=True)
+    handler.client.chat.completions.next_result = response
+    capture = []
+
+    text, tools, usage, chat, end = _drive(
+        handler,
+        tools=_guard_tools(),
+        tool_choice=tool_choice,
+        home_assistant_guard=True,
+        runtime_capture=capture,
+    )
+
+    assert text == ""
+    assert tools == []
+    assert usage is None
+    assert end is not None and end.error is None
+    assert capture[0].home_assistant_guard_failed
+    assert not any(getattr(item, "role", None) == "assistant" for item in chat.buffer)
+    assert chat._pending_tool_calls == {}
+
+
+def test_guarded_provider_failure_is_content_free_and_sticky_but_cancellation_wins():
+    handler = _make_handler(stream=True)
+
+    def fail(**_kwargs):
+        raise RuntimeError("private provider canary")
+
+    handler.client.chat.completions.create = fail
+    capture = []
+    text, tools, usage, chat, end = _drive(
+        handler,
+        tools=_guard_tools(),
+        tool_choice="auto",
+        home_assistant_guard=True,
+        runtime_capture=capture,
+    )
+    assert (text, tools, usage) == ("", [], None)
+    assert end is not None and end.error is None
+    assert capture[0].home_assistant_guard_failed
+    assert chat.buffer[-1].role == "user"
+
+    scope = CancelScope()
+    scope.cancel()
+    handler = _make_handler(stream=True, cancel_scope=scope)
+    runtime = RuntimeConfig(chat=Chat(10), session=RealtimeSessionCreateRequest(type="realtime", tools=_guard_tools()))
+    runtime.chat.add_item(make_user_message("Is the bedroom light on?"))
+    digest, count, names = session_contract(runtime.session.instructions, runtime.session.tools)
+    runtime.home_assistant_guard_version = 1
+    runtime.home_assistant_guard_nonce = "ef" * 32
+    runtime.home_assistant_guard_contract_sha256 = digest
+    runtime.home_assistant_guard_tool_count = count
+    runtime.home_assistant_guard_tool_names = names
+    request = GenerateResponseRequest(runtime_config=runtime, cancel_generation=0)
+
+    assert list(handler.process(request)) == [EndOfResponse(cancel_generation=0)]
+    assert runtime.home_assistant_guard_operational
+
+
+def test_guarded_pre_provider_serialization_failure_is_content_free_and_sticky():
+    handler = _make_handler(stream=True)
+
+    def fail_serialize(_chat):
+        raise RuntimeError("private serialization canary")
+
+    handler._serialize = fail_serialize
+    handler.client.chat.completions.last_kwargs = None
+    capture = []
+
+    text, tools, usage, chat, end = _drive(
+        handler,
+        tools=_guard_tools(),
+        tool_choice="auto",
+        home_assistant_guard=True,
+        runtime_capture=capture,
+    )
+
+    assert (text, tools, usage) == ("", [], None)
+    assert end is not None and end.error is None
+    assert capture[0].home_assistant_guard_failed
+    assert not any(getattr(item, "role", None) == "assistant" for item in chat.buffer)
+    assert handler.client.chat.completions.last_kwargs is None
 
 
 # ── Converter tests ──────────────────────────────────────────────────────────

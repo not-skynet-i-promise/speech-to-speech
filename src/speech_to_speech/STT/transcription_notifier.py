@@ -43,6 +43,7 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
         transcript_barrier_enabled: Callable[[], bool] | None = None,
         transcript_barrier_failed: Callable[[], bool] | None = None,
         transcript_barrier_state_guard: Callable[[], AbstractContextManager[tuple[bool, bool]]] | None = None,
+        private_content_enabled: Callable[[], bool] | None = None,
     ) -> None:
         self.text_output_queue = text_output_queue
         self.runtime_config = runtime_config
@@ -50,6 +51,9 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
         self.transcript_barrier_enabled = transcript_barrier_enabled or (lambda: False)
         self.transcript_barrier_failed = transcript_barrier_failed or (lambda: False)
         self.transcript_barrier_state_guard = transcript_barrier_state_guard
+        self.private_content_enabled = private_content_enabled or (
+            (lambda: runtime_config.sensitive_content) if runtime_config is not None else (lambda: False)
+        )
 
     @contextmanager
     def _barrier_state_guard(self) -> Iterator[tuple[bool, bool]]:
@@ -62,7 +66,7 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
                     stack.enter_context(self.runtime_config.transcript_barrier_state_guard())
                     state = (
                         self.runtime_config.transcript_barrier_private,
-                        self.runtime_config.transcript_barrier_failed,
+                        self.runtime_config.private_protocol_failed,
                     )
                 else:
                     state = (
@@ -87,6 +91,13 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
             if barrier_failed:
                 logger.debug("Dropping transcription after private barrier failure")
                 return
+            try:
+                private_content = self.private_content_enabled()
+                if type(private_content) is not bool:
+                    raise ValueError("invalid private content state")
+            except Exception:
+                logger.error("Private content state unavailable; transcript redacted")
+                private_content = True
             if isinstance(transcription, PartialTranscription):
                 if barrier_private:
                     logger.debug("Private transcript barrier suppressed a partial transcription")
@@ -99,7 +110,10 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
                             turn_revision=transcription.turn_revision,
                         )
                     )
-                    logger.debug("Partial transcription: %s", str(transcription.text)[:80])
+                    if private_content:
+                        logger.debug("Partial transcription redacted")
+                    else:
+                        logger.debug("Partial transcription: %s", str(transcription.text)[:80])
                 return
 
             if isinstance(transcription, Transcription):
@@ -162,7 +176,11 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
                     logger.debug("Empty transcription completed; listening re-enabled")
                 return
 
-            if language_code:
+            if private_content and language_code:
+                logger.info("Transcription completed (language=%s); private content redacted", language_code)
+            elif private_content:
+                logger.info("Transcription completed; private content redacted")
+            elif language_code:
                 logger.info("Transcription completed (language=%s): %s", language_code, transcript)
             else:
                 logger.info("Transcription completed: %s", transcript)

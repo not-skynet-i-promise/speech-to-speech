@@ -57,7 +57,18 @@ class BaseHandler(Generic[InT, OutT]):
         candidates = item if isinstance(item, tuple) else (item,)
         for candidate in candidates:
             runtime_config = getattr(candidate, "runtime_config", None)
-            if runtime_config is not None and bool(getattr(runtime_config, "transcript_barrier_failed", False)):
+            failed = (
+                bool(
+                    getattr(
+                        runtime_config,
+                        "private_protocol_failed",
+                        getattr(runtime_config, "transcript_barrier_failed", False),
+                    )
+                )
+                if runtime_config is not None
+                else False
+            )
+            if failed and not isinstance(candidate, EndOfResponse):
                 logger.debug("%s: dropping input after private barrier failure", self.__class__.__name__)
                 return False
         cancel_scope = getattr(self, "cancel_scope", None)
@@ -120,8 +131,12 @@ class BaseHandler(Generic[InT, OutT]):
                 try:
                     private_state = getattr(
                         runtime_config,
-                        "transcript_barrier_private",
-                        getattr(runtime_config, "transcript_barrier_enabled", False),
+                        "sensitive_content",
+                        getattr(
+                            runtime_config,
+                            "transcript_barrier_private",
+                            getattr(runtime_config, "transcript_barrier_enabled", False),
+                        ),
                     )
                     if bool(private_state):
                         yield True
@@ -153,8 +168,12 @@ class BaseHandler(Generic[InT, OutT]):
                 private_content = bool(
                     getattr(
                         runtime_config,
-                        "transcript_barrier_private",
-                        getattr(runtime_config, "transcript_barrier_enabled", False),
+                        "sensitive_content",
+                        getattr(
+                            runtime_config,
+                            "transcript_barrier_private",
+                            getattr(runtime_config, "transcript_barrier_enabled", False),
+                        ),
                     )
                 )
             except Exception:

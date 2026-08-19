@@ -35,6 +35,13 @@ class ModuleArguments:
             "'chat-completions' (OpenAI-compatible /v1/chat/completions). Default is 'responses-api'."
         },
     )
+    require_home_assistant_guard: bool = field(
+        default=False,
+        metadata={
+            "help": "Require every realtime client to complete the Home Assistant guard handshake. "
+            "Only valid with the chat-completions backend. Default is false."
+        },
+    )
     tts: Optional[Literal["chatTTS", "facebookMMS", "pocket", "kokoro", "qwen3"]] = field(
         default="qwen3",
         metadata={

@@ -515,6 +515,8 @@ See [ModuleArguments](./src/speech_to_speech/arguments_classes/module_arguments.
 - `--mode`: `realtime` (default), `local`, `socket`, or `websocket`
 - STT implementation (`--stt`)
 - LLM backend (`--llm_backend`: `transformers`, `mlx-lm`, `responses-api`, or `chat-completions`)
+- required local Home Assistant selector quarantine (`--require_home_assistant_guard true`; realtime
+  Chat Completions only; see the [Realtime Engine guard contract](./src/speech_to_speech/api/openai_realtime/README.md#required-home-assistant-selector-guard))
 - TTS implementation (`--tts`)
 - logging level
 - realtime pipeline pool size (`--num_pipelines`)

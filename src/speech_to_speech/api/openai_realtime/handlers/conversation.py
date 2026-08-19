@@ -57,6 +57,8 @@ class ConversationHandler(RealtimeBaseHandler):
         try:
             self._append_item(conn_id, item)
         except ChatItemError as exc:
+            if self._state(conn_id).runtime_config.home_assistant_guard_operational:
+                return [self._service.poison_home_assistant_guard(conn_id, "invalid_conversation_item")]
             return [self.make_client_content_error(conn_id, str(exc), "invalid_conversation_item")]
 
         if not item:
