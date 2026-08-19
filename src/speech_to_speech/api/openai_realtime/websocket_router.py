@@ -228,6 +228,45 @@ async def _drain_pending_response_events(
         await ws.close(code=1008, reason="Private session failed")
 
 
+async def _drain_current_response_failures(
+    ws: WebSocket | None,
+    unit: PipelineUnit,
+    session_id: str | None,
+    generation: int,
+) -> bool:
+    """Dispatch failures already queued for a response before cancellation wins."""
+    if session_id is None:
+        return False
+
+    preserved: list[Any] = []
+    failures: list[ResponseFailedEvent] = []
+    try:
+        while True:
+            try:
+                item = unit.text_output_queue.get_nowait()
+            except Empty:
+                break
+            if isinstance(item, ResponseFailedEvent) and item.cancel_generation == generation:
+                failures.append(item)
+            else:
+                preserved.append(item)
+    finally:
+        if preserved:
+            with unit.text_output_queue.mutex:
+                for item in reversed(preserved):
+                    unit.text_output_queue.queue.appendleft(item)
+                unit.text_output_queue.not_empty.notify(len(preserved))
+
+    for failure in failures:
+        events = unit.service.dispatch_pipeline_event(session_id, failure)
+        if ws is not None and events:
+            await _send_events(ws, events)
+    private_protocol_failed = unit.service.private_protocol_failed(session_id)
+    if ws is not None and ws.application_state == WebSocketState.CONNECTED and private_protocol_failed:
+        await ws.close(code=1008, reason="Private session failed")
+    return private_protocol_failed
+
+
 def _clean_unit(unit: PipelineUnit, preserve: Callable[[Any], bool] | None = None) -> None:
     """Cancel in-flight work and flush queues for a single pipeline unit.
 
@@ -657,16 +696,41 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
 
                     was_in_response = False
                     was_response_pending = False
+                    interrupts_active_response = False
                     if is_speech_start and session_id:
                         st = unit.service._state(session_id)
                         was_in_response = st.in_response
                         was_response_pending = st.response_pending
+                        active_cfg = st.runtime_config
+                        interrupts_active_response = (
+                            (was_in_response or was_response_pending)
+                            and text_msg.interrupt_response
+                            and (active_cfg is None or active_cfg.interrupt_response_enabled)
+                        )
+
+                    failure_preempted_speech = False
+                    if interrupts_active_response:
+                        failure_preempted_speech = await _drain_current_response_failures(
+                            ws,
+                            unit,
+                            session_id,
+                            unit.cancel_scope.generation,
+                        )
 
                     if isinstance(text_msg, AssistantTextEvent) and _generation_is_discardable(
                         unit, text_msg.cancel_generation
                     ):
                         pass
-                    elif ws is not None and isinstance(text_msg, PipelineEvent) and session_id:
+                    elif isinstance(text_msg, ResponseFailedEvent) and _generation_is_discardable(
+                        unit, text_msg.cancel_generation
+                    ):
+                        pass
+                    elif (
+                        not failure_preempted_speech
+                        and ws is not None
+                        and isinstance(text_msg, PipelineEvent)
+                        and session_id
+                    ):
                         events = unit.service.dispatch_pipeline_event(session_id, text_msg)
                         if events:
                             await _send_events(ws, events)
@@ -674,12 +738,9 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                             await ws.close(code=1008, reason="Private session failed")
 
                     if is_speech_start and (was_in_response or was_response_pending):
-                        active_cfg = unit.service._state(session_id).runtime_config if session_id else None
-                        if text_msg.interrupt_response and (
-                            active_cfg is None or active_cfg.interrupt_response_enabled
-                        ):
+                        if interrupts_active_response:
                             unit.cancel_scope.cancel()
-                            if session_id:
+                            if session_id and not failure_preempted_speech:
                                 unit.service._state(session_id).response_pending = False
                             _flush_queue(unit.output_queue, preserve=_keep_audio_sentinel)
                             _flush_queue(unit.text_output_queue, preserve=_keep_user_text_event)

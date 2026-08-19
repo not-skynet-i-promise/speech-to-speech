@@ -1083,6 +1083,30 @@ class TestHandleConversationItemCreate:
             for e in service._state(conn_id).runtime_config.chat.buffer
         )
 
+    def test_guarded_invalid_function_call_output_poison_is_sticky(self, service, conn_id, text_prompt_queue):
+        state = service._state(conn_id)
+        cfg = state.runtime_config
+        cfg.home_assistant_guard_version = 1
+        cfg.home_assistant_guard_nonce = "cd" * 32
+        cfg.home_assistant_guard_contract_sha256 = "ef" * 32
+        cfg.home_assistant_guard_tool_count = 1
+        cfg.home_assistant_guard_tool_names = ("home_assistant__GetLiveContext",)
+        event = ConversationItemCreateEvent(
+            type="conversation.item.create",
+            item={"type": "function_call_output", "output": '{"result": 42}', "call_id": "call_unknown"},
+        )
+
+        events = service.handle_conversation_item_create(conn_id, event)
+
+        assert len(events) == 1
+        assert isinstance(events[0], RealtimeErrorEvent)
+        assert events[0].error.type == "invalid_conversation_item"
+        assert events[0].error.message == "Home Assistant guard protocol violation."
+        assert cfg.home_assistant_guard_failed is True
+        assert cfg.home_assistant_guard_operational is False
+        assert text_prompt_queue.empty()
+        assert cfg.chat.buffer == []
+
     def test_input_image_forwarded(self, service, conn_id, text_prompt_queue):
         evt = ConversationItemCreateEvent(
             type="conversation.item.create",

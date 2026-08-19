@@ -45,6 +45,27 @@ def test_latest_end_of_response_is_forwarded_to_tts():
     assert outputs[0].turn_revision == 1
 
 
+def test_failed_response_keeps_its_cancel_generation_on_the_text_side_channel():
+    tracker = SpeculativeTurnTracker()
+    tracker.observe("turn_1", 1)
+    processor = _processor(tracker)
+
+    outputs = list(
+        processor.process(
+            EndOfResponse(
+                turn_id="turn_1",
+                turn_revision=1,
+                cancel_generation=7,
+                error="failed",
+            )
+        )
+    )
+
+    failure = processor.text_output_queue.get_nowait()
+    assert failure.cancel_generation == 7
+    assert outputs[0].cancel_generation == 7
+
+
 def test_cancel_generation_is_forwarded_to_tts():
     tracker = SpeculativeTurnTracker()
     tracker.observe("turn_1", 0)

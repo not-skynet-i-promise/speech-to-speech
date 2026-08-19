@@ -1070,6 +1070,130 @@ class TestSendLoop:
                 time.sleep(0.15)
                 assert not cancel_scope.discarding
 
+    def test_queued_selector_rejection_wins_before_speech_start_cancellation(self, setup):
+        app, service, _, _, text_output_queue, _, _, response_playing, cancel_scope = setup
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                conn_id = service.connection_ids[0]
+                state = service._state(conn_id)
+                cfg = state.runtime_config
+                cfg.home_assistant_guard_version = 1
+                cfg.home_assistant_guard_nonce = "cd" * 32
+                cfg.home_assistant_guard_contract_sha256 = "ef" * 32
+                cfg.home_assistant_guard_tool_count = 1
+                cfg.home_assistant_guard_tool_names = ("home_assistant__GetLiveContext",)
+                service.response._ensure_response(conn_id)
+                response_playing.set()
+                generation = cancel_scope.generation
+
+                text_output_queue.put(SpeechStartedEvent())
+                text_output_queue.put(
+                    ResponseFailedEvent(
+                        message=HOME_ASSISTANT_SELECTOR_REJECTED,
+                        cancel_generation=generation,
+                    )
+                )
+
+                error = ws.receive_json()
+                done = ws.receive_json()
+                assert error["type"] == "error"
+                assert error["error"]["type"] == "home_assistant_selector_rejected"
+                assert done["type"] == "response.done"
+                assert done["response"]["status"] == "failed"
+                time.sleep(0.1)
+                assert cfg.home_assistant_guard_failed is True
+                assert cancel_scope.is_stale(generation)
+                assert text_output_queue.empty()
+
+    def test_late_selector_rejection_from_cancelled_generation_is_discarded(self, setup):
+        app, service, _, _, text_output_queue, _, _, _, cancel_scope = setup
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                conn_id = service.connection_ids[0]
+                state = service._state(conn_id)
+                cfg = state.runtime_config
+                cfg.home_assistant_guard_version = 1
+                cfg.home_assistant_guard_nonce = "cd" * 32
+                cfg.home_assistant_guard_contract_sha256 = "ef" * 32
+                cfg.home_assistant_guard_tool_count = 1
+                cfg.home_assistant_guard_tool_names = ("home_assistant__GetLiveContext",)
+                stale_generation = cancel_scope.generation
+                cancel_scope.cancel()
+                service.response._ensure_response(conn_id)
+
+                text_output_queue.put(
+                    ResponseFailedEvent(
+                        message=HOME_ASSISTANT_SELECTOR_REJECTED,
+                        cancel_generation=stale_generation,
+                    )
+                )
+                time.sleep(0.15)
+
+                assert cfg.home_assistant_guard_failed is False
+                assert state.in_response is True
+                assert text_output_queue.empty()
+
+    def test_guarded_semantic_invalid_conversation_item_closes_before_followup(self, setup):
+        app, service, *_ = setup
+        tools = [
+            {
+                "type": "function",
+                "name": "home_assistant__GetLiveContext",
+                "parameters": {"type": "object", "properties": {"area": {"type": "string"}}},
+            }
+        ]
+        contract = RealtimeSessionCreateRequest(type="realtime", instructions="private", tools=tools)
+        digest, count, _names = session_contract(contract.instructions, contract.tools)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "realtime",
+                            "instructions": "private",
+                            "tools": tools,
+                            "reachy_home_assistant_guard": {
+                                "version": 1,
+                                "nonce": "31" * 32,
+                                "session_contract_sha256": digest,
+                                "tool_count": count,
+                            },
+                        },
+                    }
+                )
+                assert ws.receive_json()["type"] == "reachy.home_assistant_guard.ready"
+                conn_id = service.connection_ids[0]
+                cfg = service._state(conn_id).runtime_config
+
+                ws.send_json(
+                    {
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "function_call_output",
+                            "call_id": "call_unknown",
+                            "output": '{"result": 42}',
+                        },
+                    }
+                )
+                error = ws.receive_json()
+
+                assert error["type"] == "error"
+                assert error["error"] == {
+                    "type": "invalid_conversation_item",
+                    "code": None,
+                    "event_id": None,
+                    "message": "Home Assistant guard protocol violation.",
+                    "param": None,
+                }
+                assert cfg.home_assistant_guard_failed is True
+                assert service.text_prompt_queue is not None
+                assert service.text_prompt_queue.empty()
+
     def test_speech_started_does_not_cancel_pending_when_internal_non_interrupt(self, setup):
         app, service, _, _, text_output_queue, _, _, _, cancel_scope = setup
         with TestClient(app) as client:
