@@ -127,6 +127,8 @@ _GUARDED_PROTOCOL_MARKER = re.compile(
     r"|[{}\[\]=]|(?<![A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_]*\s*\()",
     re.IGNORECASE,
 )
+_SELECTOR_NAME_WORD = re.compile(r"[A-Z]+(?=[A-Z][a-z]|[0-9]|$)|[A-Z]?[a-z]+|[0-9]+")
+_VISIBLE_SELECTOR_WORD = re.compile(r"[^\W_]+", re.UNICODE)
 
 
 def _assistant_message_text(event: AssistantMessage) -> str:
@@ -151,6 +153,29 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise ValueError(f"duplicate JSON object key is not allowed: {key}")
         result[key] = value
     return result
+
+
+def _selector_surface_words(value: str) -> tuple[str, ...]:
+    """Split one registered identifier into the words a person could speak."""
+    words: list[str] = []
+    for segment in re.split(r"[^A-Za-z0-9]+", value):
+        words.extend(match.group(0).casefold() for match in _SELECTOR_NAME_WORD.finditer(segment))
+    return tuple(words)
+
+
+def _contains_spoken_selector_surface(text: str, surfaces: tuple[str, ...]) -> bool:
+    """Reject registered identifiers even when spoken with spaces or punctuation."""
+    visible_words = tuple(match.group(0).casefold() for match in _VISIBLE_SELECTOR_WORD.finditer(text))
+    for surface in surfaces:
+        surface_words = _selector_surface_words(surface)
+        if not surface_words or len(surface_words) > len(visible_words):
+            continue
+        if any(
+            visible_words[index : index + len(surface_words)] == surface_words
+            for index in range(len(visible_words) - len(surface_words) + 1)
+        ):
+            return True
+    return False
 
 
 def _guarded_selector_output_allowed(
@@ -234,11 +259,17 @@ def _guarded_selector_output_allowed(
         seen.add(identity)
 
     spoken_text = remove_unspeechable(text)
+    registered_surfaces = registered_tool_surface_names(tuple(registered_names))
+    spoken_home_assistant_surfaces = registered_tool_surface_names(
+        tuple(name for name in registered_names if name.startswith(HOME_ASSISTANT_TOOL_PREFIX))
+    )
     for visible_text in (text, spoken_text):
         if _GUARDED_PROTOCOL_MARKER.search(visible_text):
             return False
         folded_text = visible_text.casefold()
-        if any(name.casefold() in folded_text for name in registered_tool_surface_names(tuple(registered_names))):
+        if any(name.casefold() in folded_text for name in registered_surfaces):
+            return False
+        if _contains_spoken_selector_surface(visible_text, spoken_home_assistant_surfaces):
             return False
         if HOME_ASSISTANT_TOOL_PREFIX.casefold() in folded_text:
             return False
@@ -879,7 +910,10 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 active_chat = build_active_chat(original_chat, response)
             except ChatItemError as exc:
                 with private_content_redaction(runtime_config) as private_content:
-                    if private_content:
+                    if runtime_config.home_assistant_guard_operational:
+                        error_message = HOME_ASSISTANT_SELECTOR_REJECTED
+                        logger.info("Out-of-band response rejected by the Home Assistant guard")
+                    elif private_content:
                         error_message = "Private out-of-band response rejected."
                         logger.info("Out-of-band response rejected; private content redacted")
                     else:

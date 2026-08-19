@@ -925,6 +925,8 @@ def test_home_assistant_guard_keeps_deliberate_cancellation_non_poisoning_on_pro
         ("<tool_call>private</tool_call>", None, None),
         ("Let me use GetLiveContext to check.", "home_assistant__GetLiveContext", "{}"),
         ("Let me use GetLive\u200bContext to check.", "home_assistant__GetLiveContext", "{}"),
+        ("Let me use Get Live Context to check.", "home_assistant__GetLiveContext", "{}"),
+        ("Let me use Get-Live-Context to check.", "home_assistant__GetLiveContext", "{}"),
         ("HOME_ASSISTANT__UnknownTool", None, None),
         ("HOME\u200b_ASSISTANT__UnknownTool", None, None),
         ("Let me use `GetLiveContext` to check.", "home_assistant__GetLiveContext", "{}"),
@@ -1744,6 +1746,32 @@ def test_private_out_of_band_validation_error_is_content_free(caplog):
 
     assert end is not None
     assert end.error == "Private out-of-band response rejected."
+    assert canary not in caplog.text
+
+
+def test_home_assistant_guard_maps_out_of_band_validation_error_to_selector_rejection(caplog):
+    handler = _make_handler(stream=True)
+    canary = "HOME_ASSISTANT_OOB_INPUT_CANARY"
+    orphan = RealtimeConversationItemFunctionCallOutput(
+        type="function_call_output",
+        call_id=canary,
+        output="{}",
+    )
+    response = RealtimeResponseCreateParams(conversation="none", input=[orphan])
+
+    with caplog.at_level(logging.INFO):
+        text, tools, usage, chat, end = _drive(
+            handler,
+            response=response,
+            tools=_guard_tools(),
+            home_assistant_guard=True,
+        )
+
+    assert text == ""
+    assert tools == []
+    assert usage is None
+    assert end is not None and end.error == HOME_ASSISTANT_SELECTOR_REJECTED
+    assert chat._pending_tool_calls == {}
     assert canary not in caplog.text
 
 

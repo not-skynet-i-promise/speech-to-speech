@@ -195,11 +195,15 @@ accumulating tool fragments, and rejects payload after the terminal frame.
 Transport, timeout, parser, and raw-envelope-limit failures take the same
 content-free sticky-failure path; deliberate cancellation remains
 non-poisoning. Spoken text may contain neither a
-full registered tool name nor its provider-facing Home Assistant suffix, and
+full registered tool name nor its provider-facing Home Assistant suffix,
+including a suffix humanized with spaces or punctuation, and
 any angle-tag, backtick, backslash escape, JSON, assignment, or call surface is
 forbidden. Rejection emits only the
 content-free `home_assistant_selector_rejected` error and a failed response,
 then makes the guard sticky-failed until disconnect.
+Malformed guarded in-band input is validated atomically before history, and a
+malformed out-of-band input takes the same sticky selector-rejection path, so a
+rejected request cannot leave an accepted action-bearing prefix behind.
 
 ---
 

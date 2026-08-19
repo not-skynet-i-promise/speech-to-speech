@@ -1566,6 +1566,40 @@ class TestHandleResponseCreate:
         assert state.runtime_config.chat.buffer == []
         assert canary not in str(state.runtime_config.chat.to_responses_api_chat())
 
+    def test_home_assistant_response_input_rejection_poisoned_without_valid_prefix(self, service, conn_id):
+        state = service._state(conn_id)
+        config = state.runtime_config
+        config.home_assistant_guard_version = 1
+        config.home_assistant_guard_nonce = "19" * 32
+        config.home_assistant_guard_contract_sha256 = "29" * 32
+        config.home_assistant_guard_tool_count = 1
+        config.home_assistant_guard_tool_names = ("home_assistant__GetLiveContext",)
+        canary = "turn off the lights later"
+        event = ResponseCreateEvent(
+            type="response.create",
+            response={
+                "input": [
+                    self._user_input(canary),
+                    {
+                        "type": "function_call_output",
+                        "output": "{}",
+                        "call_id": "call_orphan",
+                    },
+                ]
+            },
+        )
+
+        result = service.handle_response_create(conn_id, event)
+
+        assert isinstance(result, RealtimeErrorEvent)
+        assert result.error.type == "invalid_input_item"
+        assert result.error.message == "Home Assistant guard protocol violation."
+        assert state.in_response is False
+        assert config.home_assistant_guard_failed is True
+        assert config.home_assistant_guard_operational is False
+        assert config.chat.buffer == []
+        assert canary not in str(config.chat.to_responses_api_chat())
+
     def test_double_response_create_rejected(self, service, conn_id, text_prompt_queue):
         """Second response.create is rejected because in_response is set immediately."""
         evt = ResponseCreateEvent(type="response.create")

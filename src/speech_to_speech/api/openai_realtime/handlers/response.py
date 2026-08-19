@@ -209,7 +209,7 @@ class ResponseHandler(RealtimeBaseHandler):
         # the input rides along on the request and seeds a throwaway chat in the LM.
         if not out_of_band and event.response and event.response.input:
             try:
-                if st.runtime_config.transcript_barrier_private:
+                if st.runtime_config.sensitive_content:
                     add_supported_items_atomically(st.runtime_config.chat, list(event.response.input))
                 else:
                     # Preserve the default Realtime behavior: accepted prefix items
@@ -218,6 +218,8 @@ class ResponseHandler(RealtimeBaseHandler):
                     for item in event.response.input:
                         add_supported_item(st.runtime_config.chat, item)
             except ChatItemError as exc:
+                if st.runtime_config.home_assistant_guard_operational:
+                    return self._service.poison_home_assistant_guard(conn_id, "invalid_input_item")
                 return self.make_client_content_error(conn_id, str(exc), "invalid_input_item")
 
         st.in_response = True
