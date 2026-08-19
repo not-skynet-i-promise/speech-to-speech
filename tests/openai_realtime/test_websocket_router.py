@@ -260,6 +260,7 @@ class TestClientEventDispatch:
 
     def test_home_assistant_guard_ready_precedes_audio_and_missing_guard_closes(self, setup):
         app, service, input_queue, *_ = setup
+        service.home_assistant_guard_required = True
         tools = [
             {
                 "type": "function",
@@ -317,26 +318,15 @@ class TestClientEventDispatch:
                 assert error["type"] == "error"
                 assert error["error"]["type"] == "invalid_home_assistant_guard"
 
-    def test_nested_chat_completions_tool_shape_is_still_home_assistant_context(self, setup):
+    def test_response_create_cannot_add_home_assistant_authority_after_session_start(self, setup):
         app, service, *_ = setup
+        service.home_assistant_guard_required = True
         with TestClient(app) as client:
             with client.websocket_connect("/v1/realtime") as ws:
                 ws.receive_json()
                 ws.send_json(
                     {
-                        "type": "session.update",
-                        "session": {
-                            "type": "realtime",
-                            "tools": [
-                                {
-                                    "type": "function",
-                                    "function": {
-                                        "name": "home_assistant__GetLiveContext",
-                                        "parameters": {"type": "object", "properties": {}},
-                                    },
-                                }
-                            ],
-                        },
+                        "type": "response.create",
                     }
                 )
 
@@ -345,29 +335,23 @@ class TestClientEventDispatch:
                 assert error["error"]["type"] == "invalid_home_assistant_guard"
                 assert service.sensitive_content() is True
 
-    def test_response_create_cannot_add_home_assistant_authority_after_session_start(self, setup):
+    def test_required_backend_rejects_non_object_first_event_content_free(self, setup):
         app, service, *_ = setup
+        service.home_assistant_guard_required = True
         with TestClient(app) as client:
             with client.websocket_connect("/v1/realtime") as ws:
                 ws.receive_json()
-                ws.send_json(
-                    {
-                        "type": "response.create",
-                        "response": {
-                            "tools": [
-                                {
-                                    "type": "function",
-                                    "name": "home_assistant__GetLiveContext",
-                                    "parameters": {"type": "object", "properties": {}},
-                                }
-                            ]
-                        },
-                    }
-                )
+                ws.send_json(["not", "an", "event"])
 
                 error = ws.receive_json()
                 assert error["type"] == "error"
-                assert error["error"]["type"] == "invalid_home_assistant_guard"
+                assert error["error"] == {
+                    "type": "invalid_home_assistant_guard",
+                    "code": None,
+                    "event_id": None,
+                    "message": "Home Assistant guard protocol violation.",
+                    "param": None,
+                }
                 assert service.sensitive_content() is True
 
     def test_private_transcript_barrier_malformed_or_duplicate_handshake_fails_closed(self, setup):

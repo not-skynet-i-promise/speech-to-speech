@@ -458,12 +458,13 @@ class TestHandleSessionUpdate:
         assert runtime_config.home_assistant_guard_enabled is False
         assert runtime_config.home_assistant_guard_failed is True
 
-    def test_home_assistant_tools_without_exact_guard_fail_closed(
+    def test_required_home_assistant_backend_rejects_first_update_without_guard(
         self,
         service,
         conn_id,
         runtime_config,
     ):
+        service.home_assistant_guard_required = True
         result = service.handle_session_update(
             conn_id,
             self._make_update(
@@ -471,7 +472,7 @@ class TestHandleSessionUpdate:
                 tools=[
                     {
                         "type": "function",
-                        "name": "home_assistant__GetLiveContext",
+                        "name": "get_local_time",
                         "parameters": {"type": "object", "properties": {}},
                     }
                 ],
@@ -485,7 +486,34 @@ class TestHandleSessionUpdate:
         assert runtime_config.session.instructions is None
         assert runtime_config.session.tools is None
 
-    def test_nested_chat_completions_home_assistant_tool_cannot_bypass_guard(
+    def test_required_home_assistant_backend_rejects_named_tool_choice_without_guard(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+    ):
+        service.home_assistant_guard_required = True
+        result = service.handle_session_update(
+            conn_id,
+            self._make_update(
+                tools=[
+                    {
+                        "type": "function",
+                        "name": "get_local_time",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+                tool_choice={"type": "function", "name": "home_assistant__GetLiveContext"},
+            ),
+        )
+
+        assert isinstance(result, RealtimeErrorEvent)
+        assert result.error.type == "invalid_home_assistant_guard"
+        assert runtime_config.home_assistant_guard_enabled is False
+        assert runtime_config.home_assistant_guard_failed is True
+        assert runtime_config.session.tools is None
+
+    def test_ordinary_backend_does_not_infer_guard_policy_from_tool_names(
         self,
         service,
         conn_id,
@@ -502,15 +530,18 @@ class TestHandleSessionUpdate:
                             "parameters": {"type": "object", "properties": {}},
                         },
                     }
-                ]
+                ],
+                tool_choice={"type": "function", "name": "home_assistant__GetLiveContext"},
             ),
         )
 
-        assert isinstance(result, RealtimeErrorEvent)
-        assert result.error.type == "invalid_home_assistant_guard"
+        assert result is None
         assert runtime_config.home_assistant_guard_enabled is False
-        assert runtime_config.home_assistant_guard_failed is True
-        assert runtime_config.session.tools is None
+        assert runtime_config.home_assistant_guard_failed is False
+
+    def test_required_guard_needs_complete_chat_completions_quarantine(self):
+        with pytest.raises(ValueError, match="complete Chat Completions quarantine"):
+            RealtimeService(home_assistant_guard_required=True)
 
     def test_home_assistant_guard_rejects_backend_without_complete_output_quarantine(self):
         cancel_scope = CancelScope()
@@ -1207,34 +1238,17 @@ class TestHandleResponseCreate:
         assert req.response.tool_choice == "auto"
         assert req.runtime_config is runtime_config
 
-    @pytest.mark.parametrize(
-        "tool",
-        [
-            {
-                "type": "function",
-                "name": "home_assistant__GetLiveContext",
-                "parameters": {"type": "object", "properties": {}},
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "home_assistant__GetLiveContext",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            },
-        ],
-    )
-    def test_response_create_cannot_introduce_unguarded_home_assistant_tools(
+    def test_required_home_assistant_backend_rejects_response_before_handshake(
         self,
         service,
         conn_id,
         runtime_config,
         text_prompt_queue,
-        tool,
     ):
+        service.home_assistant_guard_required = True
         result = service.handle_response_create(
             conn_id,
-            ResponseCreateEvent(type="response.create", response={"tools": [tool]}),
+            ResponseCreateEvent(type="response.create"),
         )
 
         assert isinstance(result, RealtimeErrorEvent)

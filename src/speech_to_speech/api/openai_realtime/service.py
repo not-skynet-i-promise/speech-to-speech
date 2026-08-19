@@ -41,7 +41,6 @@ from speech_to_speech.api.openai_realtime.handlers import (
 from speech_to_speech.api.openai_realtime.home_assistant_guard import (
     HOME_ASSISTANT_SELECTOR_REJECTED,
     HomeAssistantGuardReadyEvent,
-    contains_home_assistant_tool_identity,
     session_contract,
     valid_guarded_tool_choice,
 )
@@ -238,6 +237,7 @@ class RealtimeService:
         speculative_turns: SpeculativeTurnTracker | None = None,
         cancel_scope: CancelScope | None = None,
         home_assistant_guard_supported: bool = False,
+        home_assistant_guard_required: bool = False,
     ) -> None:
         self.text_prompt_queue = text_prompt_queue
         self.should_listen = should_listen
@@ -245,6 +245,9 @@ class RealtimeService:
         self.speculative_turns = speculative_turns
         self.cancel_scope = cancel_scope
         self.home_assistant_guard_supported = home_assistant_guard_supported
+        self.home_assistant_guard_required = home_assistant_guard_required
+        if home_assistant_guard_required and not home_assistant_guard_supported:
+            raise ValueError("required Home Assistant guard needs complete Chat Completions quarantine")
         self._cancel_scope_wiring_verified = False
         self._conns: dict[str, ConnState] = {}
         self.total_usage = GlobalUsageMetrics()
@@ -320,10 +323,16 @@ class RealtimeService:
 
     def parse_client_event(
         self,
-        raw: Mapping[str, object],
+        raw: object,
         *,
         redact_private_content: bool = False,
     ) -> Optional[ClientEvent]:
+        if not isinstance(raw, Mapping):
+            if redact_private_content:
+                logger.warning("Private client event must be an object; content redacted")
+            else:
+                logger.warning("Client event must be a JSON object")
+            return None
         raw_type = raw.get("type")
         event_type: Optional[str] = raw_type if isinstance(raw_type, str) else None
         if event_type is None:
@@ -386,6 +395,13 @@ class RealtimeService:
         if len(self._conns) != 1:
             return False
         return next(iter(self._conns.values())).runtime_config.home_assistant_guard_enabled
+
+    def home_assistant_guard_pending(self, conn_id: str) -> bool:
+        """Return whether this dedicated backend still awaits its first guard handshake."""
+        cfg = self._state(conn_id).runtime_config
+        return self.home_assistant_guard_required and not (
+            cfg.home_assistant_guard_enabled or cfg.home_assistant_guard_failed
+        )
 
     def private_protocol_failed(self, conn_id: str) -> bool:
         return self._state(conn_id).runtime_config.private_protocol_failed
@@ -490,6 +506,8 @@ class RealtimeService:
         cfg = self._state(conn_id).runtime_config
         if cfg.transcript_barrier_pending:
             return self.poison_transcript_barrier(conn_id, "transcript_barrier_pending")
+        if self.home_assistant_guard_pending(conn_id):
+            return self.poison_home_assistant_guard(conn_id, "invalid_home_assistant_guard")
         response = event.response
         if (
             cfg.home_assistant_guard_enabled
@@ -498,9 +516,6 @@ class RealtimeService:
         ):
             return self.poison_home_assistant_guard(conn_id, "invalid_home_assistant_guard")
         explicit_tools = response is not None and "tools" in response.model_fields_set
-        response_has_home_assistant = response is not None and contains_home_assistant_tool_identity(response.tools)
-        if response_has_home_assistant and not cfg.home_assistant_guard_operational:
-            return self.poison_home_assistant_guard(conn_id, "invalid_home_assistant_guard")
         if explicit_tools and cfg.home_assistant_guard_enabled:
             assert response is not None
             try:

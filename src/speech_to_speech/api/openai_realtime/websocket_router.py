@@ -21,7 +21,6 @@ from starlette.websockets import WebSocketState
 
 from speech_to_speech.api.openai_realtime.home_assistant_guard import (
     HOME_ASSISTANT_GUARD_FIELD,
-    contains_home_assistant_tool_identity,
 )
 from speech_to_speech.api.openai_realtime.pipeline_unit import PipelineUnit, SessionState
 from speech_to_speech.api.openai_realtime.service import ServerEvent, build_error_event
@@ -63,18 +62,11 @@ def _requests_private_transcript_barrier(raw: object) -> bool:
     return isinstance(session, Mapping) and TRANSCRIPT_BARRIER_FIELD in session
 
 
-def _home_assistant_guard_context(raw: object) -> bool:
-    if not isinstance(raw, Mapping):
+def _requests_home_assistant_guard(raw: object) -> bool:
+    if not isinstance(raw, Mapping) or raw.get("type") != "session.update":
         return False
-    if raw.get("type") == "session.update":
-        session = raw.get("session")
-        return isinstance(session, Mapping) and (
-            HOME_ASSISTANT_GUARD_FIELD in session or contains_home_assistant_tool_identity(session.get("tools"))
-        )
-    if raw.get("type") == "response.create":
-        response = raw.get("response")
-        return isinstance(response, Mapping) and contains_home_assistant_tool_identity(response.get("tools"))
-    return False
+    session = raw.get("session")
+    return isinstance(session, Mapping) and HOME_ASSISTANT_GUARD_FIELD in session
 
 
 def _as_event_list(result: ServerEvent | list[ServerEvent] | None) -> list[ServerEvent]:
@@ -389,6 +381,9 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
         unit.session.session_id = session_id
         logger.info(f"Client connected to pipeline {unit.index} (session {session_id})")
 
+        if unit.service.home_assistant_guard_required:
+            _mark_websocket_private(ws)
+
         # Defensive: drain edge queues and reset events so stale data from a
         # previous session that survived SESSION_END propagation doesn't leak.
         _clean_unit(unit)
@@ -403,7 +398,9 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                     continue
 
                 activation_requested = _requests_private_transcript_barrier(raw)
-                home_assistant_context = _home_assistant_guard_context(raw)
+                home_assistant_context = unit.service.home_assistant_guard_required or _requests_home_assistant_guard(
+                    raw
+                )
                 if activation_requested or home_assistant_context:
                     _mark_websocket_private(ws)
                 redact_private_content = _websocket_is_private(ws) or unit.service.sensitive_content()
@@ -412,6 +409,7 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                     redact_private_content=redact_private_content,
                 )
                 if event is None:
+                    raw_type = raw.get("type") if isinstance(raw, Mapping) else None
                     if activation_requested:
                         await _send_event(
                             ws,
@@ -432,7 +430,7 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                         )
                         await ws.close(code=1008, reason="Home Assistant guard negotiation failed")
                         return
-                    if raw.get("type") == "reachy.transcript_barrier.resolve":
+                    if raw_type == "reachy.transcript_barrier.resolve":
                         await _send_event(
                             ws,
                             unit.service.poison_transcript_barrier(
@@ -445,10 +443,21 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                     message = (
                         "Unknown or invalid private client event."
                         if redact_private_content
-                        else f"Unknown or invalid event: {raw.get('type')}"
+                        else f"Unknown or invalid event: {raw_type}"
                     )
                     await _send_event(ws, unit.service.make_error(message, "unknown_or_invalid_event"))
                     continue
+
+                if unit.service.home_assistant_guard_pending(session_id) and not isinstance(event, SessionUpdateEvent):
+                    await _send_event(
+                        ws,
+                        unit.service.poison_home_assistant_guard(
+                            session_id,
+                            "invalid_home_assistant_guard",
+                        ),
+                    )
+                    await ws.close(code=1008, reason="Home Assistant guard negotiation failed")
+                    return
 
                 if isinstance(event, InputAudioBufferAppendEvent):
                     if not unit.service.transcript_barrier_audio_allowed(session_id):

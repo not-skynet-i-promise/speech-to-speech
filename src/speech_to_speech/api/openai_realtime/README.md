@@ -143,16 +143,25 @@ session-voice, WebSocket-route, and send-loop failures use the same sticky
 redaction boundary. Clients that do not request this extension keep the
 standard Realtime behavior described above.
 
-### Opt-in Home Assistant selector guard
+### Required Home Assistant selector guard
 
-Trusted local clients that expose any `home_assistant__*` tool must also opt in
-on their first `session.update` with `reachy_home_assistant_guard`. The request
+A dedicated Home Assistant backend is started with
+`--require_home_assistant_guard true` and the Chat Completions backend. In this
+mode the server marks the WebSocket private immediately and accepts no client
+event until the exact first `session.update` completes
+`reachy_home_assistant_guard`. The request
 contains version `1`, a fresh 64-character lowercase hexadecimal nonce, the
 SHA-256 digest of the complete canonical instructions-and-tools contract, and
 the total tool count. The digest covers every tool in order, including non-Home
-Assistant tools; omitting or changing any tool invalidates the handshake. Only
-the Chat Completions backend advertises the complete-output quarantine needed
-by this initial extension; other backends reject the handshake.
+Assistant tools; omitting or changing any tool invalidates the handshake. The
+required mode is rejected for other pipeline modes or LLM backends because only
+Realtime Chat Completions supplies the complete-output quarantine.
+
+An ordinary backend keeps its existing behavior and does not infer security
+policy by recursively searching arbitrary tool or `tool_choice` payloads. A
+Chat Completions client may explicitly request the same guard handshake, but
+production Home Assistant deployment must use required mode so an unguarded
+client cannot create a session at all.
 Every tool must use the canonical flat Realtime function shape; nested
 Chat-Completions tools and unknown schema fields fail closed. A
 `response.create` cannot introduce Home Assistant tools. After activation, an

@@ -17,7 +17,6 @@ from speech_to_speech.api.openai_realtime.home_assistant_guard import (
     HOME_ASSISTANT_GUARD_VERSION,
     HOME_ASSISTANT_TOOL_PREFIX,
     HomeAssistantGuardReadyEvent,
-    contains_home_assistant_tool_identity,
     parse_home_assistant_guard_request,
     session_contract,
     valid_guarded_tool_choice,
@@ -60,7 +59,8 @@ class SessionHandler(RealtimeBaseHandler):
         extra = s.model_extra or {}
         barrier_requested = TRANSCRIPT_BARRIER_FIELD in extra
         home_assistant_requested = HOME_ASSISTANT_GUARD_FIELD in extra
-        private_request = barrier_requested or home_assistant_requested
+        home_assistant_required = self._service.home_assistant_guard_required
+        private_request = barrier_requested or home_assistant_requested or home_assistant_required
 
         if isinstance(s, RealtimeTranscriptionSessionCreateRequest):
             barrier_error = None
@@ -69,7 +69,7 @@ class SessionHandler(RealtimeBaseHandler):
                     conn_id,
                     "invalid_transcript_barrier",
                 )
-            if home_assistant_requested:
+            if home_assistant_requested or home_assistant_required:
                 home_assistant_error = self._service.poison_home_assistant_guard(
                     conn_id,
                     "invalid_home_assistant_guard",
@@ -117,8 +117,7 @@ class SessionHandler(RealtimeBaseHandler):
 
         home_assistant_context = (
             home_assistant_requested
-            or has_home_assistant_tools
-            or contains_home_assistant_tool_identity(getattr(s, "tools", None))
+            or home_assistant_required
             or cfg.home_assistant_guard_enabled
             or cfg.home_assistant_guard_failed
         )

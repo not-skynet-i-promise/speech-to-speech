@@ -526,6 +526,7 @@ def _build_realtime_pipeline_unit(
         speculative_turns=speculative_turns,
         cancel_scope=cancel_scope,
         home_assistant_guard_supported=module_kwargs.llm_backend == "chat-completions",
+        home_assistant_guard_required=module_kwargs.require_home_assistant_guard,
     )
 
     if module_kwargs.enable_live_transcription:
@@ -1033,6 +1034,11 @@ def main() -> None:
             f"--num_pipelines > 1 is only supported with --mode realtime "
             f"(got mode={args.module_kwargs.mode!r}, num_pipelines={args.module_kwargs.num_pipelines})"
         )
+
+    if args.module_kwargs.require_home_assistant_guard and (
+        args.module_kwargs.mode != "realtime" or args.module_kwargs.llm_backend != "chat-completions"
+    ):
+        raise ValueError("--require_home_assistant_guard requires --mode realtime and --llm_backend chat-completions")
 
     # On Apple Silicon, all MLX inference serializes through a global lock (utils/mlx_lock.py).
     # The progressive STT path uses a short timeout and drops work under contention, producing

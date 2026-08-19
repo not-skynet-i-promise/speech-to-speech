@@ -1,4 +1,4 @@
-"""Opt-in Home Assistant selector guard for trusted local realtime clients."""
+"""Home Assistant selector guard for trusted local realtime clients."""
 
 from __future__ import annotations
 
@@ -34,24 +34,6 @@ def _jsonable_tool(tool: object) -> dict[str, Any]:
     if set(value) - _CANONICAL_FUNCTION_TOOL_FIELDS:
         raise ValueError("tool schema contains noncanonical fields")
     return value
-
-
-def contains_home_assistant_tool_identity(value: object) -> bool:
-    """Return whether a possibly noncanonical tool value carries HA identity.
-
-    OpenAI's permissive Pydantic models retain unknown nested fields.  Inspect
-    the complete value rather than only a normalized top-level ``name`` so a
-    Chat-Completions-shaped tool cannot bypass guard activation.
-    """
-    if isinstance(value, BaseModel):
-        value = value.model_dump(mode="json", exclude_none=True)
-    if isinstance(value, str):
-        return value.startswith(HOME_ASSISTANT_TOOL_PREFIX)
-    if isinstance(value, Mapping):
-        return any(contains_home_assistant_tool_identity(item) for item in value.values())
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return any(contains_home_assistant_tool_identity(item) for item in value)
-    return False
 
 
 def registered_tool_surface_names(names: Sequence[str]) -> tuple[str, ...]:
@@ -123,7 +105,7 @@ def parse_home_assistant_guard_request(
 
 
 class HomeAssistantGuardReadyEvent(BaseModel):
-    """Acknowledgement required before an opted-in client sends microphone audio."""
+    """Acknowledgement required before a guarded client sends microphone audio."""
 
     model_config = ConfigDict(extra="forbid")
 
