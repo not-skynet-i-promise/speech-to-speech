@@ -547,7 +547,8 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                         return
 
                 elif isinstance(event, ResponseCancelEvent):
-                    was_active = unit.service._state(session_id).in_response
+                    response_state = unit.service._state(session_id)
+                    was_active = response_state.in_response or response_state.response_pending
                     if was_active:
                         unit.cancel_scope.cancel()
                     _flush_queue(unit.output_queue, preserve=_keep_audio_sentinel)

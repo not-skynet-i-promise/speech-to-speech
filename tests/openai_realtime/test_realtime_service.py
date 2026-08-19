@@ -1439,6 +1439,7 @@ class TestHandleResponseCreate:
         assert initial_req.turn_id == "turn_1"
         assert initial_req.turn_revision == 2
         assert initial_req.speech_stopped_at_s == 123.0
+        assert service.finish_response(conn_id) == []
 
         result = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
 
@@ -1650,6 +1651,7 @@ class TestHandleResponseCreate:
             ),
         )
         text_prompt_queue.get()  # drain the STT-triggered request
+        assert service.finish_response(conn_id) == []
 
         result = service.handle_response_create(
             conn_id, ResponseCreateEvent(type="response.create", response={"conversation": "none"})
@@ -1695,6 +1697,34 @@ class TestHandleResponseCancel:
     def test_cancel_no_active_response(self, service, conn_id):
         events = service.handle_response_cancel(conn_id)
         assert events == []
+
+    def test_cancel_pending_automatic_response(self, service, conn_id):
+        state = service._state(conn_id)
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="Is the bedroom light on?"),
+        )
+        assert state.response_pending is True
+        assert state.in_response is False
+
+        assert service.handle_response_cancel(conn_id) == []
+        assert state.response_pending is False
+        assert state.in_response is False
+
+    def test_response_create_rejects_pending_automatic_response(self, service, conn_id):
+        state = service._state(conn_id)
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="Is the bedroom light on?"),
+        )
+        assert state.response_pending is True
+
+        result = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+
+        assert isinstance(result, RealtimeErrorEvent)
+        assert result.error.type == "conversation_already_has_active_response"
+        assert state.response_pending is True
+        assert state.in_response is False
 
 
 # ===================================================================

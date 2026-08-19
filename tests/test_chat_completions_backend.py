@@ -45,6 +45,7 @@ from speech_to_speech.LLM.chat_completions_language_model import (
 )
 from speech_to_speech.LLM.tool_call.function_tool import MAX_TOOL_CALLS_PER_RESPONSE
 from speech_to_speech.pipeline.cancel_scope import CancelScope
+from speech_to_speech.pipeline.events import TranscriptionCompletedEvent
 from speech_to_speech.pipeline.messages import (
     EndOfResponse,
     GenerateResponseRequest,
@@ -192,6 +193,34 @@ def test_cancelled_queued_request_cannot_start_after_private_barrier_ready():
 
     assert handler.client.chat.completions.last_kwargs is None
     assert outputs == [EndOfResponse(cancel_generation=0)]
+    service.unregister(conn_id)
+
+
+def test_cancelled_pending_automatic_request_never_reaches_provider():
+    text_prompt_queue: queue.Queue = queue.Queue()
+    cancel_scope = CancelScope()
+    service = RealtimeService(text_prompt_queue=text_prompt_queue, cancel_scope=cancel_scope)
+    conn_id = service.register()
+
+    service.dispatch_pipeline_event(
+        conn_id,
+        TranscriptionCompletedEvent(transcript="Is the bedroom light on?"),
+    )
+    request = text_prompt_queue.get(timeout=1.0)
+    assert isinstance(request, GenerateResponseRequest)
+    assert request.cancel_generation == 0
+    assert service._state(conn_id).response_pending is True
+
+    cancel_scope.cancel()
+    service.handle_response_cancel(conn_id)
+    handler = _make_handler(stream=False, cancel_scope=cancel_scope)
+    handler.client.chat.completions.last_kwargs = None
+
+    outputs = list(handler.process(request))
+
+    assert handler.client.chat.completions.last_kwargs is None
+    assert outputs == [EndOfResponse(cancel_generation=0)]
+    assert service._state(conn_id).response_pending is False
     service.unregister(conn_id)
 
 

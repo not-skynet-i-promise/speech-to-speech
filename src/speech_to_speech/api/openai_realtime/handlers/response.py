@@ -196,7 +196,7 @@ class ResponseHandler(RealtimeBaseHandler):
                     message="Only string tool_choice values are supported for now (auto, required, none).",
                     _type="tool_choice_not_supported",
                 )
-        if st.in_response:
+        if st.in_response or st.response_pending:
             return self.make_error(
                 message="Cannot create response while another response is in progress.",
                 _type="conversation_already_has_active_response",
@@ -311,6 +311,11 @@ class ResponseHandler(RealtimeBaseHandler):
                 )
             )
             self._end_response(conn_id, status)
+        elif st.response_pending:
+            # An automatic response may be queued before its first output creates a
+            # protocol response. Cancellation/terminalization must still retire that
+            # exact generation even though there is no response ID to report.
+            st.response_pending = False
         # Apply any client items that arrived mid-generation now that in_response
         # is cleared and the generation's own write-back has landed. Done outside
         # the in_response guard so a stray terminal call still drains the buffer.
