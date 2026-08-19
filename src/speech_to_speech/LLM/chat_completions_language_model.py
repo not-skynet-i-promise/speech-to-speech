@@ -301,7 +301,6 @@ class ChatCompletionsApiModelHandler(BaseOpenAICompatibleHandler):
         if not turn.runtime_config.home_assistant_guard_operational:
             return super()._events_for_turn(api_response, optional_kwargs, turn, streaming=streaming)
         if streaming:
-            turn.runtime_config.fail_home_assistant_guard()
             raise HomeAssistantSelectorRejected("guarded selector unexpectedly streamed")
         try:
             events = self._guarded_response_events(
@@ -310,7 +309,6 @@ class ChatCompletionsApiModelHandler(BaseOpenAICompatibleHandler):
                 tool_choice=optional_kwargs.get("tool_choice"),
             )
         except (MemoryError, RecursionError, TypeError, UnicodeError, ValueError):
-            turn.runtime_config.fail_home_assistant_guard()
             raise HomeAssistantSelectorRejected("guarded selector output rejected") from None
         return iter(events)
 

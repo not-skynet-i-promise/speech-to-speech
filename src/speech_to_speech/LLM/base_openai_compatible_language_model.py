@@ -618,15 +618,12 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     logger.error("LLM generation failed; private content redacted")
                 else:
                     logger.exception("LLM generation failed; ending the current response")
-                if (
-                    guarded_turn
-                    and not self._generation_is_stale(turn.gen)
-                    and self._turn_output_allowed(
+                if guarded_turn:
+                    if not self._generation_is_stale(turn.gen) and self._turn_output_allowed(
                         turn.turn_id,
                         turn.turn_revision,
-                    )
-                ):
-                    turn.runtime_config.fail_home_assistant_guard()
+                    ):
+                        turn.runtime_config.fail_home_assistant_guard()
                     error_message = None
                 elif error_message is None:
                     error_message = (

@@ -509,6 +509,31 @@ def test_guarded_provider_failure_is_content_free_and_sticky_but_cancellation_wi
     assert runtime.home_assistant_guard_operational
 
 
+def test_guarded_selector_rejection_during_cancellation_does_not_poison():
+    scope = CancelScope()
+    handler = _make_handler(stream=True, cancel_scope=scope)
+    handler.client.chat.completions.next_result = _complete_response(content="unsafe")
+    capture = []
+
+    def cancel_then_reject(*_args, **_kwargs):
+        scope.cancel()
+        raise ValueError("cancelled selector canary")
+
+    handler._guarded_response_events = cancel_then_reject
+    text, tools, usage, chat, end = _drive(
+        handler,
+        tools=_guard_tools(),
+        tool_choice="auto",
+        home_assistant_guard=True,
+        runtime_capture=capture,
+    )
+
+    assert (text, tools, usage) == ("", [], None)
+    assert end == EndOfResponse(turn_id="t", turn_revision=0, cancel_generation=0)
+    assert capture[0].home_assistant_guard_operational
+    assert chat.buffer[-1].role == "user"
+
+
 def test_guarded_pre_provider_serialization_failure_is_content_free_and_sticky():
     handler = _make_handler(stream=True)
 

@@ -913,6 +913,50 @@ class TestDeferConversationItemsDuringResponse:
         assert chat._has_call_id_in_buffer("call_1")
         assert chat.buffer[-1].type == "function_call_output"
 
+    def test_guarded_deferred_batch_is_atomic_when_later_output_is_invalid(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+    ):
+        from openai.types.realtime.realtime_conversation_item_function_call import (
+            RealtimeConversationItemFunctionCall,
+        )
+
+        _activate_home_assistant_guard(service, conn_id)
+        st = service._state(conn_id)
+        chat = runtime_config.chat
+        chat.add_item(
+            RealtimeConversationItemFunctionCall(
+                type="function_call",
+                call_id="call_valid",
+                name="home_assistant__GetLiveContext",
+                arguments="{}",
+            )
+        )
+        st.in_response = True
+        for call_id in ("call_valid", "call_unknown"):
+            assert (
+                service.handle_conversation_item_create(
+                    conn_id,
+                    ConversationItemCreateEvent(
+                        type="conversation.item.create",
+                        item={"type": "function_call_output", "output": "ok", "call_id": call_id},
+                    ),
+                )
+                == []
+            )
+
+        events = service.finish_response(conn_id)
+
+        assert runtime_config.home_assistant_guard_failed
+        assert st.deferred_items == []
+        assert "call_valid" in chat._pending_tool_calls
+        assert not any(getattr(item, "type", None) == "function_call_output" for item in chat.buffer)
+        assert not any(isinstance(event, ConversationItemCreatedEvent) for event in events)
+        errors = [event for event in events if isinstance(event, RealtimeErrorEvent)]
+        assert len(errors) == 1 and errors[0].error.type == "invalid_conversation_item"
+
 
 # ===================================================================
 # Audio commit
@@ -1869,6 +1913,136 @@ class TestDispatchPipelineEvent:
         assert isinstance(result["events"][1], ResponseAudioTranscriptDoneEvent)
         assert result["events"][1].transcript == "latest"
         assert tracker.is_committed("turn_1", 0)
+        service.unregister(conn_id)
+
+    def test_assistant_text_retries_reopen_without_holding_private_failure_lock(
+        self,
+        runtime_config,
+        should_listen,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        tracker = SpeculativeTurnTracker()
+        cancel_scope = CancelScope()
+        service = RealtimeService(
+            should_listen=should_listen,
+            speculative_turns=tracker,
+            cancel_scope=cancel_scope,
+        )
+        assert service.verify_cancel_scope_wiring(cancel_scope, cancel_scope)
+        conn_id = service.register()
+        service._state(conn_id).runtime_config = runtime_config
+        _activate_home_assistant_guard(service, conn_id)
+        tracker.observe("turn_1", 0)
+        original_check = service._is_stale_turn_event
+        reopen_started = Event()
+        candidate_revision: list[int] = []
+
+        def start_reopen_after_first_check(event, *, wait_for_pending_reopen=True):
+            if not reopen_started.is_set():
+                candidate = tracker.begin_reopen_candidate("turn_1", 0)
+                assert candidate is not None
+                candidate_revision.append(candidate)
+                reopen_started.set()
+                return False
+            return original_check(event, wait_for_pending_reopen=wait_for_pending_reopen)
+
+        monkeypatch.setattr(service, "_is_stale_turn_event", start_reopen_after_first_check)
+        dispatched = Event()
+        result: dict[str, object] = {}
+
+        def dispatch() -> None:
+            result["events"] = service.dispatch_pipeline_event(
+                conn_id,
+                AssistantTextEvent(text="must stay private", turn_id="turn_1", turn_revision=0),
+            )
+            dispatched.set()
+
+        dispatch_thread = Thread(target=dispatch)
+        dispatch_thread.start()
+        assert reopen_started.wait(1.0)
+
+        poisoned = Event()
+
+        def poison() -> None:
+            runtime_config.fail_home_assistant_guard()
+            poisoned.set()
+
+        poison_thread = Thread(target=poison)
+        poison_thread.start()
+        assert poisoned.wait(0.25), "speculative wait held the private-failure lock"
+        tracker.cancel_reopen_candidate("turn_1", candidate_revision[0])
+        assert dispatched.wait(1.0)
+        dispatch_thread.join(timeout=1.0)
+        poison_thread.join(timeout=1.0)
+
+        assert result["events"] == []
+        assert runtime_config.home_assistant_guard_failed
+        assert service._state(conn_id).current_response_id is None
+        service.unregister(conn_id)
+
+    def test_guard_failure_cannot_linearize_inside_terminal_deferred_flush(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        _activate_home_assistant_guard(service, conn_id)
+        st = service._state(conn_id)
+        st.in_response = True
+        service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "msg_guarded",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "accepted first"}],
+                },
+            ),
+        )
+        original_flush = service.conversation.flush_deferred_items
+        flush_entered = Event()
+        release_flush = Event()
+
+        def blocked_flush(flush_conn_id: str):
+            flush_entered.set()
+            assert release_flush.wait(1.0)
+            return original_flush(flush_conn_id)
+
+        monkeypatch.setattr(service.conversation, "flush_deferred_items", blocked_flush)
+        finished = Event()
+        result: dict[str, object] = {}
+
+        def finish() -> None:
+            result["events"] = service.finish_response(conn_id)
+            finished.set()
+
+        finish_thread = Thread(target=finish)
+        finish_thread.start()
+        assert flush_entered.wait(1.0)
+        poisoned = Event()
+
+        def poison() -> None:
+            runtime_config.fail_home_assistant_guard()
+            poisoned.set()
+
+        poison_thread = Thread(target=poison)
+        poison_thread.start()
+        assert not poisoned.wait(0.05), "failure crossed the terminal sink boundary"
+        release_flush.set()
+        assert finished.wait(1.0)
+        assert poisoned.wait(1.0)
+        finish_thread.join(timeout=1.0)
+        poison_thread.join(timeout=1.0)
+
+        user_texts = [
+            item.content[0].text for item in runtime_config.chat.buffer if getattr(item, "role", None) == "user"
+        ]
+        assert user_texts == ["accepted first"]
+        assert any(isinstance(event, ConversationItemCreatedEvent) for event in result["events"])
+        assert runtime_config.home_assistant_guard_failed
         service.unregister(conn_id)
 
     def test_token_usage_waits_for_pending_reopen_and_drops_confirmed_stale_turn(
@@ -3512,6 +3686,43 @@ def test_guarded_response_override_must_match_or_explicitly_disable_tools(
     assert rejected.error.type == "invalid_home_assistant_guard"
     assert runtime_config.home_assistant_guard_failed
     assert text_prompt_queue.empty()
+
+
+def test_guarded_action_response_changed_instructions_rejects_bound_tools(
+    service: RealtimeService,
+    conn_id: str,
+    runtime_config,
+    text_prompt_queue: Queue,
+) -> None:
+    _activate_home_assistant_guard(service, conn_id)
+
+    rejected = service.handle_response_create(
+        conn_id,
+        ResponseCreateEvent(type="response.create", response={"instructions": "Changed authority."}),
+    )
+
+    assert isinstance(rejected, RealtimeErrorEvent)
+    assert rejected.error.type == "invalid_home_assistant_guard"
+    assert runtime_config.home_assistant_guard_failed
+    assert text_prompt_queue.empty()
+
+
+def test_guarded_action_response_accepts_omitted_or_exact_instructions(
+    service: RealtimeService,
+    conn_id: str,
+    text_prompt_queue: Queue,
+) -> None:
+    _activate_home_assistant_guard(service, conn_id)
+
+    for response in ({"metadata": {"case": "omitted"}}, {"instructions": "Use exposed tools."}):
+        created = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(type="response.create", response=response),
+        )
+        assert isinstance(created, ResponseCreatedEvent)
+        request = text_prompt_queue.get_nowait()
+        assert isinstance(request, GenerateResponseRequest)
+        service.finish_response(conn_id)
 
 
 def test_guarded_tools_disabled_private_narration_is_allowed(

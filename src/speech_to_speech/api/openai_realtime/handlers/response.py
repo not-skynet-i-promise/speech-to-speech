@@ -317,8 +317,16 @@ class ResponseHandler(RealtimeBaseHandler):
         # is cleared and the generation's own write-back has landed. Done outside
         # the in_response guard so a stray terminal call still drains the buffer.
         cfg = st.runtime_config
-        if not cfg.transcript_barrier_pending and not cfg.private_protocol_failed:
-            events.extend(self._service.conversation.flush_deferred_items(conn_id))
+        if cfg.sensitive_content:
+            with cfg.transcript_barrier_state_guard():
+                if not cfg.transcript_barrier_pending and not cfg.private_protocol_failed:
+                    events.extend(self._service.conversation.flush_deferred_items(conn_id))
+        elif not cfg.transcript_barrier_pending:
+            # An ordinary provider may still own the content guard while a
+            # cancelled response is closing. Private activation is separately
+            # serialized against its response lease, so do not wait here.
+            if not cfg.private_protocol_failed:
+                events.extend(self._service.conversation.flush_deferred_items(conn_id))
         return events
 
     # ── Pipeline event handlers ───────────────────

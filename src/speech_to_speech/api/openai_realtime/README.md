@@ -158,8 +158,9 @@ audio or conversation input is accepted. The guard and private transcript
 barrier may be activated atomically in the same update; their ready events are
 then emitted in that order.
 
-The acknowledged catalog cannot be replaced. A later explicit response tool
-list must match it exactly; omission inherits it. An out-of-band private
+The acknowledged action contract cannot be replaced. Every action-capable
+response uses the acknowledged instructions and tools; explicit values must
+hash to that same contract, while omission inherits it. An out-of-band private
 narration response is allowed only with `tool_choice="none"` and an omitted or
 empty tool list. Missing, malformed, duplicate, late, or mismatched negotiation
 and semantic-invalid guarded client items make the session sticky-failed and

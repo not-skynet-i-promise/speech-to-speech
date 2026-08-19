@@ -539,9 +539,14 @@ class RealtimeService:
                 tools_disabled = response.tool_choice == "none" and (not explicit_tools or response.tools == [])
                 if is_out_of_band(response) and not tools_disabled:
                     return self.poison_home_assistant_guard(conn_id, "invalid_home_assistant_guard")
-                if explicit_tools and not tools_disabled:
+                if not tools_disabled:
+                    effective_instructions = response.instructions or cfg.session.instructions
+                    effective_tools = response.tools if explicit_tools else cfg.session.tools
                     try:
-                        digest, tool_count, tool_names = session_contract(cfg.session.instructions, response.tools)
+                        digest, tool_count, tool_names = session_contract(
+                            effective_instructions,
+                            effective_tools,
+                        )
                     except (TypeError, ValueError):
                         return self.poison_home_assistant_guard(conn_id, "invalid_home_assistant_guard")
                     if (
@@ -689,40 +694,52 @@ class RealtimeService:
         wait_for_pending_reopen: bool,
     ) -> list[ServerEvent] | None:
         cfg = self._state(conn_id).runtime_config
-        is_stale = self._is_stale_turn_event(event, wait_for_pending_reopen=wait_for_pending_reopen)
-        if is_stale is None:
-            return None
-        if is_stale:
-            logger.info(
-                "Ignoring stale %s for turn=%s rev=%s",
-                event.type,
-                getattr(event, "turn_id", None),
-                getattr(event, "turn_revision", None),
-            )
-            return []
-
-        with cfg.transcript_barrier_state_guard():
-            if cfg.private_protocol_failed:
-                logger.debug("Dropping pipeline event after private barrier failure")
-                return []
-            if cfg.transcript_barrier_enabled and isinstance(
-                event,
-                (PartialTranscriptionEvent, TranscriptionCompletedEvent),
-            ):
-                logger.info("Rejecting ordinary transcription event after private barrier activation")
-                return [self.poison_transcript_barrier(conn_id, "invalid_transcript_barrier_event")]
-            self._observe_turn_event(event)
-            if isinstance(event, AssistantTextEvent):
-                return self.response.on_assistant_text(
-                    conn_id,
-                    event,
-                    wait_for_pending_reopen=wait_for_pending_reopen,
+        while True:
+            # The speculative tracker may wait for its reopen grace. Never do
+            # that while holding the private-failure lock: provider rejection
+            # must be able to poison the session immediately.
+            is_stale = self._is_stale_turn_event(event, wait_for_pending_reopen=wait_for_pending_reopen)
+            if is_stale is None:
+                return None
+            if is_stale:
+                logger.info(
+                    "Ignoring stale %s for turn=%s rev=%s",
+                    event.type,
+                    getattr(event, "turn_id", None),
+                    getattr(event, "turn_revision", None),
                 )
-            handler = self._pipeline_dispatch.get(type(event))
-            if handler is None:
-                logger.debug("Unhandled pipeline event type: %s", type(event).__name__)
                 return []
-            return handler(conn_id, event)
+
+            with cfg.transcript_barrier_state_guard():
+                if cfg.private_protocol_failed:
+                    logger.debug("Dropping pipeline event after private barrier failure")
+                    return []
+                if cfg.transcript_barrier_enabled and isinstance(
+                    event,
+                    (PartialTranscriptionEvent, TranscriptionCompletedEvent),
+                ):
+                    logger.info("Rejecting ordinary transcription event after private barrier activation")
+                    return [self.poison_transcript_barrier(conn_id, "invalid_transcript_barrier_event")]
+                if isinstance(event, AssistantTextEvent):
+                    events = self.response.on_assistant_text(
+                        conn_id,
+                        event,
+                        wait_for_pending_reopen=False,
+                    )
+                    if events is None:
+                        if not wait_for_pending_reopen:
+                            return None
+                        # A reopen began after the outside-lock check. Retry so
+                        # its bounded wait occurs only after releasing this lock.
+                        continue
+                    self._observe_turn_event(event)
+                    return events
+                self._observe_turn_event(event)
+                handler = self._pipeline_dispatch.get(type(event))
+                if handler is None:
+                    logger.debug("Unhandled pipeline event type: %s", type(event).__name__)
+                    return []
+                return handler(conn_id, event)
 
     def _is_stale_turn_event(self, event: PipelineEvent, *, wait_for_pending_reopen: bool = True) -> bool | None:
         if self.speculative_turns is None:
