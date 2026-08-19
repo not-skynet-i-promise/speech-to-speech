@@ -912,7 +912,7 @@ class RealtimeService:
         state = self._state(conn_id)
         private_barrier = state.runtime_config.sensitive_content
         if event.message == HOME_ASSISTANT_SELECTOR_REJECTED and state.runtime_config.home_assistant_guard_enabled:
-            if not state.in_response:
+            if not (state.in_response or state.response_pending):
                 return []
             guard_events: list[ServerEvent] = [
                 self.poison_home_assistant_guard(
@@ -920,7 +920,10 @@ class RealtimeService:
                     "home_assistant_selector_rejected",
                 )
             ]
-            guard_events.extend(self.response.finish_response(conn_id, status="failed"))
+            if state.in_response:
+                guard_events.extend(self.response.finish_response(conn_id, status="failed"))
+            else:
+                state.response_pending = False
             return guard_events
         if private_barrier:
             message = "Private response failed."

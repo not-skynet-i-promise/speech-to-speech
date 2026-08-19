@@ -3105,6 +3105,39 @@ class TestDispatchPipelineEvent:
         assert done[0].response.status == "failed"
         assert state.in_response is False
 
+    def test_home_assistant_selector_rejection_poison_closes_pending_automatic_response(
+        self,
+        service,
+        conn_id,
+    ):
+        state = service._state(conn_id)
+        cfg = state.runtime_config
+        cfg.home_assistant_guard_version = 1
+        cfg.home_assistant_guard_nonce = "cd" * 32
+        cfg.home_assistant_guard_contract_sha256 = "ef" * 32
+        cfg.home_assistant_guard_tool_count = 1
+        cfg.home_assistant_guard_tool_names = ("home_assistant__GetLiveContext",)
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="Is the bedroom light on?"),
+        )
+        assert state.response_pending is True
+        assert state.in_response is False
+
+        events = service.dispatch_pipeline_event(
+            conn_id,
+            ResponseFailedEvent(message=HOME_ASSISTANT_SELECTOR_REJECTED),
+        )
+
+        assert len(events) == 1
+        error = events[0]
+        assert isinstance(error, RealtimeErrorEvent)
+        assert error.error.type == "home_assistant_selector_rejected"
+        assert error.error.message == "Home Assistant guard protocol violation."
+        assert cfg.home_assistant_guard_failed is True
+        assert state.response_pending is False
+        assert state.in_response is False
+
     # -- unknown --
 
     def test_unknown_type_returns_empty(self, service, conn_id):

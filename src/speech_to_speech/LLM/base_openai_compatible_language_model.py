@@ -132,6 +132,10 @@ def _assistant_message_text(event: AssistantMessage) -> str:
     return "".join(part.text or "" for part in event.content if part.type == "output_text")
 
 
+def _reject_nonfinite_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant is not allowed: {value}")
+
+
 def _guarded_selector_output_allowed(
     events: list[ProviderEvent],
     runtime_config: RuntimeConfig,
@@ -197,7 +201,7 @@ def _guarded_selector_output_allowed(
         if len(tool.arguments) > MAX_GUARDED_TEXT_CHARS:
             return False
         try:
-            arguments = json.loads(tool.arguments)
+            arguments = json.loads(tool.arguments, parse_constant=_reject_nonfinite_json_constant)
         except (TypeError, ValueError):
             return False
         if not isinstance(arguments, dict):
@@ -207,17 +211,19 @@ def _guarded_selector_output_allowed(
             return False
         seen.add(identity)
 
-    if _GUARDED_PROTOCOL_MARKER.search(text):
-        return False
-    folded_text = text.casefold()
-    if any(name.casefold() in folded_text for name in registered_tool_surface_names(tuple(registered_names))):
-        return False
-    if HOME_ASSISTANT_TOOL_PREFIX in text:
-        return False
+    spoken_text = remove_unspeechable(text)
+    for visible_text in (text, spoken_text):
+        if _GUARDED_PROTOCOL_MARKER.search(visible_text):
+            return False
+        folded_text = visible_text.casefold()
+        if any(name.casefold() in folded_text for name in registered_tool_surface_names(tuple(registered_names))):
+            return False
+        if HOME_ASSISTANT_TOOL_PREFIX in visible_text:
+            return False
 
     home_assistant_tools = [tool for tool in tools if tool.name.startswith(HOME_ASSISTANT_TOOL_PREFIX)]
     if home_assistant_tools:
-        stripped = text.strip()
+        stripped = spoken_text.strip()
         return (
             len(tools) == 1
             and len(stripped) <= 160
