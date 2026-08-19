@@ -314,6 +314,38 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             return True
         return self.speculative_turns.is_latest_after_reopen_grace(turn_id, turn_revision)
 
+    def _fail_home_assistant_guard_for_current_turn(
+        self,
+        runtime_config: RuntimeConfig,
+        *,
+        generation: int | None,
+        turn_id: str | None,
+        turn_revision: int | None,
+    ) -> bool:
+        """Latch a guarded turn failure only while that turn still owns output.
+
+        Speculative reopen waits must happen outside the private-failure lock.
+        The nonblocking recheck inside that lock either establishes one exact
+        failure-before-cancel/reopen ordering or retries after releasing it.
+        """
+        while True:
+            if self._generation_is_stale(generation) or not self._turn_output_allowed(turn_id, turn_revision):
+                return False
+            with runtime_config.transcript_barrier_state_guard():
+                if self._generation_is_stale(generation):
+                    return False
+                if self.speculative_turns is not None:
+                    owns_turn = self.speculative_turns.try_is_latest_after_reopen_grace(
+                        turn_id,
+                        turn_revision,
+                    )
+                    if owns_turn is None:
+                        continue
+                    if not owns_turn:
+                        return False
+                runtime_config.fail_home_assistant_guard()
+                return True
+
     def _apply_config(
         self,
         chat: Chat,
@@ -549,7 +581,12 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             if not guarded_turn:
                 raise
             logger.error("Guarded provider request could not be serialized; private content redacted")
-            turn.runtime_config.fail_home_assistant_guard()
+            self._fail_home_assistant_guard_for_current_turn(
+                turn.runtime_config,
+                generation=turn.gen,
+                turn_id=turn.turn_id,
+                turn_revision=turn.turn_revision,
+            )
             yield EndOfResponse(
                 turn_id=turn.turn_id,
                 turn_revision=turn.turn_revision,
@@ -566,7 +603,12 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             # would reject this; fail with a clear message instead of an opaque error.
             error_message = "Cannot generate a response: no instructions and no input were provided."
             if guarded_turn:
-                turn.runtime_config.fail_home_assistant_guard()
+                self._fail_home_assistant_guard_for_current_turn(
+                    turn.runtime_config,
+                    generation=turn.gen,
+                    turn_id=turn.turn_id,
+                    turn_revision=turn.turn_revision,
+                )
                 error_message = None
                 skip_provider = True
 
@@ -591,13 +633,17 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 "OpenAI API read timed out after %.1fs; ending the current response",
                 self.request_timeout_s,
             )
-            current_turn = not self._generation_is_stale(turn.gen) and self._turn_output_allowed(
+            if guarded_turn:
+                self._fail_home_assistant_guard_for_current_turn(
+                    turn.runtime_config,
+                    generation=turn.gen,
+                    turn_id=turn.turn_id,
+                    turn_revision=turn.turn_revision,
+                )
+            elif not self._generation_is_stale(turn.gen) and self._turn_output_allowed(
                 turn.turn_id,
                 turn.turn_revision,
-            )
-            if guarded_turn and current_turn:
-                turn.runtime_config.fail_home_assistant_guard()
-            elif current_turn:
+            ):
                 # Canned apology carries no language_code (mirrors the prior handlers).
                 yield LLMResponseChunk(
                     text="Wow I'm a bit slow today, could you repeat that?",
@@ -618,19 +664,20 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     logger.error("LLM generation failed; private content redacted")
                 else:
                     logger.exception("LLM generation failed; ending the current response")
-                if guarded_turn:
-                    if not self._generation_is_stale(turn.gen) and self._turn_output_allowed(
-                        turn.turn_id,
-                        turn.turn_revision,
-                    ):
-                        turn.runtime_config.fail_home_assistant_guard()
-                    error_message = None
-                elif error_message is None:
-                    error_message = (
-                        "Language model generation failed in private transcript mode."
-                        if private_content
-                        else f"Language model generation failed: {exc}"
-                    )
+            if guarded_turn:
+                self._fail_home_assistant_guard_for_current_turn(
+                    turn.runtime_config,
+                    generation=turn.gen,
+                    turn_id=turn.turn_id,
+                    turn_revision=turn.turn_revision,
+                )
+                error_message = None
+            elif error_message is None:
+                error_message = (
+                    "Language model generation failed in private transcript mode."
+                    if private_content
+                    else f"Language model generation failed: {exc}"
+                )
         finally:
             if api_response is not None and hasattr(api_response, "close"):
                 try:
@@ -679,6 +726,9 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         turn_revision = request.turn_revision
         speech_stopped_at_s = request.speech_stopped_at_s
         request_generation = request.cancel_generation
+        owner_generation = request_generation
+        if owner_generation is None and self.cancel_scope is not None:
+            owner_generation = self.cancel_scope.generation
         if (
             request_generation is not None
             and self.cancel_scope is not None
@@ -702,8 +752,8 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 active_chat = build_active_chat(original_chat, response)
             except ChatItemError as exc:
                 with private_content_redaction(runtime_config) as private_content:
-                    if runtime_config.home_assistant_guard_operational:
-                        runtime_config.fail_home_assistant_guard()
+                    guarded_failure = runtime_config.home_assistant_guard_operational
+                    if guarded_failure:
                         error_message = None
                     elif private_content:
                         error_message = "Private out-of-band response rejected."
@@ -711,11 +761,19 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     else:
                         error_message = str(exc)
                         logger.info("Out-of-band response rejected: %s", error_message)
-                    yield EndOfResponse(
+                if guarded_failure:
+                    self._fail_home_assistant_guard_for_current_turn(
+                        runtime_config,
+                        generation=owner_generation,
                         turn_id=turn_id,
                         turn_revision=turn_revision,
-                        error=error_message,
                     )
+                yield EndOfResponse(
+                    turn_id=turn_id,
+                    turn_revision=turn_revision,
+                    cancel_generation=owner_generation,
+                    error=error_message,
+                )
                 return
         else:
             active_chat = original_chat.copy()
@@ -742,9 +800,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         # CancelScope.is_stale(gen) is checked when the stream iterator advances; a
         # blocked read inside httpx cannot be aborted by cancel_scope.cancel() from
         # the websocket router. Mitigations: request_timeout_s / ReadTimeout.
-        gen = request_generation
-        if gen is None and self.cancel_scope is not None:
-            gen = self.cancel_scope.generation
+        gen = owner_generation
 
         turn = _Turn(
             language_code=language_code,

@@ -15,6 +15,7 @@ import queue
 import threading
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from openai.types.realtime import ResponseCreatedEvent, ResponseCreateEvent, SessionUpdateEvent
 from openai.types.realtime.conversation_item import (
@@ -33,7 +34,7 @@ from speech_to_speech.api.openai_realtime.home_assistant_guard import session_co
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.api.openai_realtime.service import RealtimeService
 from speech_to_speech.api.openai_realtime.transcript_barrier import TranscriptBarrierReadyEvent
-from speech_to_speech.LLM.chat import Chat, make_user_message
+from speech_to_speech.LLM.chat import Chat, ChatItemError, make_user_message
 from speech_to_speech.LLM.chat_completions_language_model import (
     ChatCompletionsApiModelHandler,
     _to_chat_tool_choice,
@@ -46,6 +47,7 @@ from speech_to_speech.pipeline.messages import (
     LLMResponseChunk,
     TokenUsage,
 )
+from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
 
 # ── Fakes ────────────────────────────────────────────────────────────────────
 
@@ -509,29 +511,136 @@ def test_guarded_provider_failure_is_content_free_and_sticky_but_cancellation_wi
     assert runtime.home_assistant_guard_operational
 
 
-def test_guarded_selector_rejection_during_cancellation_does_not_poison():
+@pytest.mark.parametrize("failure_stage", ["serialize", "empty", "timeout", "selector", "out-of-band"])
+def test_cancelled_guarded_turn_failure_does_not_poison(failure_stage, monkeypatch):
     scope = CancelScope()
     handler = _make_handler(stream=True, cancel_scope=scope)
-    handler.client.chat.completions.next_result = _complete_response(content="unsafe")
     capture = []
+    response = None
 
-    def cancel_then_reject(*_args, **_kwargs):
+    def cancel() -> None:
         scope.cancel()
-        raise ValueError("cancelled selector canary")
 
-    handler._guarded_response_events = cancel_then_reject
+    if failure_stage == "serialize":
+        handler._serialize = lambda _chat: (cancel(), (_ for _ in ()).throw(RuntimeError("serialize")))[1]
+    elif failure_stage == "empty":
+        handler._serialize = lambda _chat: (cancel(), [])[1]
+    elif failure_stage == "timeout":
+        handler.client.chat.completions.create = lambda **_kwargs: (
+            cancel(),
+            (_ for _ in ()).throw(httpx.ReadTimeout("timeout")),
+        )[1]
+    elif failure_stage == "selector":
+        handler._guarded_response_events = lambda *_args, **_kwargs: (
+            cancel(),
+            (_ for _ in ()).throw(ValueError("selector")),
+        )[1]
+    else:
+        response = RealtimeResponseCreateParams(conversation="none")
+        monkeypatch.setattr(
+            base_mod,
+            "build_active_chat",
+            lambda *_args, **_kwargs: (
+                cancel(),
+                (_ for _ in ()).throw(ChatItemError("out-of-band")),
+            )[1],
+        )
+
     text, tools, usage, chat, end = _drive(
         handler,
         tools=_guard_tools(),
         tool_choice="auto",
         home_assistant_guard=True,
         runtime_capture=capture,
+        response=response,
     )
 
     assert (text, tools, usage) == ("", [], None)
-    assert end == EndOfResponse(turn_id="t", turn_revision=0, cancel_generation=0)
+    assert end is not None and end.error is None and end.cancel_generation == 0
     assert capture[0].home_assistant_guard_operational
     assert chat.buffer[-1].role == "user"
+
+
+def test_guard_failure_owner_wait_does_not_hold_private_failure_lock(monkeypatch):
+    scope = CancelScope()
+    handler = _make_handler(stream=True, cancel_scope=scope)
+    tracker = SpeculativeTurnTracker()
+    handler.speculative_turns = tracker
+    tracker.observe("turn", 0)
+    candidate = tracker.begin_reopen_candidate("turn", 0)
+    assert candidate == 1
+    session = RealtimeSessionCreateRequest(type="realtime", tools=_guard_tools())
+    digest, count, names = session_contract(session.instructions, session.tools)
+    runtime = RuntimeConfig(
+        chat=Chat(10),
+        session=session,
+        home_assistant_guard_version=1,
+        home_assistant_guard_nonce="ac" * 32,
+        home_assistant_guard_contract_sha256=digest,
+        home_assistant_guard_tool_count=count,
+        home_assistant_guard_tool_names=names,
+    )
+    wait_entered = threading.Event()
+    original_wait = tracker.is_latest_after_reopen_grace
+
+    def observed_wait(turn_id, turn_revision):
+        wait_entered.set()
+        return original_wait(turn_id, turn_revision)
+
+    monkeypatch.setattr(tracker, "is_latest_after_reopen_grace", observed_wait)
+    helper_done = threading.Event()
+    helper_thread = threading.Thread(
+        target=lambda: (
+            handler._fail_home_assistant_guard_for_current_turn(
+                runtime,
+                generation=0,
+                turn_id="turn",
+                turn_revision=0,
+            ),
+            helper_done.set(),
+        )
+    )
+    helper_thread.start()
+    assert wait_entered.wait(1.0)
+
+    poison_done = threading.Event()
+    poison_thread = threading.Thread(target=lambda: (runtime.fail_home_assistant_guard(), poison_done.set()))
+    poison_thread.start()
+    assert poison_done.wait(0.25), "owner wait held the private-failure lock"
+    tracker.cancel_reopen_candidate("turn", candidate)
+    assert helper_done.wait(1.0)
+    helper_thread.join(timeout=1.0)
+    poison_thread.join(timeout=1.0)
+
+
+def test_guard_failure_owner_rejects_confirmed_supersession():
+    scope = CancelScope()
+    handler = _make_handler(stream=True, cancel_scope=scope)
+    tracker = SpeculativeTurnTracker()
+    handler.speculative_turns = tracker
+    tracker.observe("turn", 0)
+    candidate = tracker.begin_reopen_candidate("turn", 0)
+    assert candidate == 1
+    assert tracker.confirm_reopen_candidate("turn", 0, candidate)
+    session = RealtimeSessionCreateRequest(type="realtime", tools=_guard_tools())
+    digest, count, names = session_contract(session.instructions, session.tools)
+    runtime = RuntimeConfig(
+        chat=Chat(10),
+        session=session,
+        home_assistant_guard_version=1,
+        home_assistant_guard_nonce="ad" * 32,
+        home_assistant_guard_contract_sha256=digest,
+        home_assistant_guard_tool_count=count,
+        home_assistant_guard_tool_names=names,
+    )
+
+    assert not handler._fail_home_assistant_guard_for_current_turn(
+        runtime,
+        generation=0,
+        turn_id="turn",
+        turn_revision=0,
+    )
+    assert runtime.home_assistant_guard_operational
 
 
 def test_guarded_pre_provider_serialization_failure_is_content_free_and_sticky():
@@ -1183,6 +1292,29 @@ def test_private_out_of_band_validation_error_is_content_free(caplog):
     assert end is not None
     assert end.error == "Private out-of-band response rejected."
     assert canary not in caplog.text
+
+
+def test_guarded_out_of_band_validation_error_is_content_free_and_sticky():
+    handler = _make_handler(stream=True)
+    orphan = RealtimeConversationItemFunctionCallOutput(
+        type="function_call_output",
+        call_id="call_unknown",
+        output="{}",
+    )
+    response = RealtimeResponseCreateParams(conversation="none", input=[orphan])
+    capture = []
+
+    text, tools, usage, _chat, end = _drive(
+        handler,
+        response=response,
+        tools=_guard_tools(),
+        home_assistant_guard=True,
+        runtime_capture=capture,
+    )
+
+    assert (text, tools, usage) == ("", [], None)
+    assert end is not None and end.error is None
+    assert capture[0].home_assistant_guard_failed
 
 
 # ── Standalone runner (no pytest required) ────────────────────────────────────
