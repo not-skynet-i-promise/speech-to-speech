@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -17,8 +19,16 @@ from openai.types.realtime.realtime_conversation_item_assistant_message import (
     Content as AssistantContent,
 )
 from openai.types.responses import ResponseFunctionToolCall
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
+from speech_to_speech.api.openai_realtime.home_assistant_guard import (
+    GUARDED_TOOL_CHOICES,
+    HOME_ASSISTANT_SELECTOR_REJECTED,
+    HOME_ASSISTANT_TOOL_PREFIX,
+    MAX_GUARDED_PROVIDER_EVENTS,
+    MAX_GUARDED_TEXT_CHARS,
+    registered_tool_surface_names,
+)
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.LLM.chat import (
@@ -82,8 +92,139 @@ class Usage(BaseModel):
     output_tokens: int
 
 
-ProviderEvent = TextDelta | AssistantMessage | ToolCall | Usage
+class ProviderCompletion(BaseModel):
+    """One provider-declared terminal reason for the complete response."""
+
+    reason: str
+
+
+class MalformedProviderOutput(BaseModel):
+    """Content-free evidence that provider normalization encountered ambiguity."""
+
+
+class ProviderStreamFrame(BaseModel):
+    """Content-free identity for one raw streaming provider frame.
+
+    Guarded generation retains this metadata so cancellation and envelope bounds
+    apply before tool fragments are accumulated, rather than only after a whole
+    provider stream has been normalized.
+    """
+
+    choice_count: int
+    choice_index: StrictInt | None
+    terminal: bool
+    usage_present: bool
+
+
+ProviderEvent = (
+    TextDelta | AssistantMessage | ToolCall | Usage | ProviderCompletion | MalformedProviderOutput | ProviderStreamFrame
+)
 PrivateContentGuard = bool | RuntimeConfig
+
+_GUARDED_PROTOCOL_MARKER = re.compile(
+    r"(?:[`<>\\]|['\"](?:name|arguments|tool_name)['\"]\s*:"
+    r"|[{}\[\]=]|(?<![A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_]*\s*\()",
+    re.IGNORECASE,
+)
+
+
+def _assistant_message_text(event: AssistantMessage) -> str:
+    return "".join(part.text or "" for part in event.content if part.type == "output_text")
+
+
+def _guarded_selector_output_allowed(
+    events: list[ProviderEvent],
+    runtime_config: RuntimeConfig,
+    *,
+    tool_choice: object = None,
+) -> bool:
+    """Validate one complete selector result before any history/client/TTS sink."""
+    if len(events) > MAX_GUARDED_PROVIDER_EVENTS:
+        return False
+    if any(isinstance(event, MalformedProviderOutput) for event in events):
+        return False
+    frames = [event for event in events if isinstance(event, ProviderStreamFrame)]
+    if frames:
+        terminal_seen = False
+        usage_seen = False
+        for frame in frames:
+            if frame.choice_count == 0:
+                if not frame.usage_present or not terminal_seen or usage_seen:
+                    return False
+                usage_seen = True
+                continue
+            if (
+                frame.choice_count != 1
+                or type(frame.choice_index) is not int
+                or frame.choice_index != 0
+                or terminal_seen
+                or usage_seen
+                or frame.usage_present
+            ):
+                return False
+            if frame.terminal:
+                terminal_seen = True
+        if not terminal_seen:
+            return False
+    completions = [event for event in events if isinstance(event, ProviderCompletion)]
+    if len(completions) != 1:
+        return False
+    text = "".join(event.text for event in events if isinstance(event, TextDelta))
+    assistant_text = "".join(_assistant_message_text(event) for event in events if isinstance(event, AssistantMessage))
+    if len(text) > MAX_GUARDED_TEXT_CHARS or len(assistant_text) > MAX_GUARDED_TEXT_CHARS:
+        return False
+    if assistant_text and assistant_text != text:
+        return False
+
+    tools = [event.item for event in events if isinstance(event, ToolCall)]
+    effective_tool_choice = "auto" if tool_choice is None else tool_choice
+    if type(effective_tool_choice) is not str or effective_tool_choice not in GUARDED_TOOL_CHOICES:
+        return False
+    if effective_tool_choice == "none" and tools:
+        return False
+    if effective_tool_choice == "required" and not tools:
+        return False
+    expected_finish_reason = "tool_calls" if tools else "stop"
+    if completions[0].reason != expected_finish_reason:
+        return False
+    if len(tools) > MAX_TOOL_CALLS_PER_RESPONSE:
+        return False
+    registered_names = set(runtime_config.home_assistant_guard_tool_names)
+    seen: set[tuple[str, str]] = set()
+    for tool in tools:
+        if tool.name not in registered_names:
+            return False
+        if len(tool.arguments) > MAX_GUARDED_TEXT_CHARS:
+            return False
+        try:
+            arguments = json.loads(tool.arguments)
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(arguments, dict):
+            return False
+        identity = (tool.name, tool.arguments)
+        if identity in seen:
+            return False
+        seen.add(identity)
+
+    if _GUARDED_PROTOCOL_MARKER.search(text):
+        return False
+    folded_text = text.casefold()
+    if any(name.casefold() in folded_text for name in registered_tool_surface_names(tuple(registered_names))):
+        return False
+    if HOME_ASSISTANT_TOOL_PREFIX in text:
+        return False
+
+    home_assistant_tools = [tool for tool in tools if tool.name.startswith(HOME_ASSISTANT_TOOL_PREFIX)]
+    if home_assistant_tools:
+        stripped = text.strip()
+        return (
+            len(tools) == 1
+            and len(stripped) <= 160
+            and "\n" not in stripped
+            and len(re.findall(r"[.!?]+", stripped)) <= 1
+        )
+    return True
 
 
 @contextmanager
@@ -368,7 +509,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             logger.info("LLM generation cancelled (stale speculative turn)")
             return
         with turn.runtime_config.transcript_barrier_state_guard():
-            if turn.runtime_config.transcript_barrier_failed:
+            if turn.runtime_config.private_protocol_failed:
                 return
             if not is_out_of_band(turn.response):
                 # Flush assistant text accumulated before this call first (so history
@@ -532,12 +673,57 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         try:
             if error_message is None:
                 api_response = self._request(api_input, optional_kwargs)
+                if (
+                    api_response is None
+                    and turn.runtime_config.home_assistant_guard_operational
+                    and not self._generation_is_stale(turn.gen)
+                    and self._turn_is_latest(turn.turn_id, turn.turn_revision)
+                ):
+                    error_message = HOME_ASSISTANT_SELECTOR_REJECTED
             if api_response is not None:
                 events = self._iter_events(
                     api_response,
                     redact_private_content=turn.runtime_config,
                 )
-                if self.stream:
+                if turn.runtime_config.home_assistant_guard_operational:
+                    guarded_events: list[ProviderEvent] = []
+                    guarded_text_chars = 0
+                    for provider_event in events:
+                        if self._generation_is_stale(turn.gen) or not self._turn_is_latest(
+                            turn.turn_id,
+                            turn.turn_revision,
+                        ):
+                            break
+                        guarded_events.append(provider_event)
+                        if isinstance(provider_event, TextDelta):
+                            guarded_text_chars += len(provider_event.text)
+                        if (
+                            len(guarded_events) > MAX_GUARDED_PROVIDER_EVENTS
+                            or guarded_text_chars > MAX_GUARDED_TEXT_CHARS
+                        ):
+                            error_message = HOME_ASSISTANT_SELECTOR_REJECTED
+                            break
+                    if (
+                        error_message is None
+                        and not self._generation_is_stale(turn.gen)
+                        and self._turn_is_latest(turn.turn_id, turn.turn_revision)
+                    ):
+                        if _guarded_selector_output_allowed(
+                            guarded_events,
+                            turn.runtime_config,
+                            tool_choice=optional_kwargs.get("tool_choice"),
+                        ):
+                            if self.stream:
+                                yield from self._consume_streaming(iter(guarded_events), state, turn)
+                            else:
+                                yield from self._consume_nonstreaming(iter(guarded_events), state, turn)
+                        else:
+                            error_message = HOME_ASSISTANT_SELECTOR_REJECTED
+                    guarded_events.clear()
+                    guarded_text_chars = 0
+                    if error_message == HOME_ASSISTANT_SELECTOR_REJECTED:
+                        logger.error("Home Assistant selector output rejected; content redacted")
+                elif self.stream:
                     yield from self._consume_streaming(events, state, turn)
                 else:
                     yield from self._consume_nonstreaming(events, state, turn)
@@ -546,7 +732,18 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 "OpenAI API read timed out after %.1fs; ending the current response",
                 self.request_timeout_s,
             )
-            if not self._generation_is_stale(turn.gen) and self._turn_output_allowed(turn.turn_id, turn.turn_revision):
+            if self._generation_is_stale(turn.gen) or not self._turn_is_latest(
+                turn.turn_id,
+                turn.turn_revision,
+            ):
+                logger.info("LLM generation cancelled while the provider read was blocked")
+            elif turn.runtime_config.home_assistant_guard_enabled:
+                error_message = HOME_ASSISTANT_SELECTOR_REJECTED
+                logger.error("Home Assistant selector timed out; content redacted")
+            elif not self._generation_is_stale(turn.gen) and self._turn_output_allowed(
+                turn.turn_id,
+                turn.turn_revision,
+            ):
                 # Canned apology carries no language_code (mirrors the prior handlers).
                 yield LLMResponseChunk(
                     text="Wow I'm a bit slow today, could you repeat that?",
@@ -562,17 +759,25 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             # the error and fall through to the EndOfResponse below. Without this the
             # exception would escape process() and no EndOfResponse would be emitted,
             # leaving st.in_response stuck and locking every subsequent response.
-            with private_content_redaction(turn.runtime_config) as private_content:
-                if private_content:
-                    logger.error("LLM generation failed; private content redacted")
-                else:
-                    logger.exception("LLM generation failed; ending the current response")
-                if error_message is None:
-                    error_message = (
-                        "Language model generation failed in private transcript mode."
-                        if private_content
-                        else f"Language model generation failed: {exc}"
-                    )
+            if self._generation_is_stale(turn.gen) or not self._turn_is_latest(
+                turn.turn_id,
+                turn.turn_revision,
+            ):
+                logger.info("LLM generation cancelled while the provider failed")
+            else:
+                with private_content_redaction(turn.runtime_config) as private_content:
+                    if private_content:
+                        logger.error("LLM generation failed; private content redacted")
+                    else:
+                        logger.exception("LLM generation failed; ending the current response")
+                    if turn.runtime_config.home_assistant_guard_enabled:
+                        error_message = HOME_ASSISTANT_SELECTOR_REJECTED
+                    elif error_message is None:
+                        error_message = (
+                            "Language model generation failed in private transcript mode."
+                            if private_content
+                            else f"Language model generation failed: {exc}"
+                        )
         finally:
             if api_response is not None and hasattr(api_response, "close"):
                 try:
@@ -589,7 +794,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             # default conversation (their context was a throwaway chat).
             if not is_out_of_band(turn.response):
                 with turn.runtime_config.transcript_barrier_state_guard():
-                    if not turn.runtime_config.transcript_barrier_failed:
+                    if not turn.runtime_config.private_protocol_failed:
                         # Tool calls (and any assistant text preceding them) were already
                         # written eagerly in _record_tool_call; only trailing items remain.
                         for item in state.pending:
@@ -604,7 +809,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     turn_revision=turn.turn_revision,
                 )
         with private_content_redaction(turn.runtime_config) as private_content:
-            if private_content and error_message is not None:
+            if private_content and error_message is not None and error_message != HOME_ASSISTANT_SELECTOR_REJECTED:
                 error_message = "Language model generation failed in private transcript mode."
             yield EndOfResponse(
                 turn_id=turn.turn_id,

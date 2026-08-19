@@ -14,10 +14,15 @@ from queue import Empty, Queue
 from threading import Event as ThreadingEvent
 
 import pytest
+from openai.types.realtime.realtime_session_create_request import RealtimeSessionCreateRequest
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketState
 
 import speech_to_speech.api.openai_realtime.websocket_router as router_module
+from speech_to_speech.api.openai_realtime.home_assistant_guard import (
+    HOME_ASSISTANT_SELECTOR_REJECTED,
+    session_contract,
+)
 from speech_to_speech.api.openai_realtime.pipeline_unit import PipelineUnit
 from speech_to_speech.api.openai_realtime.service import CHUNK_SIZE_BYTES, RealtimeService
 from speech_to_speech.api.openai_realtime.websocket_router import create_app
@@ -25,6 +30,7 @@ from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.control import SESSION_END, PipelineControlMessage, is_control_message
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
+    ResponseFailedEvent,
     SpeechStartedEvent,
     TokenUsageEvent,
     TranscriptBarrierCompletedEvent,
@@ -66,6 +72,7 @@ def setup():
         text_prompt_queue=text_prompt_queue,
         should_listen=should_listen,
         cancel_scope=cancel_scope,
+        home_assistant_guard_supported=True,
     )
     assert service.verify_cancel_scope_wiring(cancel_scope, cancel_scope)
     input_queue: Queue = Queue()
@@ -127,9 +134,14 @@ class _FakeWebSocket:
     def __init__(self):
         self.sent: list[dict] = []
         self.scope: dict[str, object] = {}
+        self.closed: tuple[int, str] | None = None
 
     async def send_json(self, payload: dict) -> None:
         self.sent.append(payload)
+
+    async def close(self, *, code: int, reason: str) -> None:
+        self.closed = (code, reason)
+        self.application_state = WebSocketState.DISCONNECTED
 
 
 def test_private_websocket_transport_exception_is_content_free(caplog):
@@ -245,6 +257,118 @@ class TestClientEventDispatch:
                     "nonce": nonce,
                 }
                 assert service.transcript_barrier_enabled() is True
+
+    def test_home_assistant_guard_ready_precedes_audio_and_missing_guard_closes(self, setup):
+        app, service, input_queue, *_ = setup
+        tools = [
+            {
+                "type": "function",
+                "name": "home_assistant__GetLiveContext",
+                "parameters": {"type": "object", "properties": {"area": {"type": "string"}}},
+            }
+        ]
+        contract = RealtimeSessionCreateRequest(type="realtime", instructions="private", tools=tools)
+        digest, count, _names = session_contract(contract.instructions, contract.tools)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "realtime",
+                            "instructions": "private",
+                            "tools": tools,
+                            "reachy_home_assistant_guard": {
+                                "version": 1,
+                                "nonce": "31" * 32,
+                                "session_contract_sha256": digest,
+                                "tool_count": count,
+                            },
+                        },
+                    }
+                )
+                ready = ws.receive_json()
+                assert ready["type"] == "reachy.home_assistant_guard.ready"
+                assert ready["session_contract_sha256"] == digest
+                assert service.home_assistant_guard_enabled() is True
+                assert not any(isinstance(item, tuple) for item in tuple(input_queue.queue))
+
+            _simulate_session_end_drain(setup[2], setup[3])
+            deadline = time.monotonic() + 1.0
+            while service.connection_ids and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert service.connection_ids == []
+
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "realtime",
+                            "instructions": "private",
+                            "tools": tools,
+                        },
+                    }
+                )
+                error = ws.receive_json()
+                assert error["type"] == "error"
+                assert error["error"]["type"] == "invalid_home_assistant_guard"
+
+    def test_nested_chat_completions_tool_shape_is_still_home_assistant_context(self, setup):
+        app, service, *_ = setup
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "realtime",
+                            "tools": [
+                                {
+                                    "type": "function",
+                                    "function": {
+                                        "name": "home_assistant__GetLiveContext",
+                                        "parameters": {"type": "object", "properties": {}},
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                )
+
+                error = ws.receive_json()
+                assert error["type"] == "error"
+                assert error["error"]["type"] == "invalid_home_assistant_guard"
+                assert service.sensitive_content() is True
+
+    def test_response_create_cannot_add_home_assistant_authority_after_session_start(self, setup):
+        app, service, *_ = setup
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "response.create",
+                        "response": {
+                            "tools": [
+                                {
+                                    "type": "function",
+                                    "name": "home_assistant__GetLiveContext",
+                                    "parameters": {"type": "object", "properties": {}},
+                                }
+                            ]
+                        },
+                    }
+                )
+
+                error = ws.receive_json()
+                assert error["type"] == "error"
+                assert error["error"]["type"] == "invalid_home_assistant_guard"
+                assert service.sensitive_content() is True
 
     def test_private_transcript_barrier_malformed_or_duplicate_handshake_fails_closed(self, setup):
         app, service, *_ = setup
@@ -1098,6 +1222,50 @@ class TestSendLoop:
         assert done_events[0].response.usage.input_tokens == 10
         assert done_events[0].response.usage.output_tokens == 5
         assert text_output_queue.empty()
+
+    def test_response_completion_drain_orders_guard_failure_before_audio_done(self, setup):
+        _, service, input_queue, output_queue, text_output_queue, should_listen, _, response_playing, cancel_scope = (
+            setup
+        )
+        unit = PipelineUnit(
+            index=0,
+            service=service,
+            cancel_scope=cancel_scope,
+            should_listen=should_listen,
+            response_playing=response_playing,
+            input_queue=input_queue,
+            output_queue=output_queue,
+            text_output_queue=text_output_queue,
+            text_prompt_queue=Queue(),
+            handlers=[],
+        )
+        conn_id = service.register()
+        state = service._state(conn_id)
+        state.runtime_config.home_assistant_guard_version = 1
+        state.runtime_config.home_assistant_guard_nonce = "cd" * 32
+        state.runtime_config.home_assistant_guard_contract_sha256 = "ef" * 32
+        state.runtime_config.home_assistant_guard_tool_count = 1
+        state.runtime_config.home_assistant_guard_tool_names = ("home_assistant__GetLiveContext",)
+        service.response._ensure_response(conn_id)
+        text_output_queue.put(SpeechStartedEvent())
+        text_output_queue.put(ResponseFailedEvent(message=HOME_ASSISTANT_SELECTOR_REJECTED))
+        output_queue.put(AUDIO_RESPONSE_DONE)
+        ws = _FakeWebSocket()
+
+        asyncio.run(router_module._drain_pending_response_events(ws, unit, conn_id))
+        late_completion = service.finish_response(conn_id)
+
+        assert [payload["type"] for payload in ws.sent] == ["error", "response.done"]
+        assert ws.sent[0]["error"]["type"] == "home_assistant_selector_rejected"
+        assert ws.sent[0]["error"]["message"] == "Home Assistant guard protocol violation."
+        assert ws.sent[1]["response"]["status"] == "failed"
+        assert state.runtime_config.home_assistant_guard_failed is True
+        assert state.in_response is False
+        assert late_completion == []
+        assert output_queue.get_nowait() == AUDIO_RESPONSE_DONE
+        assert isinstance(text_output_queue.get_nowait(), SpeechStartedEvent)
+        assert text_output_queue.empty()
+        assert ws.closed == (1008, "Private session failed")
 
     def test_response_completion_drain_preserves_usage_across_non_response_boundary(self, setup):
         _, service, input_queue, output_queue, text_output_queue, should_listen, _, response_playing, cancel_scope = (

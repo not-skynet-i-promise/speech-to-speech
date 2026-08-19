@@ -15,6 +15,8 @@ import queue
 import threading
 from types import SimpleNamespace
 
+import httpx
+import pytest
 from openai.types.realtime import ResponseCreatedEvent, ResponseCreateEvent, SessionUpdateEvent
 from openai.types.realtime.conversation_item import (
     RealtimeConversationItemFunctionCall,
@@ -28,6 +30,10 @@ from openai.types.responses import ResponseFunctionToolCall
 
 import speech_to_speech.LLM.base_openai_compatible_language_model as base_mod
 import speech_to_speech.LLM.chat_completions_language_model as ccm
+from speech_to_speech.api.openai_realtime.home_assistant_guard import (
+    HOME_ASSISTANT_SELECTOR_REJECTED,
+    MAX_GUARDED_PROVIDER_EVENTS,
+)
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.api.openai_realtime.service import RealtimeService
 from speech_to_speech.api.openai_realtime.transcript_barrier import TranscriptBarrierReadyEvent
@@ -37,6 +43,7 @@ from speech_to_speech.LLM.chat_completions_language_model import (
     _to_chat_tool_choice,
     _to_chat_tools,
 )
+from speech_to_speech.LLM.tool_call.function_tool import MAX_TOOL_CALLS_PER_RESPONSE
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.messages import (
     EndOfResponse,
@@ -71,6 +78,18 @@ class _PoisoningStream(_FakeStream):
     def __iter__(self):
         yield from self._chunks
         self._runtime_config.transcript_barrier_failed = True
+
+
+class _FailingStream(_FakeStream):
+    """Raise a transport or parser failure while the provider stream is read."""
+
+    def __init__(self, failure: Exception):
+        super().__init__([])
+        self._failure = failure
+
+    def __iter__(self):
+        raise self._failure
+        yield  # pragma: no cover - make this an iterator without exposing content
 
 
 # Make the handler's ``isinstance(resp, Stream)`` check recognise our fake as a
@@ -193,10 +212,16 @@ def test_cancel_scope_serializes_response_admission_cancel_and_private_activatio
         assert quiescent is True
 
 
-def _chunk(content=None, tool_calls=None, usage=None):
+def _chunk(content=None, tool_calls=None, usage=None, finish_reason=None, *, choice_index=0):
     choices = []
-    if content is not None or tool_calls is not None:
-        choices = [SimpleNamespace(delta=SimpleNamespace(content=content, tool_calls=tool_calls), finish_reason=None)]
+    if content is not None or tool_calls is not None or finish_reason is not None:
+        choices = [
+            SimpleNamespace(
+                index=choice_index,
+                delta=SimpleNamespace(content=content, tool_calls=tool_calls),
+                finish_reason=finish_reason,
+            )
+        ]
     return SimpleNamespace(choices=choices, usage=usage)
 
 
@@ -214,6 +239,7 @@ def _drive(
     response=None,
     instructions="Du bist ein Roboter.",
     private_barrier=False,
+    home_assistant_guard=False,
 ):
     chat = chat or Chat(10)
     if user:
@@ -228,6 +254,13 @@ def _drive(
         session=session,
         transcript_barrier_version=1 if private_barrier else None,
         transcript_barrier_nonce="ab" * 32 if private_barrier else None,
+        home_assistant_guard_version=1 if home_assistant_guard else None,
+        home_assistant_guard_nonce="cd" * 32 if home_assistant_guard else None,
+        home_assistant_guard_contract_sha256="ef" * 32 if home_assistant_guard else None,
+        home_assistant_guard_tool_count=len(tools or ()) if home_assistant_guard else 0,
+        home_assistant_guard_tool_names=(
+            tuple(str(tool["name"]) for tool in tools or ()) if home_assistant_guard else ()
+        ),
     )
     req = GenerateResponseRequest(
         runtime_config=rc, response=response, language_code="de", turn_id="t", turn_revision=0
@@ -463,6 +496,812 @@ def test_private_poison_during_provider_stream_blocks_text_and_tool_history_writ
     assert not any(getattr(item, "role", None) == "assistant" for item in chat.buffer)
     assert not any(getattr(item, "type", None) == "function_call" for item in chat.buffer)
     assert not any(isinstance(output, LLMResponseChunk) and output.tools for output in outputs)
+
+
+def _guard_tools():
+    return [
+        {
+            "type": "function",
+            "name": "home_assistant__GetLiveContext",
+            "parameters": {"type": "object", "properties": {"area": {"type": "string"}}},
+        },
+        {
+            "type": "function",
+            "name": "get_local_time",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    ]
+
+
+def test_home_assistant_guard_releases_one_complete_native_call_after_validation():
+    handler = _make_handler(stream=True)
+    handler.client.chat.completions.create = lambda **_kwargs: _FakeStream(
+        [
+            _chunk(content="Let me check."),
+            _chunk(
+                tool_calls=[
+                    _tc_delta(
+                        0,
+                        id="provider_ha",
+                        name="home_assistant__GetLiveContext",
+                        arguments='{"area":"bedroom"}',
+                    )
+                ]
+            ),
+            _chunk(finish_reason="tool_calls"),
+            _chunk(usage=SimpleNamespace(prompt_tokens=7, completion_tokens=4)),
+        ]
+    )
+
+    text, tools, usage, chat, end = _drive(
+        handler,
+        tools=_guard_tools(),
+        home_assistant_guard=True,
+    )
+
+    assert text == "Let me check."
+    assert [tool.name for tool in tools] == ["home_assistant__GetLiveContext"]
+    assert json.loads(tools[0].arguments) == {"area": "bedroom"}
+    assert usage == (7, 4)
+    assert end is not None and end.error is None
+    assert len(chat._pending_tool_calls) == 1
+
+
+def test_home_assistant_guard_preserves_complete_ordinary_speech():
+    handler = _make_handler(stream=True)
+    handler.client.chat.completions.create = lambda **_kwargs: _FakeStream(
+        [
+            _chunk(content="Hello there."),
+            _chunk(finish_reason="stop"),
+            _chunk(usage=SimpleNamespace(prompt_tokens=5, completion_tokens=2)),
+        ]
+    )
+
+    text, tools, usage, chat, end = _drive(
+        handler,
+        tools=_guard_tools(),
+        home_assistant_guard=True,
+    )
+
+    assert text == "Hello there."
+    assert tools == []
+    assert usage == (5, 2)
+    assert end is not None and end.error is None
+    assert any(getattr(item, "role", None) == "assistant" for item in chat.buffer)
+
+
+@pytest.mark.parametrize(
+    ("session_choice", "response_choice", "provider_call", "accepted"),
+    [
+        ("none", None, False, True),
+        ("none", None, True, False),
+        ("required", None, False, False),
+        ("required", None, True, True),
+        ("none", "auto", True, True),
+        ("required", "none", True, False),
+    ],
+)
+def test_home_assistant_guard_enforces_effective_tool_choice(
+    session_choice,
+    response_choice,
+    provider_call,
+    accepted,
+):
+    handler = _make_handler(stream=True)
+    if provider_call:
+        chunks = [
+            _chunk(
+                tool_calls=[
+                    _tc_delta(
+                        0,
+                        id="provider_ha",
+                        name="home_assistant__GetLiveContext",
+                        arguments="{}",
+                    )
+                ]
+            ),
+            _chunk(finish_reason="tool_calls"),
+        ]
+    else:
+        chunks = [_chunk(content="Hello."), _chunk(finish_reason="stop")]
+    handler.client.chat.completions.create = lambda **_kwargs: _FakeStream(chunks)
+    response = (
+        RealtimeResponseCreateParams(conversation="none", tool_choice=response_choice)
+        if response_choice is not None
+        else None
+    )
+
+    text, tools, _usage, chat, end = _drive(
+        handler,
+        tools=_guard_tools(),
+        tool_choice=session_choice,
+        response=response,
+        home_assistant_guard=True,
+    )
+
+    if accepted:
+        assert end is not None and end.error is None
+        assert ([tool.name for tool in tools] == ["home_assistant__GetLiveContext"]) is provider_call
+        assert (text == "Hello.") is (not provider_call)
+    else:
+        assert text == ""
+        assert tools == []
+        assert end is not None and end.error == HOME_ASSISTANT_SELECTOR_REJECTED
+        assert chat._pending_tool_calls == {}
+
+
+@pytest.mark.parametrize(
+    "chunks",
+    [
+        [
+            _chunk(content="Checking now.", choice_index=0),
+            _chunk(
+                tool_calls=[
+                    _tc_delta(
+                        0,
+                        id="provider_ha",
+                        name="home_assistant__GetLiveContext",
+                        arguments='{"area":"bedroom"}',
+                    )
+                ],
+                choice_index=1,
+            ),
+            _chunk(finish_reason="tool_calls", choice_index=1),
+        ],
+        [
+            _chunk(tool_calls=[_tc_delta(0, id="provider_ha", name="home_assistant__GetLiveContext", arguments="{}")]),
+            _chunk(finish_reason="tool_calls"),
+            _chunk(content="late payload"),
+        ],
+        [
+            _chunk(content="Checking now.", choice_index=None),
+            _chunk(finish_reason="stop", choice_index=None),
+        ],
+    ],
+    ids=["cross-choice-splice", "payload-after-terminal", "missing-choice-index"],
+)
+def test_home_assistant_guard_rejects_ambiguous_raw_stream_envelope(chunks):
+    handler = _make_handler(stream=True)
+    handler.client.chat.completions.create = lambda **_kwargs: _FakeStream(chunks)
+
+    text, tools, usage, chat, end = _drive(
+        handler,
+        tools=_guard_tools(),
+        home_assistant_guard=True,
+    )
+
+    assert text == ""
+    assert tools == []
+    assert usage is None
+    assert end is not None and end.error == HOME_ASSISTANT_SELECTOR_REJECTED
+    assert not any(getattr(item, "role", None) == "assistant" for item in chat.buffer)
+    assert chat._pending_tool_calls == {}
+
+
+def test_home_assistant_guard_bounds_raw_tool_only_frames_before_normalization():
+    class CountingToolStream(_FakeStream):
+        def __init__(self):
+            super().__init__([])
+            self.frames_read = 0
+
+        def __iter__(self):
+            for index in range(MAX_GUARDED_PROVIDER_EVENTS + 2):
+                self.frames_read += 1
+                yield _chunk(
+                    tool_calls=[
+                        _tc_delta(
+                            0,
+                            id="provider_ha" if index == 0 else None,
+                            name="home_assistant__GetLiveContext" if index == 0 else None,
+                            arguments=" ",
+                        )
+                    ]
+                )
+
+    stream = CountingToolStream()
+    handler = _make_handler(stream=True)
+    handler.client.chat.completions.create = lambda **_kwargs: stream
+
+    text, tools, usage, chat, end = _drive(
+        handler,
+        tools=_guard_tools(),
+        home_assistant_guard=True,
+    )
+
+    assert stream.frames_read == MAX_GUARDED_PROVIDER_EVENTS + 1
+    assert text == ""
+    assert tools == []
+    assert usage is None
+    assert end is not None and end.error == HOME_ASSISTANT_SELECTOR_REJECTED
+    assert chat._pending_tool_calls == {}
+
+
+@pytest.mark.parametrize("stream", [True, False])
+def test_home_assistant_guard_rejects_oversized_native_call_container_without_iterating(stream):
+    class IterationBombToolCalls(list):
+        def __iter__(self):
+            raise AssertionError("guarded oversized tool-call containers must not be iterated")
+
+    oversized = IterationBombToolCalls(
+        _tc_delta(
+            index,
+            id=f"provider_{index}",
+            name="home_assistant__GetLiveContext",
+            arguments="{}",
+        )
+        for index in range(MAX_TOOL_CALLS_PER_RESPONSE + 1)
+    )
+    handler = _make_handler(stream=stream)
+    if stream:
+        handler.client.chat.completions.create = lambda **_kwargs: _FakeStream(
+            [_chunk(tool_calls=oversized), _chunk(finish_reason="tool_calls")]
+        )
+    else:
+        handler.client.chat.completions.create = lambda **_kwargs: SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="", tool_calls=oversized),
+                    finish_reason="tool_calls",
+                )
+            ],
+            usage=None,
+        )
+
+    text, tools, usage, chat, end = _drive(
+        handler,
+        tools=_guard_tools(),
+        home_assistant_guard=True,
+    )
+
+    assert text == ""
+    assert tools == []
+    assert usage is None
+    assert end is not None and end.error == HOME_ASSISTANT_SELECTOR_REJECTED
+    assert not any(getattr(item, "role", None) == "assistant" for item in chat.buffer)
+    assert chat._pending_tool_calls == {}
+
+
+def test_home_assistant_guard_rejects_more_than_the_bounded_distinct_stream_indexes():
+    handler = _make_handler(stream=True)
+    handler.client.chat.completions.create = lambda **_kwargs: _FakeStream(
+        [
+            _chunk(
+                tool_calls=[
+                    _tc_delta(0, id="provider_0", name="home_assistant__GetLiveContext", arguments="{}"),
+                    _tc_delta(1, id="provider_1", name="get_local_time", arguments="{}"),
+                ]
+            ),
+            _chunk(tool_calls=[_tc_delta(2, id="provider_2", name="home_assistant__GetLiveContext", arguments="{}")]),
+            _chunk(finish_reason="tool_calls"),
+        ]
+    )
+
+    text, tools, usage, chat, end = _drive(
+        handler,
+        tools=_guard_tools(),
+        home_assistant_guard=True,
+    )
+
+    assert text == ""
+    assert tools == []
+    assert usage is None
+    assert end is not None and end.error == HOME_ASSISTANT_SELECTOR_REJECTED
+    assert chat._pending_tool_calls == {}
+
+
+def test_home_assistant_guard_bounds_cumulative_tool_fragments_during_normalization():
+    handler = _make_handler(stream=True)
+    runtime_config = RuntimeConfig(
+        chat=Chat(10),
+        session=RealtimeSessionCreateRequest(type="realtime"),
+        home_assistant_guard_version=1,
+        home_assistant_guard_nonce="cd" * 32,
+        home_assistant_guard_contract_sha256="ef" * 32,
+        home_assistant_guard_tool_count=1,
+        home_assistant_guard_tool_names=("home_assistant__GetLiveContext",),
+    )
+    events = list(
+        handler._iter_stream_events(
+            _FakeStream(
+                [
+                    _chunk(
+                        tool_calls=[
+                            _tc_delta(
+                                0,
+                                id="provider_ha",
+                                name="home_assistant__GetLiveContext",
+                                arguments="x" * 9_000,
+                            )
+                        ]
+                    ),
+                    _chunk(tool_calls=[_tc_delta(0, arguments="y" * 9_000)]),
+                    _chunk(finish_reason="tool_calls"),
+                ]
+            ),
+            redact_private_content=runtime_config,
+        )
+    )
+
+    accumulated = [event.item.arguments for event in events if isinstance(event, base_mod.ToolCall)]
+    assert accumulated == ["x" * 9_000]
+    assert any(isinstance(event, base_mod.MalformedProviderOutput) for event in events)
+
+
+def test_home_assistant_guard_polls_cancellation_between_raw_tool_frames():
+    cancel_scope = CancelScope()
+
+    class CancellingToolStream(_FakeStream):
+        def __init__(self):
+            super().__init__([])
+            self.frames_read = 0
+
+        def __iter__(self):
+            for index in range(MAX_GUARDED_PROVIDER_EVENTS):
+                self.frames_read += 1
+                yield _chunk(
+                    tool_calls=[
+                        _tc_delta(
+                            0,
+                            id="provider_ha" if index == 0 else None,
+                            name="home_assistant__GetLiveContext" if index == 0 else None,
+                            arguments=" ",
+                        )
+                    ]
+                )
+                if index == 0:
+                    cancel_scope.cancel()
+
+    stream = CancellingToolStream()
+    handler = _make_handler(stream=True, cancel_scope=cancel_scope)
+    handler.client.chat.completions.create = lambda **_kwargs: stream
+
+    text, tools, usage, chat, end = _drive(
+        handler,
+        tools=_guard_tools(),
+        home_assistant_guard=True,
+    )
+
+    assert stream.frames_read == 2
+    assert text == ""
+    assert tools == []
+    assert usage is None
+    assert end is not None and end.error is None
+    assert chat._pending_tool_calls == {}
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [httpx.ReadTimeout("timed out"), ValueError("malformed provider frame")],
+    ids=["read-timeout", "normalizer-error"],
+)
+def test_home_assistant_guard_maps_provider_failures_to_content_free_selector_rejection(failure):
+    handler = _make_handler(stream=True)
+    handler.client.chat.completions.create = lambda **_kwargs: _FailingStream(failure)
+
+    text, tools, usage, chat, end = _drive(
+        handler,
+        tools=_guard_tools(),
+        home_assistant_guard=True,
+    )
+
+    assert text == ""
+    assert tools == []
+    assert usage is None
+    assert end is not None and end.error == HOME_ASSISTANT_SELECTOR_REJECTED
+    assert not any(getattr(item, "role", None) == "assistant" for item in chat.buffer)
+    assert chat._pending_tool_calls == {}
+
+
+def test_home_assistant_guard_keeps_deliberate_cancellation_non_poisoning_on_provider_failure():
+    cancel_scope = CancelScope()
+
+    class CancelledFailureStream(_FakeStream):
+        def __iter__(self):
+            cancel_scope.cancel()
+            raise httpx.ReadTimeout("cancelled blocked read")
+            yield  # pragma: no cover - make this an iterator without exposing content
+
+    handler = _make_handler(stream=True, cancel_scope=cancel_scope)
+    handler.client.chat.completions.create = lambda **_kwargs: CancelledFailureStream([])
+
+    text, tools, usage, chat, end = _drive(
+        handler,
+        tools=_guard_tools(),
+        home_assistant_guard=True,
+    )
+
+    assert text == ""
+    assert tools == []
+    assert usage is None
+    assert end is not None and end.error is None
+    assert chat._pending_tool_calls == {}
+
+
+@pytest.mark.parametrize(
+    ("content", "tool_name", "arguments"),
+    [
+        ("Let me check. home_assistant__GetLiveContext(area='bedroom')", None, None),
+        ("The Get_Local_Time tool says noon.", None, None),
+        ("<tool_call>private</tool_call>", None, None),
+        ("Let me use GetLiveContext to check.", "home_assistant__GetLiveContext", "{}"),
+        ("Let me use `GetLiveContext` to check.", "home_assistant__GetLiveContext", "{}"),
+        ("<function_call>GetLiveContext</function_call>", "home_assistant__GetLiveContext", "{}"),
+        (r"Let me use \u0047etLiveContext to check.", "home_assistant__GetLiveContext", "{}"),
+        ('{"name":"x","arguments":{}}', None, None),
+        ("{'name':'x','arguments':{}}", None, None),
+        ('Checking {"area":"bedroom"}.', "home_assistant__GetLiveContext", "{}"),
+        ("Checking area=bedroom.", "home_assistant__GetLiveContext", "{}"),
+        ("Checking fetch_state('bedroom').", "home_assistant__GetLiveContext", "{}"),
+        ("Checking.", "unregistered_tool", "{}"),
+        ("Checking.", "home_assistant__GetLiveContext", "[]"),
+        ("Checking.", "home_assistant__GetLiveContext", '{"value":"' + "x" * 16_384 + '"}'),
+        ("Checking. Still checking.", "home_assistant__GetLiveContext", "{}"),
+    ],
+)
+def test_home_assistant_guard_rejects_complete_unsafe_selector_without_any_sink(
+    content,
+    tool_name,
+    arguments,
+):
+    handler = _make_handler(stream=True)
+    chunks = [_chunk(content=content)]
+    if tool_name is not None:
+        chunks.append(_chunk(tool_calls=[_tc_delta(0, id="provider_bad", name=tool_name, arguments=arguments)]))
+    chunks.append(_chunk(finish_reason="tool_calls" if tool_name is not None else "stop"))
+    handler.client.chat.completions.create = lambda **_kwargs: _FakeStream(chunks)
+
+    text, tools, usage, chat, end = _drive(
+        handler,
+        tools=_guard_tools(),
+        home_assistant_guard=True,
+    )
+
+    assert text == ""
+    assert tools == []
+    assert usage is None
+    assert end is not None and end.error == HOME_ASSISTANT_SELECTOR_REJECTED
+    assert not any(getattr(item, "role", None) == "assistant" for item in chat.buffer)
+    assert chat._pending_tool_calls == {}
+
+
+@pytest.mark.parametrize("stream", [True, False])
+def test_home_assistant_guard_rejects_missing_tool_name_before_normalization(stream):
+    handler = _make_handler(stream=stream)
+    if stream:
+        handler.client.chat.completions.create = lambda **_kwargs: _FakeStream(
+            [
+                _chunk(tool_calls=[_tc_delta(0, id="provider_bad", arguments='{"area":"bedroom"}')]),
+                _chunk(finish_reason="tool_calls"),
+            ]
+        )
+    else:
+        handler.client.chat.completions.create = lambda **_kwargs: SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="",
+                        tool_calls=[
+                            SimpleNamespace(
+                                id="provider_bad",
+                                function=SimpleNamespace(name=None, arguments='{"area":"bedroom"}'),
+                            )
+                        ],
+                    ),
+                    finish_reason="tool_calls",
+                )
+            ],
+            usage=SimpleNamespace(prompt_tokens=7, completion_tokens=4),
+        )
+
+    text, tools, usage, chat, end = _drive(
+        handler,
+        tools=_guard_tools(),
+        home_assistant_guard=True,
+    )
+
+    assert text == ""
+    assert tools == []
+    assert usage is None
+    assert end is not None and end.error == HOME_ASSISTANT_SELECTOR_REJECTED
+    assert chat._pending_tool_calls == {}
+
+
+@pytest.mark.parametrize("stream", [True, False])
+@pytest.mark.parametrize(
+    ("provider_id", "arguments"),
+    [(None, "{}"), ("provider_bad", None), ("provider_bad", "")],
+    ids=["missing-id", "missing-arguments", "empty-arguments"],
+)
+def test_home_assistant_guard_rejects_incomplete_native_call_before_normalization(
+    stream,
+    provider_id,
+    arguments,
+):
+    handler = _make_handler(stream=stream)
+    if stream:
+        handler.client.chat.completions.create = lambda **_kwargs: _FakeStream(
+            [
+                _chunk(
+                    tool_calls=[
+                        _tc_delta(
+                            0,
+                            id=provider_id,
+                            name="home_assistant__GetLiveContext",
+                            arguments=arguments,
+                        )
+                    ]
+                ),
+                _chunk(finish_reason="tool_calls"),
+            ]
+        )
+    else:
+        handler.client.chat.completions.create = lambda **_kwargs: SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="",
+                        tool_calls=[
+                            SimpleNamespace(
+                                id=provider_id,
+                                function=SimpleNamespace(
+                                    name="home_assistant__GetLiveContext",
+                                    arguments=arguments,
+                                ),
+                            )
+                        ],
+                    ),
+                    finish_reason="tool_calls",
+                )
+            ],
+            usage=SimpleNamespace(prompt_tokens=7, completion_tokens=4),
+        )
+
+    text, tools, usage, chat, end = _drive(
+        handler,
+        tools=_guard_tools(),
+        home_assistant_guard=True,
+    )
+
+    assert text == ""
+    assert tools == []
+    assert usage is None
+    assert end is not None and end.error == HOME_ASSISTANT_SELECTOR_REJECTED
+    assert chat._pending_tool_calls == {}
+
+
+def test_home_assistant_guard_rejects_changed_provider_call_id_between_fragments():
+    handler = _make_handler(stream=True)
+    handler.client.chat.completions.create = lambda **_kwargs: _FakeStream(
+        [
+            _chunk(
+                tool_calls=[
+                    _tc_delta(
+                        0,
+                        id="provider_a",
+                        name="home_assistant__GetLiveContext",
+                        arguments="{",
+                    )
+                ]
+            ),
+            _chunk(tool_calls=[_tc_delta(0, id="provider_b", arguments="}")]),
+            _chunk(finish_reason="tool_calls"),
+        ]
+    )
+
+    text, tools, usage, chat, end = _drive(
+        handler,
+        tools=_guard_tools(),
+        home_assistant_guard=True,
+    )
+
+    assert text == ""
+    assert tools == []
+    assert usage is None
+    assert end is not None and end.error == HOME_ASSISTANT_SELECTOR_REJECTED
+    assert chat._pending_tool_calls == {}
+
+
+@pytest.mark.parametrize(
+    "chunks",
+    [
+        [
+            _chunk(usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1)),
+            _chunk(content="Hello."),
+            _chunk(finish_reason="stop"),
+        ],
+        [
+            _chunk(
+                content="Hello.",
+                usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+            ),
+            _chunk(finish_reason="stop"),
+        ],
+        [
+            _chunk(content="Hello."),
+            _chunk(finish_reason="stop"),
+            _chunk(usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1)),
+            _chunk(usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1)),
+        ],
+    ],
+    ids=["early-usage", "choice-bearing-usage", "duplicate-trailing-usage"],
+)
+def test_home_assistant_guard_rejects_noncanonical_usage_frames(chunks):
+    handler = _make_handler(stream=True)
+    handler.client.chat.completions.create = lambda **_kwargs: _FakeStream(chunks)
+
+    text, tools, usage, chat, end = _drive(
+        handler,
+        tools=_guard_tools(),
+        home_assistant_guard=True,
+    )
+
+    assert text == ""
+    assert tools == []
+    assert usage is None
+    assert end is not None and end.error == HOME_ASSISTANT_SELECTOR_REJECTED
+    assert chat._pending_tool_calls == {}
+
+
+@pytest.mark.parametrize(
+    "tool_calls",
+    [
+        [
+            _tc_delta(0, id="provider_same", name="get_local_time", arguments="{}"),
+            _tc_delta(1, id="provider_same", name="home_assistant__GetLiveContext", arguments="{}"),
+        ],
+        [_tc_delta(1, id="provider_sparse", name="home_assistant__GetLiveContext", arguments="{}")],
+    ],
+    ids=["reused-provider-id", "sparse-tool-index"],
+)
+def test_home_assistant_guard_marks_reused_identity_or_sparse_index_malformed(tool_calls):
+    handler = _make_handler(stream=True)
+    runtime_config = RuntimeConfig(
+        chat=Chat(10),
+        session=RealtimeSessionCreateRequest(type="realtime"),
+        home_assistant_guard_version=1,
+        home_assistant_guard_nonce="cd" * 32,
+        home_assistant_guard_contract_sha256="ef" * 32,
+        home_assistant_guard_tool_count=2,
+        home_assistant_guard_tool_names=("home_assistant__GetLiveContext", "get_local_time"),
+    )
+
+    events = list(
+        handler._iter_stream_events(
+            _FakeStream(
+                [
+                    _chunk(tool_calls=tool_calls),
+                    _chunk(finish_reason="tool_calls"),
+                ]
+            ),
+            redact_private_content=runtime_config,
+        )
+    )
+
+    assert any(isinstance(event, base_mod.MalformedProviderOutput) for event in events)
+
+
+@pytest.mark.parametrize("stream", [True, False])
+@pytest.mark.parametrize("finish_reason", [None, "length", "content_filter", "stop"])
+def test_home_assistant_guard_requires_one_tool_calls_completion(stream, finish_reason):
+    handler = _make_handler(stream=stream)
+    if stream:
+        chunks = [
+            _chunk(tool_calls=[_tc_delta(0, id="provider_bad", name="home_assistant__GetLiveContext", arguments="{}")])
+        ]
+        if finish_reason is not None:
+            chunks.append(_chunk(finish_reason=finish_reason))
+        handler.client.chat.completions.create = lambda **_kwargs: _FakeStream(chunks)
+    else:
+        handler.client.chat.completions.create = lambda **_kwargs: SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="",
+                        tool_calls=[
+                            SimpleNamespace(
+                                id="provider_bad",
+                                function=SimpleNamespace(
+                                    name="home_assistant__GetLiveContext",
+                                    arguments="{}",
+                                ),
+                            )
+                        ],
+                    ),
+                    finish_reason=finish_reason,
+                )
+            ],
+            usage=SimpleNamespace(prompt_tokens=7, completion_tokens=4),
+        )
+
+    text, tools, usage, chat, end = _drive(
+        handler,
+        tools=_guard_tools(),
+        home_assistant_guard=True,
+    )
+
+    assert text == ""
+    assert tools == []
+    assert usage is None
+    assert end is not None and end.error == HOME_ASSISTANT_SELECTOR_REJECTED
+    assert chat._pending_tool_calls == {}
+
+
+def test_home_assistant_guard_accepts_nonstreaming_complete_native_call():
+    handler = _make_handler(stream=False)
+    handler.client.chat.completions.create = lambda **_kwargs: SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content="Let me check.",
+                    tool_calls=[
+                        SimpleNamespace(
+                            id="provider_ha",
+                            function=SimpleNamespace(
+                                name="home_assistant__GetLiveContext",
+                                arguments='{"area":"bedroom"}',
+                            ),
+                        )
+                    ],
+                ),
+                finish_reason="tool_calls",
+            )
+        ],
+        usage=SimpleNamespace(prompt_tokens=7, completion_tokens=4),
+    )
+
+    text, tools, usage, chat, end = _drive(
+        handler,
+        tools=_guard_tools(),
+        home_assistant_guard=True,
+    )
+
+    assert text == "Let me check."
+    assert [(tool.name, json.loads(tool.arguments)) for tool in tools] == [
+        ("home_assistant__GetLiveContext", {"area": "bedroom"})
+    ]
+    assert usage == (7, 4)
+    assert end is not None and end.error is None
+    assert len(chat._pending_tool_calls) == 1
+
+
+def test_home_assistant_guard_rejects_mixed_native_calls_but_preserves_non_ha_branch():
+    handler = _make_handler(stream=True)
+    handler.client.chat.completions.create = lambda **_kwargs: _FakeStream(
+        [
+            _chunk(
+                tool_calls=[
+                    _tc_delta(0, id="provider_ha", name="home_assistant__GetLiveContext", arguments="{}"),
+                    _tc_delta(1, id="provider_time", name="get_local_time", arguments="{}"),
+                ]
+            ),
+            _chunk(finish_reason="tool_calls"),
+        ]
+    )
+    text, tools, _usage, chat, end = _drive(
+        handler,
+        tools=_guard_tools(),
+        home_assistant_guard=True,
+    )
+    assert text == ""
+    assert tools == []
+    assert end is not None and end.error == HOME_ASSISTANT_SELECTOR_REJECTED
+    assert chat._pending_tool_calls == {}
+
+    handler.client.chat.completions.create = lambda **_kwargs: _FakeStream(
+        [
+            _chunk(content="One moment."),
+            _chunk(tool_calls=[_tc_delta(0, id="provider_time", name="get_local_time", arguments="{}")]),
+            _chunk(finish_reason="tool_calls"),
+        ]
+    )
+    text, tools, _usage, _chat, end = _drive(
+        handler,
+        tools=_guard_tools(),
+        home_assistant_guard=True,
+    )
+    assert text == "One moment."
+    assert [tool.name for tool in tools] == ["get_local_time"]
+    assert end is not None and end.error is None
 
 
 def test_non_streaming_tool_call():

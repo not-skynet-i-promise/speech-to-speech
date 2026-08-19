@@ -55,6 +55,7 @@ def service(runtime_config, text_prompt_queue, should_listen, cancel_scope):
         text_prompt_queue=text_prompt_queue,
         should_listen=should_listen,
         cancel_scope=cancel_scope,
+        home_assistant_guard_supported=True,
     )
     assert svc.verify_cancel_scope_wiring(cancel_scope, cancel_scope)
     return svc

@@ -120,7 +120,7 @@ class LMOutputProcessor(BaseHandler[LLMOut, TTSIn]):
 
         runtime_config = lm_output.runtime_config
         with self._runtime_config_private_logging_guard(runtime_config) as private_barrier:
-            if runtime_config is not None and runtime_config.transcript_barrier_failed:
+            if runtime_config is not None and runtime_config.private_protocol_failed:
                 logger.debug("Dropping LM processor content after private barrier failure")
                 return
             if private_barrier:
@@ -136,7 +136,7 @@ class LMOutputProcessor(BaseHandler[LLMOut, TTSIn]):
                 cancel_generation=lm_output.cancel_generation,
             )
             with self._runtime_config_private_logging_guard(runtime_config) as private_barrier:
-                if runtime_config is not None and runtime_config.transcript_barrier_failed:
+                if runtime_config is not None and runtime_config.private_protocol_failed:
                     logger.debug("Dropping client text after private barrier failure")
                     return
                 if private_barrier:
@@ -161,7 +161,7 @@ class LMOutputProcessor(BaseHandler[LLMOut, TTSIn]):
                     continue
                 pending_tts_input: TTSInput | None = None
                 with self._runtime_config_private_logging_guard(runtime_config) as private_barrier:
-                    if runtime_config is not None and runtime_config.transcript_barrier_failed:
+                    if runtime_config is not None and runtime_config.private_protocol_failed:
                         logger.debug("Dropping TTS text after private barrier failure")
                         return
                     if private_barrier:

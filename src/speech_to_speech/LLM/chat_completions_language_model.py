@@ -24,18 +24,26 @@ from openai.types.realtime.realtime_conversation_item_assistant_message import (
 from openai.types.responses import ResponseFunctionToolCall
 from openai.types.shared_params import FunctionDefinition
 
+from speech_to_speech.api.openai_realtime.home_assistant_guard import (
+    MAX_GUARDED_PROVIDER_EVENTS,
+    MAX_GUARDED_TEXT_CHARS,
+)
 from speech_to_speech.LLM.base_openai_compatible_language_model import (
     WARMUP_MAX_RETRIES,
     AssistantMessage,
     BaseOpenAICompatibleHandler,
+    MalformedProviderOutput,
     PrivateContentGuard,
+    ProviderCompletion,
     ProviderEvent,
+    ProviderStreamFrame,
     TextDelta,
     ToolCall,
     Usage,
 )
 from speech_to_speech.LLM.chat import Chat
 from speech_to_speech.LLM.compaction_prompt import CompactGenerateFn
+from speech_to_speech.LLM.tool_call.function_tool import MAX_TOOL_CALLS_PER_RESPONSE
 from speech_to_speech.utils.utils import _generate_id
 
 logger = logging.getLogger(__name__)
@@ -214,37 +222,105 @@ class ChatCompletionsApiModelHandler(BaseOpenAICompatibleHandler):
         # raw assistant text, then emit assistant message + tool calls + usage once
         # the stream is exhausted.
         tool_accum: dict[int, dict[str, str]] = {}
+        malformed = False
+        completion_reasons: list[str] = []
         usage: Usage | None = None
         raw_text = ""
+        guarded_tool_argument_chars = 0
+        guarded_tool_fragments = 0
+        guard_operational = bool(getattr(redact_private_content, "home_assistant_guard_operational", False))
         for chunk in api_response:
+            choices = chunk.choices or []
+            sole_choice = choices[0] if len(choices) == 1 else None
+            choice_index = getattr(sole_choice, "index", None) if sole_choice is not None else None
+            finish_reason = getattr(sole_choice, "finish_reason", None) if sole_choice is not None else None
+            yield ProviderStreamFrame(
+                choice_count=len(choices),
+                choice_index=choice_index,
+                terminal=finish_reason is not None,
+                usage_present=chunk.usage is not None,
+            )
             # Usage-only trailing chunk (choices == []) when include_usage is set.
             if chunk.usage is not None:
                 usage = Usage(
                     input_tokens=chunk.usage.prompt_tokens or 0, output_tokens=chunk.usage.completion_tokens or 0
                 )
-            if not chunk.choices:
+            if not choices:
                 continue
-            delta = chunk.choices[0].delta
-            if delta.tool_calls:
-                for tc in delta.tool_calls:
-                    entry = tool_accum.setdefault(tc.index, {"name": "", "args": "", "id": ""})
-                    if tc.id:
-                        entry["id"] = tc.id
-                    if tc.function is not None:
-                        if tc.function.name:
-                            entry["name"] = tc.function.name
-                        if tc.function.arguments:
-                            entry["args"] += tc.function.arguments
+            if len(choices) != 1:
+                malformed = True
+            choice = choices[0]
+            if finish_reason is not None:
+                completion_reasons.append(str(finish_reason))
+            delta = choice.delta
+            tool_call_deltas = delta.tool_calls or []
+            if guard_operational and len(tool_call_deltas) > MAX_TOOL_CALLS_PER_RESPONSE:
+                malformed = True
+                tool_call_deltas = []
+            for tc in tool_call_deltas:
+                if guard_operational:
+                    guarded_tool_fragments += 1
+                    if guarded_tool_fragments > MAX_GUARDED_PROVIDER_EVENTS:
+                        malformed = True
+                        continue
+                if type(tc.index) is not int or tc.index < 0:
+                    malformed = True
+                    continue
+                if guard_operational and tc.index not in tool_accum and len(tool_accum) >= MAX_TOOL_CALLS_PER_RESPONSE:
+                    malformed = True
+                    continue
+                entry = tool_accum.setdefault(tc.index, {"name": "", "args": "", "id": ""})
+                provider_id = getattr(tc, "id", None)
+                if provider_id is not None:
+                    if not isinstance(provider_id, str) or not provider_id:
+                        malformed = True
+                    elif entry["id"] and entry["id"] != provider_id:
+                        malformed = True
+                    elif not entry["id"]:
+                        entry["id"] = provider_id
+                if tc.function is None:
+                    malformed = True
+                    continue
+                function_name = tc.function.name
+                if function_name is not None:
+                    if not isinstance(function_name, str) or not function_name:
+                        malformed = True
+                    elif entry["name"] and entry["name"] != function_name:
+                        malformed = True
+                    elif not entry["name"]:
+                        entry["name"] = function_name
+                argument_fragment = tc.function.arguments
+                if argument_fragment is not None:
+                    if not isinstance(argument_fragment, str):
+                        malformed = True
+                        continue
+                    if not argument_fragment:
+                        continue
+                    if (
+                        guard_operational
+                        and guarded_tool_argument_chars + len(argument_fragment) > MAX_GUARDED_TEXT_CHARS
+                    ):
+                        malformed = True
+                    else:
+                        guarded_tool_argument_chars += len(argument_fragment)
+                        entry["args"] += argument_fragment
             # A refusal streams as `delta.refusal` with `delta.content` None;
             # surface it as assistant text so it is spoken and stored.
             text_piece = delta.content or getattr(delta, "refusal", None)
             if text_piece:
-                raw_text += text_piece
-                yield TextDelta(text=text_piece)
+                if guard_operational and len(raw_text) + len(text_piece) > MAX_GUARDED_TEXT_CHARS:
+                    malformed = True
+                else:
+                    raw_text += text_piece
+                    yield TextDelta(text=text_piece)
 
         if raw_text.strip():
             yield AssistantMessage(content=[AssistantContent(type="output_text", text=raw_text)])
-        yield from self._tool_calls_from_accum(tool_accum)
+        yield from self._tool_calls_from_accum(tool_accum, require_complete=guard_operational)
+        if malformed:
+            yield MalformedProviderOutput()
+        for reason in completion_reasons:
+            yield ProviderCompletion(reason=reason)
         if usage is not None:
             yield usage
 
@@ -259,7 +335,10 @@ class ChatCompletionsApiModelHandler(BaseOpenAICompatibleHandler):
             yield Usage(input_tokens=usage.prompt_tokens or 0, output_tokens=usage.completion_tokens or 0)
         # A valid-but-empty response (e.g. content filter) returns no choices;
         # complete cleanly with no assistant text rather than raising IndexError.
-        message = api_response.choices[0].message if api_response.choices else None
+        choices = api_response.choices or []
+        if len(choices) != 1:
+            yield MalformedProviderOutput()
+        message = choices[0].message if choices else None
         if message is None:
             return
         # A refusal arrives as `message.refusal` with `message.content` None; treat
@@ -269,25 +348,66 @@ class ChatCompletionsApiModelHandler(BaseOpenAICompatibleHandler):
             yield AssistantMessage(content=[AssistantContent(type="output_text", text=raw_content)])
             yield TextDelta(text=raw_content)
         tool_accum: dict[int, dict[str, str]] = {}
-        for tc in message.tool_calls or []:
+        malformed = False
+        guard_operational = bool(getattr(redact_private_content, "home_assistant_guard_operational", False))
+        message_tool_calls = message.tool_calls or []
+        if guard_operational and len(message_tool_calls) > MAX_TOOL_CALLS_PER_RESPONSE:
+            malformed = True
+            message_tool_calls = []
+        for tc in message_tool_calls:
+            function = getattr(tc, "function", None)
+            if function is None:
+                malformed = True
+                continue
+            function_name = getattr(function, "name", None)
+            arguments = getattr(function, "arguments", None)
+            provider_id = getattr(tc, "id", None)
             tool_accum[len(tool_accum)] = {
-                "name": tc.function.name or "",
-                "args": tc.function.arguments or "",
-                "id": tc.id or "",
+                "name": function_name if isinstance(function_name, str) else "",
+                "args": arguments if isinstance(arguments, str) else "",
+                "id": provider_id if isinstance(provider_id, str) else "",
             }
-        yield from self._tool_calls_from_accum(tool_accum)
+            if (
+                (function_name is not None and not isinstance(function_name, str))
+                or (arguments is not None and not isinstance(arguments, str))
+                or (provider_id is not None and not isinstance(provider_id, str))
+            ):
+                malformed = True
+        yield from self._tool_calls_from_accum(tool_accum, require_complete=guard_operational)
+        if malformed:
+            yield MalformedProviderOutput()
+        finish_reason = getattr(choices[0], "finish_reason", None)
+        if finish_reason is None:
+            yield MalformedProviderOutput()
+        else:
+            yield ProviderCompletion(reason=str(finish_reason))
 
     @staticmethod
-    def _tool_calls_from_accum(tool_accum: dict[int, dict[str, str]]) -> Iterator[ToolCall]:
+    def _tool_calls_from_accum(
+        tool_accum: dict[int, dict[str, str]],
+        *,
+        require_complete: bool = False,
+    ) -> Iterator[ProviderEvent]:
         """Turn accumulated tool-call deltas into ToolCall events.
 
         IDs are regenerated (mirroring the Responses handler) so the rest of the
         pipeline pairs each call_id with its function_call_output consistently.
         """
-        for index in sorted(tool_accum):
+        indexes = sorted(tool_accum)
+        if require_complete and indexes != list(range(len(indexes))):
+            yield MalformedProviderOutput()
+            return
+        seen_provider_ids: set[str] = set()
+        for index in indexes:
             entry = tool_accum[index]
-            if not entry["name"]:
+            if (
+                not entry["name"]
+                or (require_complete and not entry["args"])
+                or (require_complete and (not entry["id"] or entry["id"] in seen_provider_ids))
+            ):
+                yield MalformedProviderOutput()
                 continue
+            seen_provider_ids.add(entry["id"])
             yield ToolCall(
                 item=ResponseFunctionToolCall(
                     type="function_call",

@@ -19,6 +19,10 @@ from openai.types.realtime import (
 )
 from starlette.websockets import WebSocketState
 
+from speech_to_speech.api.openai_realtime.home_assistant_guard import (
+    HOME_ASSISTANT_GUARD_FIELD,
+    contains_home_assistant_tool_identity,
+)
 from speech_to_speech.api.openai_realtime.pipeline_unit import PipelineUnit, SessionState
 from speech_to_speech.api.openai_realtime.service import ServerEvent, build_error_event
 from speech_to_speech.api.openai_realtime.transcript_barrier import (
@@ -30,6 +34,7 @@ from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
     PartialTranscriptionEvent,
     PipelineEvent,
+    ResponseFailedEvent,
     SpeechStartedEvent,
     SpeechStoppedEvent,
     TokenUsageEvent,
@@ -56,6 +61,26 @@ def _requests_private_transcript_barrier(raw: object) -> bool:
         return False
     session = raw.get("session")
     return isinstance(session, Mapping) and TRANSCRIPT_BARRIER_FIELD in session
+
+
+def _home_assistant_guard_context(raw: object) -> bool:
+    if not isinstance(raw, Mapping):
+        return False
+    if raw.get("type") == "session.update":
+        session = raw.get("session")
+        return isinstance(session, Mapping) and (
+            HOME_ASSISTANT_GUARD_FIELD in session or contains_home_assistant_tool_identity(session.get("tools"))
+        )
+    if raw.get("type") == "response.create":
+        response = raw.get("response")
+        return isinstance(response, Mapping) and contains_home_assistant_tool_identity(response.get("tools"))
+    return False
+
+
+def _as_event_list(result: ServerEvent | list[ServerEvent] | None) -> list[ServerEvent]:
+    if result is None:
+        return []
+    return result if isinstance(result, list) else [result]
 
 
 def _mark_websocket_private(ws: WebSocket) -> None:
@@ -158,8 +183,9 @@ async def _drain_pending_response_events(
 
     preserved: list[Any] = []
     drained_assistant = 0
+    drained_failures = 0
     drained_usage = 0
-    drain_assistant_events = True
+    drain_response_events = True
     try:
         while True:
             try:
@@ -172,7 +198,12 @@ async def _drain_pending_response_events(
             if isinstance(item, TokenUsageEvent):
                 unit.service.dispatch_pipeline_event(session_id, item)
                 drained_usage += 1
-            elif drain_assistant_events and isinstance(item, AssistantTextEvent):
+            elif isinstance(item, ResponseFailedEvent):
+                drained_failures += 1
+                events = unit.service.dispatch_pipeline_event(session_id, item)
+                if ws is not None and events:
+                    await _send_events(ws, events)
+            elif drain_response_events and isinstance(item, AssistantTextEvent):
                 drained_assistant += 1
                 if _generation_is_discardable(unit, item.cancel_generation):
                     continue
@@ -181,7 +212,7 @@ async def _drain_pending_response_events(
                     await _send_events(ws, events)
             else:
                 preserved.append(item)
-                drain_assistant_events = False
+                drain_response_events = False
     finally:
         if preserved:
             with unit.text_output_queue.mutex:
@@ -189,13 +220,20 @@ async def _drain_pending_response_events(
                     unit.text_output_queue.queue.appendleft(item)
                 unit.text_output_queue.not_empty.notify(len(preserved))
 
-    if drained_assistant or drained_usage:
+    if drained_assistant or drained_failures or drained_usage:
         logger.debug(
-            "Pipeline %d: drained %d assistant event(s) and %d token usage event(s) before response completion",
+            "Pipeline %d: drained %d assistant, %d failure, and %d token usage event(s) before response completion",
             unit.index,
             drained_assistant,
+            drained_failures,
             drained_usage,
         )
+    if (
+        ws is not None
+        and ws.application_state == WebSocketState.CONNECTED
+        and unit.service.private_protocol_failed(session_id)
+    ):
+        await ws.close(code=1008, reason="Private session failed")
 
 
 def _clean_unit(unit: PipelineUnit, preserve: Callable[[Any], bool] | None = None) -> None:
@@ -365,9 +403,10 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                     continue
 
                 activation_requested = _requests_private_transcript_barrier(raw)
-                if activation_requested:
+                home_assistant_context = _home_assistant_guard_context(raw)
+                if activation_requested or home_assistant_context:
                     _mark_websocket_private(ws)
-                redact_private_content = _websocket_is_private(ws) or unit.service.transcript_barrier_private()
+                redact_private_content = _websocket_is_private(ws) or unit.service.sensitive_content()
                 event = unit.service.parse_client_event(
                     raw,
                     redact_private_content=redact_private_content,
@@ -382,6 +421,16 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                             ),
                         )
                         await ws.close(code=1008, reason="Private transcript barrier negotiation failed")
+                        return
+                    if home_assistant_context:
+                        await _send_event(
+                            ws,
+                            unit.service.poison_home_assistant_guard(
+                                session_id,
+                                "invalid_home_assistant_guard",
+                            ),
+                        )
+                        await ws.close(code=1008, reason="Home Assistant guard negotiation failed")
                         return
                     if raw.get("type") == "reachy.transcript_barrier.resolve":
                         await _send_event(
@@ -424,35 +473,50 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
 
                 elif isinstance(event, SessionUpdateEvent):
                     result = unit.service.handle_session_update(session_id, event)
+                    result_events = _as_event_list(result)
                     if activation_requested and (
-                        result is None
-                        or result.type != "reachy.transcript_barrier.ready"
+                        not any(item.type == "reachy.transcript_barrier.ready" for item in result_events)
                         or not unit.service.transcript_barrier_enabled()
                     ):
-                        await _send_event(
-                            ws,
-                            unit.service.poison_transcript_barrier(
-                                session_id,
-                                "invalid_transcript_barrier",
-                            ),
-                        )
+                        if not result_events:
+                            result_events.append(
+                                unit.service.poison_transcript_barrier(
+                                    session_id,
+                                    "invalid_transcript_barrier",
+                                )
+                            )
+                        await _send_events(ws, result_events)
                         await ws.close(
                             code=1008,
                             reason="Private transcript barrier negotiation failed",
                         )
                         return
-                    if result:
-                        await _send_event(ws, result)
-                    if unit.service.transcript_barrier_failed(session_id):
-                        await ws.close(code=1008, reason="Private transcript barrier negotiation failed")
+                    if home_assistant_context and (
+                        not any(item.type == "reachy.home_assistant_guard.ready" for item in result_events)
+                        or not unit.service.home_assistant_guard_enabled()
+                    ):
+                        if not result_events:
+                            result_events.append(
+                                unit.service.poison_home_assistant_guard(
+                                    session_id,
+                                    "invalid_home_assistant_guard",
+                                )
+                            )
+                        await _send_events(ws, result_events)
+                        await ws.close(code=1008, reason="Home Assistant guard negotiation failed")
+                        return
+                    if result_events:
+                        await _send_events(ws, result_events)
+                    if unit.service.private_protocol_failed(session_id):
+                        await ws.close(code=1008, reason="Private session negotiation failed")
                         return
 
                 elif isinstance(event, ConversationItemCreateEvent):
                     events = unit.service.handle_conversation_item_create(session_id, event)
                     if events:
                         await _send_events(ws, events)
-                    if unit.service.transcript_barrier_failed(session_id):
-                        await ws.close(code=1008, reason="Private transcript barrier pending")
+                    if unit.service.private_protocol_failed(session_id):
+                        await ws.close(code=1008, reason="Private session failed")
                         return
 
                 elif isinstance(event, ResponseCreateEvent):
@@ -461,8 +525,8 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                         if result.type != "error":
                             unit.cancel_scope.new_response()
                         await _send_event(ws, result)
-                    if unit.service.transcript_barrier_failed(session_id):
-                        await ws.close(code=1008, reason="Private transcript barrier pending")
+                    if unit.service.private_protocol_failed(session_id):
+                        await ws.close(code=1008, reason="Private session failed")
                         return
 
                 elif isinstance(event, TranscriptBarrierResolveEvent):
@@ -487,7 +551,7 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
         except WebSocketDisconnect:
             logger.info(f"Client {session_id} disconnected from pipeline {unit.index}")
         except Exception as e:
-            if _websocket_is_private(ws) or unit.service.transcript_barrier_private():
+            if _websocket_is_private(ws) or unit.service.sensitive_content():
                 logger.error("Private client pipeline error; content redacted")
             else:
                 logger.error(
@@ -502,7 +566,7 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
             old_session = unit.session
             if old_session is not None:
                 old_session.released_at = time.monotonic()
-            unit.service.scrub_transcript_barrier_for_disconnect(session_id)
+            unit.service.scrub_private_protocols_for_disconnect(session_id)
             _clean_unit(unit)
             unit.input_queue.put(SESSION_END)
             # Spawn the drain-and-release as a separate task so the route handler's
@@ -596,8 +660,8 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                         events = unit.service.dispatch_pipeline_event(session_id, text_msg)
                         if events:
                             await _send_events(ws, events)
-                        if unit.service.transcript_barrier_failed(session_id):
-                            await ws.close(code=1008, reason="Private transcript barrier failed")
+                        if unit.service.private_protocol_failed(session_id):
+                            await ws.close(code=1008, reason="Private session failed")
 
                     if is_speech_start and (was_in_response or was_response_pending):
                         active_cfg = unit.service._state(session_id).runtime_config if session_id else None
@@ -668,7 +732,7 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                     if is_control_message(audio_chunk):
                         continue
 
-                    if session_id and unit.service.transcript_barrier_failed(session_id):
+                    if session_id and unit.service.private_protocol_failed(session_id):
                         continue
 
                     if _should_discard_audio(unit, audio_chunk):
@@ -720,7 +784,7 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                 session = unit.session
                 ws = session.websocket if session is not None else None
                 if _websocket_is_private(ws) or (
-                    session is not None and session.session_id is not None and unit.service.transcript_barrier_private()
+                    session is not None and session.session_id is not None and unit.service.sensitive_content()
                 ):
                     logger.error("Private pipeline send loop error; content redacted")
                 else:

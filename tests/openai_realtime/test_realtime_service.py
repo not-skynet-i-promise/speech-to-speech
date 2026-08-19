@@ -34,7 +34,13 @@ from openai.types.realtime import (
     SessionCreatedEvent,
     SessionUpdateEvent,
 )
+from openai.types.realtime.realtime_session_create_request import RealtimeSessionCreateRequest
 
+from speech_to_speech.api.openai_realtime.home_assistant_guard import (
+    HOME_ASSISTANT_SELECTOR_REJECTED,
+    HomeAssistantGuardReadyEvent,
+    session_contract,
+)
 from speech_to_speech.api.openai_realtime.service import (
     CHUNK_SIZE_BYTES,
     RealtimeService,
@@ -71,6 +77,22 @@ from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
 def _pcm_bytes(n_samples: int) -> bytes:
     """Return n_samples * 2 zero bytes (valid PCM16 silence)."""
     return b"\x00" * (n_samples * 2)
+
+
+def _home_assistant_tools():
+    return [
+        {
+            "type": "function",
+            "name": "home_assistant__GetLiveContext",
+            "description": "Read exposed state.",
+            "parameters": {"type": "object", "properties": {"area": {"type": "string"}}},
+        },
+        {
+            "type": "function",
+            "name": "get_local_time",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    ]
 
 
 def _b64_pcm(n_samples: int) -> str:
@@ -345,6 +367,258 @@ class TestHandleSessionUpdate:
         assert runtime_config.transcript_barrier_failed is True
         assert runtime_config.transcript_barrier_enabled is True
         assert runtime_config.transcript_barrier_operational is False
+
+    def test_home_assistant_guard_binds_the_complete_first_session_contract(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+    ):
+        tools = [
+            {
+                "type": "function",
+                "name": "home_assistant__GetLiveContext",
+                "description": "Read exposed state.",
+                "parameters": {"type": "object", "properties": {"area": {"type": "string"}}},
+            },
+            {
+                "type": "function",
+                "name": "get_local_time",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ]
+        contract = RealtimeSessionCreateRequest(
+            type="realtime",
+            instructions="Use the exposed tools.",
+            tools=tools,
+        )
+        digest, tool_count, ordered_names = session_contract(
+            contract.instructions,
+            contract.tools,
+        )
+        nonce = "19" * 32
+
+        result = service.handle_session_update(
+            conn_id,
+            self._make_update(
+                instructions=contract.instructions,
+                tools=tools,
+                reachy_home_assistant_guard={
+                    "version": 1,
+                    "nonce": nonce,
+                    "session_contract_sha256": digest,
+                    "tool_count": tool_count,
+                },
+            ),
+        )
+
+        assert isinstance(result, HomeAssistantGuardReadyEvent)
+        assert result.model_dump(exclude={"event_id"}) == {
+            "type": "reachy.home_assistant_guard.ready",
+            "version": 1,
+            "nonce": nonce,
+            "session_contract_sha256": digest,
+            "tool_count": 2,
+        }
+        assert runtime_config.home_assistant_guard_operational is True
+        assert runtime_config.home_assistant_guard_tool_names == ordered_names
+        assert "reachy_home_assistant_guard" not in (runtime_config.session.model_extra or {})
+
+        duplicate = service.handle_session_update(conn_id, self._make_update(instructions="changed"))
+        assert isinstance(duplicate, RealtimeErrorEvent)
+        assert duplicate.error.type == "invalid_home_assistant_guard"
+        assert runtime_config.home_assistant_guard_failed is True
+
+    def test_home_assistant_guard_rejects_unsupported_initial_tool_choice(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+    ):
+        tools = _home_assistant_tools()
+        digest, tool_count, _names = session_contract("Use the exposed tools.", tools)
+
+        result = service.handle_session_update(
+            conn_id,
+            self._make_update(
+                instructions="Use the exposed tools.",
+                tools=tools,
+                tool_choice={"type": "function", "name": "home_assistant__GetLiveContext"},
+                reachy_home_assistant_guard={
+                    "version": 1,
+                    "nonce": "1a" * 32,
+                    "session_contract_sha256": digest,
+                    "tool_count": tool_count,
+                },
+            ),
+        )
+
+        assert isinstance(result, RealtimeErrorEvent)
+        assert result.error.type == "invalid_home_assistant_guard"
+        assert runtime_config.home_assistant_guard_enabled is False
+        assert runtime_config.home_assistant_guard_failed is True
+
+    def test_home_assistant_tools_without_exact_guard_fail_closed(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+    ):
+        result = service.handle_session_update(
+            conn_id,
+            self._make_update(
+                instructions="private context",
+                tools=[
+                    {
+                        "type": "function",
+                        "name": "home_assistant__GetLiveContext",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+            ),
+        )
+
+        assert isinstance(result, RealtimeErrorEvent)
+        assert result.error.type == "invalid_home_assistant_guard"
+        assert runtime_config.home_assistant_guard_enabled is False
+        assert runtime_config.home_assistant_guard_failed is True
+        assert runtime_config.session.instructions is None
+        assert runtime_config.session.tools is None
+
+    def test_nested_chat_completions_home_assistant_tool_cannot_bypass_guard(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+    ):
+        result = service.handle_session_update(
+            conn_id,
+            self._make_update(
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "home_assistant__GetLiveContext",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ]
+            ),
+        )
+
+        assert isinstance(result, RealtimeErrorEvent)
+        assert result.error.type == "invalid_home_assistant_guard"
+        assert runtime_config.home_assistant_guard_enabled is False
+        assert runtime_config.home_assistant_guard_failed is True
+        assert runtime_config.session.tools is None
+
+    def test_home_assistant_guard_rejects_backend_without_complete_output_quarantine(self):
+        cancel_scope = CancelScope()
+        service = RealtimeService(
+            text_prompt_queue=Queue(),
+            cancel_scope=cancel_scope,
+        )
+        assert service.verify_cancel_scope_wiring(cancel_scope, cancel_scope)
+        conn_id = service.register()
+        tools = [
+            {
+                "type": "function",
+                "name": "home_assistant__GetLiveContext",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ]
+        contract = RealtimeSessionCreateRequest(type="realtime", tools=tools)
+        digest, tool_count, _names = session_contract(contract.instructions, contract.tools)
+
+        result = service.handle_session_update(
+            conn_id,
+            self._make_update(
+                tools=tools,
+                reachy_home_assistant_guard={
+                    "version": 1,
+                    "nonce": "20" * 32,
+                    "session_contract_sha256": digest,
+                    "tool_count": tool_count,
+                },
+            ),
+        )
+
+        assert isinstance(result, RealtimeErrorEvent)
+        assert result.error.type == "invalid_home_assistant_guard"
+        assert service._state(conn_id).runtime_config.home_assistant_guard_failed is True
+        service.unregister(conn_id)
+
+    def test_combined_private_handshake_is_atomic_and_ordered(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+    ):
+        tools = [
+            {
+                "type": "function",
+                "name": "home_assistant__GetLiveContext",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ]
+        contract = RealtimeSessionCreateRequest(type="realtime", instructions="private", tools=tools)
+        digest, tool_count, _names = session_contract(contract.instructions, contract.tools)
+
+        result = service.handle_session_update(
+            conn_id,
+            self._make_update(
+                instructions="private",
+                tools=tools,
+                reachy_private_transcript_barrier={"version": 1, "nonce": "21" * 32},
+                reachy_home_assistant_guard={
+                    "version": 1,
+                    "nonce": "22" * 32,
+                    "session_contract_sha256": digest,
+                    "tool_count": tool_count,
+                },
+            ),
+        )
+
+        assert isinstance(result, list)
+        assert [event.type for event in result] == [
+            "reachy.transcript_barrier.ready",
+            "reachy.home_assistant_guard.ready",
+        ]
+        assert runtime_config.transcript_barrier_operational is True
+        assert runtime_config.home_assistant_guard_operational is True
+
+    def test_invalid_combined_handshake_emits_no_partial_ready(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+    ):
+        result = service.handle_session_update(
+            conn_id,
+            self._make_update(
+                instructions="private",
+                tools=[
+                    {
+                        "type": "function",
+                        "name": "home_assistant__GetLiveContext",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+                reachy_private_transcript_barrier={"version": 1, "nonce": "23" * 32},
+                reachy_home_assistant_guard={
+                    "version": 1,
+                    "nonce": "24" * 32,
+                    "session_contract_sha256": "00" * 32,
+                    "tool_count": 1,
+                },
+            ),
+        )
+
+        assert isinstance(result, RealtimeErrorEvent)
+        assert runtime_config.transcript_barrier_enabled is False
+        assert runtime_config.home_assistant_guard_enabled is False
+        assert runtime_config.transcript_barrier_failed is True
+        assert runtime_config.home_assistant_guard_failed is True
 
     def test_private_transcript_barrier_requires_shared_cancel_scope(self, runtime_config):
         service = RealtimeService(text_prompt_queue=Queue())
@@ -932,6 +1206,176 @@ class TestHandleResponseCreate:
         assert req.response.instructions == "override instructions"
         assert req.response.tool_choice == "auto"
         assert req.runtime_config is runtime_config
+
+    @pytest.mark.parametrize(
+        "tool",
+        [
+            {
+                "type": "function",
+                "name": "home_assistant__GetLiveContext",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "home_assistant__GetLiveContext",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ],
+    )
+    def test_response_create_cannot_introduce_unguarded_home_assistant_tools(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+        text_prompt_queue,
+        tool,
+    ):
+        result = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(type="response.create", response={"tools": [tool]}),
+        )
+
+        assert isinstance(result, RealtimeErrorEvent)
+        assert result.error.type == "invalid_home_assistant_guard"
+        assert runtime_config.home_assistant_guard_failed is True
+        assert text_prompt_queue.empty()
+
+    def test_guarded_response_tools_must_match_acknowledged_session_contract(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+        text_prompt_queue,
+    ):
+        tools = _home_assistant_tools()
+        digest, tool_count, _names = session_contract("Use the exposed tools.", tools)
+        ready = service.handle_session_update(
+            conn_id,
+            SessionUpdateEvent(
+                type="session.update",
+                session={
+                    "type": "realtime",
+                    "instructions": "Use the exposed tools.",
+                    "tools": tools,
+                    "reachy_home_assistant_guard": {
+                        "version": 1,
+                        "nonce": "91" * 32,
+                        "session_contract_sha256": digest,
+                        "tool_count": tool_count,
+                    },
+                },
+            ),
+        )
+        assert isinstance(ready, HomeAssistantGuardReadyEvent)
+
+        changed_tools = [dict(tool) for tool in tools]
+        changed_tools[0] = {
+            **changed_tools[0],
+            "description": "Changed per-response authority.",
+            "parameters": {"type": "object", "properties": {"entity_id": {"type": "string"}}},
+        }
+        result = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(type="response.create", response={"tools": changed_tools}),
+        )
+
+        assert isinstance(result, RealtimeErrorEvent)
+        assert result.error.type == "invalid_home_assistant_guard"
+        assert runtime_config.home_assistant_guard_failed is True
+        assert text_prompt_queue.empty()
+
+    def test_guarded_response_allows_exact_tools_or_tools_disabled_narration(
+        self,
+        service,
+        conn_id,
+        text_prompt_queue,
+    ):
+        tools = _home_assistant_tools()
+        digest, tool_count, _names = session_contract("Use the exposed tools.", tools)
+        ready = service.handle_session_update(
+            conn_id,
+            SessionUpdateEvent(
+                type="session.update",
+                session={
+                    "type": "realtime",
+                    "instructions": "Use the exposed tools.",
+                    "tools": tools,
+                    "reachy_home_assistant_guard": {
+                        "version": 1,
+                        "nonce": "92" * 32,
+                        "session_contract_sha256": digest,
+                        "tool_count": tool_count,
+                    },
+                },
+            ),
+        )
+        assert isinstance(ready, HomeAssistantGuardReadyEvent)
+
+        exact = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(type="response.create", response={"tools": tools}),
+        )
+        assert isinstance(exact, ResponseCreatedEvent)
+        assert isinstance(text_prompt_queue.get_nowait(), GenerateResponseRequest)
+        service.response._end_response(conn_id)
+
+        narration = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={"instructions": "Say one safe sentence.", "tool_choice": "none"},
+            ),
+        )
+        assert isinstance(narration, ResponseCreatedEvent)
+        assert isinstance(text_prompt_queue.get_nowait(), GenerateResponseRequest)
+
+    def test_guarded_response_rejects_unsupported_tool_choice_sticky(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+        text_prompt_queue,
+    ):
+        tools = _home_assistant_tools()
+        digest, tool_count, _names = session_contract("Use the exposed tools.", tools)
+        ready = service.handle_session_update(
+            conn_id,
+            SessionUpdateEvent(
+                type="session.update",
+                session={
+                    "type": "realtime",
+                    "instructions": "Use the exposed tools.",
+                    "tools": tools,
+                    "reachy_home_assistant_guard": {
+                        "version": 1,
+                        "nonce": "93" * 32,
+                        "session_contract_sha256": digest,
+                        "tool_count": tool_count,
+                    },
+                },
+            ),
+        )
+        assert isinstance(ready, HomeAssistantGuardReadyEvent)
+
+        result = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "tool_choice": {
+                        "type": "function",
+                        "name": "home_assistant__GetLiveContext",
+                    }
+                },
+            ),
+        )
+
+        assert isinstance(result, RealtimeErrorEvent)
+        assert result.error.type == "invalid_home_assistant_guard"
+        assert runtime_config.home_assistant_guard_failed is True
+        assert text_prompt_queue.empty()
 
     def test_response_create_preserves_latest_user_turn_timing(self, service, conn_id, text_prompt_queue):
         service.dispatch_pipeline_event(
@@ -2617,6 +3061,35 @@ class TestDispatchPipelineEvent:
         assert isinstance(error, RealtimeErrorEvent)
         assert error.error.message == "Private response failed."
         assert canary not in caplog.text
+
+    def test_home_assistant_selector_rejection_poison_closes_response_content_free(
+        self,
+        service,
+        conn_id,
+    ):
+        state = service._state(conn_id)
+        cfg = state.runtime_config
+        cfg.home_assistant_guard_version = 1
+        cfg.home_assistant_guard_nonce = "cd" * 32
+        cfg.home_assistant_guard_contract_sha256 = "ef" * 32
+        cfg.home_assistant_guard_tool_count = 1
+        cfg.home_assistant_guard_tool_names = ("home_assistant__GetLiveContext",)
+        service.response._ensure_response(conn_id)
+
+        events = service.dispatch_pipeline_event(
+            conn_id,
+            ResponseFailedEvent(message=HOME_ASSISTANT_SELECTOR_REJECTED),
+        )
+
+        error = events[0]
+        assert isinstance(error, RealtimeErrorEvent)
+        assert error.error.type == "home_assistant_selector_rejected"
+        assert error.error.message == "Home Assistant guard protocol violation."
+        assert cfg.home_assistant_guard_failed is True
+        done = [event for event in events if isinstance(event, ResponseDoneEvent)]
+        assert len(done) == 1
+        assert done[0].response.status == "failed"
+        assert state.in_response is False
 
     # -- unknown --
 

@@ -525,6 +525,7 @@ def _build_realtime_pipeline_unit(
         chat_size=chat_size,
         speculative_turns=speculative_turns,
         cancel_scope=cancel_scope,
+        home_assistant_guard_supported=module_kwargs.llm_backend == "chat-completions",
     )
 
     if module_kwargs.enable_live_transcription:

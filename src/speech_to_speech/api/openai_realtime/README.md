@@ -143,6 +143,55 @@ session-voice, WebSocket-route, and send-loop failures use the same sticky
 redaction boundary. Clients that do not request this extension keep the
 standard Realtime behavior described above.
 
+### Opt-in Home Assistant selector guard
+
+Trusted local clients that expose any `home_assistant__*` tool must also opt in
+on their first `session.update` with `reachy_home_assistant_guard`. The request
+contains version `1`, a fresh 64-character lowercase hexadecimal nonce, the
+SHA-256 digest of the complete canonical instructions-and-tools contract, and
+the total tool count. The digest covers every tool in order, including non-Home
+Assistant tools; omitting or changing any tool invalidates the handshake. Only
+the Chat Completions backend advertises the complete-output quarantine needed
+by this initial extension; other backends reject the handshake.
+Every tool must use the canonical flat Realtime function shape; nested
+Chat-Completions tools and unknown schema fields fail closed. A
+`response.create` cannot introduce Home Assistant tools. After activation, an
+explicit per-response tool list must exactly match the acknowledged session
+catalog; omitting the list inherits that catalog, so tools-disabled private
+narration uses `tool_choice="none"` without redefining it.
+Guarded sessions support only `auto`, `required`, and `none`, and validate the
+complete provider result against the effective response-over-session choice
+before release: `none` permits no call, while `required` requires one.
+
+The client must wait for the matching
+`reachy.home_assistant_guard.ready` acknowledgement before sending audio. The
+guard can be combined atomically with the private transcript barrier; when both
+are requested, both ready events are emitted before any audio is accepted. A
+missing, malformed, duplicate, late, or contract-mismatched guard poisons the
+private session and closes it content-free. Later session updates cannot replace
+the guarded tool catalog.
+
+Once active, the Chat Completions backend buffers each complete provider result
+before releasing any text, history entry, TTS input, or native tool call. It
+accepts ordinary speech and registered non-Home Assistant tools. A Home
+Assistant selection must contain exactly one registered native tool call with
+JSON-object arguments and at most one short progress sentence. Mixed, duplicate,
+unregistered, malformed, oversized, code-delimited, or textual tool syntax is
+rejected before every content or authority sink. The complete provider envelope
+must contain exactly one matching terminal reason (`stop` for text-only output,
+`tool_calls` when a call is present); missing, truncated, filtered, conflicting,
+or otherwise incomplete output is rejected. Streaming additionally requires
+one stable provider choice (exact index `0`), counts every raw frame before
+accumulating tool fragments, and rejects payload after the terminal frame.
+Transport, timeout, parser, and raw-envelope-limit failures take the same
+content-free sticky-failure path; deliberate cancellation remains
+non-poisoning. Spoken text may contain neither a
+full registered tool name nor its provider-facing Home Assistant suffix, and
+any angle-tag, backtick, backslash escape, JSON, assignment, or call surface is
+forbidden. Rejection emits only the
+content-free `home_assistant_selector_rejected` error and a failed response,
+then makes the guard sticky-failed until disconnect.
+
 ---
 
 ## Tool Calling Design

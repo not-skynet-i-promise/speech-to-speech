@@ -55,6 +55,12 @@ class RuntimeConfig(BaseModel):
     transcript_barrier_pending_sequence: int | None = Field(default=None, exclude=True)
     transcript_barrier_pending_item_id: str | None = Field(default=None, exclude=True)
     transcript_barrier_pending_transcript: str | None = Field(default=None, exclude=True, repr=False)
+    home_assistant_guard_version: int | None = Field(default=None, exclude=True)
+    home_assistant_guard_nonce: str | None = Field(default=None, exclude=True)
+    home_assistant_guard_contract_sha256: str | None = Field(default=None, exclude=True)
+    home_assistant_guard_tool_count: int = Field(default=0, exclude=True)
+    home_assistant_guard_tool_names: tuple[str, ...] = Field(default=(), exclude=True)
+    home_assistant_guard_failed: bool = Field(default=False, exclude=True)
     _transcript_barrier_state_lock: Any = PrivateAttr(default_factory=RLock)
 
     @field_validator("session", mode="after")
@@ -140,6 +146,29 @@ class RuntimeConfig(BaseModel):
         """Whether the negotiated barrier may still accept protocol work."""
         return self.transcript_barrier_enabled and not self.transcript_barrier_failed
 
+    @property
+    def home_assistant_guard_enabled(self) -> bool:
+        return (
+            self.home_assistant_guard_version == 1
+            and self.home_assistant_guard_nonce is not None
+            and self.home_assistant_guard_contract_sha256 is not None
+            and self.home_assistant_guard_tool_count > 0
+            and bool(self.home_assistant_guard_tool_names)
+        )
+
+    @property
+    def home_assistant_guard_operational(self) -> bool:
+        return self.home_assistant_guard_enabled and not self.home_assistant_guard_failed
+
+    @property
+    def sensitive_content(self) -> bool:
+        """Whether content-bearing logs and failures must remain redacted."""
+        return self.transcript_barrier_private or self.home_assistant_guard_enabled or self.home_assistant_guard_failed
+
+    @property
+    def private_protocol_failed(self) -> bool:
+        return self.transcript_barrier_failed or self.home_assistant_guard_failed
+
     @contextmanager
     def transcript_barrier_state_guard(self) -> Iterator[None]:
         """Serialize barrier failure transitions with conversation write-back.
@@ -157,7 +186,7 @@ class RuntimeConfig(BaseModel):
     def transcript_barrier_content_guard(self) -> Iterator[bool]:
         """Atomically select whether a content-bearing side effect is private."""
         with self.transcript_barrier_state_guard():
-            yield self.transcript_barrier_private
+            yield self.sensitive_content
 
     def next_transcript_barrier_sequence(self) -> int:
         """Allocate one monotonic event sequence within the current session."""

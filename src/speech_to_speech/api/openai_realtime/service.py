@@ -38,6 +38,13 @@ from speech_to_speech.api.openai_realtime.handlers import (
     ResponseHandler,
     SessionHandler,
 )
+from speech_to_speech.api.openai_realtime.home_assistant_guard import (
+    HOME_ASSISTANT_SELECTOR_REJECTED,
+    HomeAssistantGuardReadyEvent,
+    contains_home_assistant_tool_identity,
+    session_contract,
+    valid_guarded_tool_choice,
+)
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.api.openai_realtime.transcript_barrier import (
     TRANSCRIPT_BARRIER_MAX_CHARS,
@@ -111,6 +118,7 @@ ServerEvent = Union[
     ResponseFunctionCallArgumentsDoneEvent,
     ResponseTextDeltaEvent,
     ResponseTextDoneEvent,
+    HomeAssistantGuardReadyEvent,
     TranscriptBarrierReadyEvent,
     TranscriptBarrierCompletedServerEvent,
     TranscriptBarrierDiscardedServerEvent,
@@ -229,12 +237,14 @@ class RealtimeService:
         chat_size: int = 10,
         speculative_turns: SpeculativeTurnTracker | None = None,
         cancel_scope: CancelScope | None = None,
+        home_assistant_guard_supported: bool = False,
     ) -> None:
         self.text_prompt_queue = text_prompt_queue
         self.should_listen = should_listen
         self._chat_size = chat_size
         self.speculative_turns = speculative_turns
         self.cancel_scope = cancel_scope
+        self.home_assistant_guard_supported = home_assistant_guard_supported
         self._cancel_scope_wiring_verified = False
         self._conns: dict[str, ConnState] = {}
         self.total_usage = GlobalUsageMetrics()
@@ -279,7 +289,7 @@ class RealtimeService:
         return state.session_id
 
     def unregister(self, conn_id: str) -> None:
-        self.scrub_transcript_barrier_for_disconnect(conn_id)
+        self.scrub_private_protocols_for_disconnect(conn_id)
         st = self._conns.pop(conn_id, None)
         if st is not None:
             # Suppress any in-flight compaction splice so a daemon worker can't
@@ -345,7 +355,11 @@ class RealtimeService:
     def build_session_created(self, conn_id: str) -> SessionCreatedEvent:
         return self.session.build_session_created(conn_id)
 
-    def handle_session_update(self, conn_id: str, event: SessionUpdateEvent) -> ServerEvent | None:
+    def handle_session_update(
+        self,
+        conn_id: str,
+        event: SessionUpdateEvent,
+    ) -> ServerEvent | list[ServerEvent] | None:
         return self.session.handle_session_update(conn_id, event)
 
     def transcript_barrier_enabled(self) -> bool:
@@ -360,8 +374,21 @@ class RealtimeService:
             return False
         return next(iter(self._conns.values())).runtime_config.transcript_barrier_private
 
+    def sensitive_content(self) -> bool:
+        if len(self._conns) != 1:
+            return False
+        return next(iter(self._conns.values())).runtime_config.sensitive_content
+
     def transcript_barrier_failed(self, conn_id: str) -> bool:
         return self._state(conn_id).runtime_config.transcript_barrier_failed
+
+    def home_assistant_guard_enabled(self) -> bool:
+        if len(self._conns) != 1:
+            return False
+        return next(iter(self._conns.values())).runtime_config.home_assistant_guard_enabled
+
+    def private_protocol_failed(self, conn_id: str) -> bool:
+        return self._state(conn_id).runtime_config.private_protocol_failed
 
     def transcript_barrier_poisoned(self) -> bool:
         """Return whether the single-session unit must drop queued work."""
@@ -383,7 +410,17 @@ class RealtimeService:
 
     def transcript_barrier_audio_allowed(self, conn_id: str) -> bool:
         cfg = self._state(conn_id).runtime_config
-        return not cfg.transcript_barrier_failed and not cfg.transcript_barrier_pending
+        return not cfg.private_protocol_failed and not cfg.transcript_barrier_pending
+
+    def poison_home_assistant_guard(self, conn_id: str, error_type: str) -> RealtimeErrorEvent:
+        st = self._state(conn_id)
+        cfg = st.runtime_config
+        with cfg.transcript_barrier_state_guard():
+            cfg.home_assistant_guard_failed = True
+            cfg.chat.enable_private_content_logging()
+            cfg.chat.suspend_compaction()
+            st.deferred_items.clear()
+        return self.make_error("Home Assistant guard protocol violation.", error_type)
 
     def poison_transcript_barrier(self, conn_id: str, error_type: str) -> RealtimeErrorEvent:
         st = self._state(conn_id)
@@ -425,6 +462,17 @@ class RealtimeService:
                 cfg.chat.suspend_compaction()
             st.deferred_items.clear()
 
+    def scrub_private_protocols_for_disconnect(self, conn_id: str) -> None:
+        self.scrub_transcript_barrier_for_disconnect(conn_id)
+        st = self._conns.get(conn_id)
+        if st is None or not st.runtime_config.home_assistant_guard_enabled:
+            return
+        with st.runtime_config.transcript_barrier_state_guard():
+            st.runtime_config.home_assistant_guard_failed = True
+            st.runtime_config.chat.enable_private_content_logging()
+            st.runtime_config.chat.suspend_compaction()
+            st.deferred_items.clear()
+
     def handle_audio_append(self, conn_id: str, event: InputAudioBufferAppendEvent) -> list[bytes]:
         if not self.transcript_barrier_audio_allowed(conn_id):
             self.poison_transcript_barrier(conn_id, "transcript_barrier_pending")
@@ -442,6 +490,30 @@ class RealtimeService:
         cfg = self._state(conn_id).runtime_config
         if cfg.transcript_barrier_pending:
             return self.poison_transcript_barrier(conn_id, "transcript_barrier_pending")
+        response = event.response
+        if (
+            cfg.home_assistant_guard_enabled
+            and response is not None
+            and not valid_guarded_tool_choice(response.tool_choice)
+        ):
+            return self.poison_home_assistant_guard(conn_id, "invalid_home_assistant_guard")
+        explicit_tools = response is not None and "tools" in response.model_fields_set
+        response_has_home_assistant = response is not None and contains_home_assistant_tool_identity(response.tools)
+        if response_has_home_assistant and not cfg.home_assistant_guard_operational:
+            return self.poison_home_assistant_guard(conn_id, "invalid_home_assistant_guard")
+        if explicit_tools and cfg.home_assistant_guard_enabled:
+            assert response is not None
+            try:
+                digest, tool_count, tool_names = session_contract(cfg.session.instructions, response.tools)
+            except (TypeError, ValueError):
+                return self.poison_home_assistant_guard(conn_id, "invalid_home_assistant_guard")
+            if (
+                not cfg.home_assistant_guard_operational
+                or digest != cfg.home_assistant_guard_contract_sha256
+                or tool_count != cfg.home_assistant_guard_tool_count
+                or tool_names != cfg.home_assistant_guard_tool_names
+            ):
+                return self.poison_home_assistant_guard(conn_id, "invalid_home_assistant_guard")
         return self.response.handle_response_create(conn_id, event)
 
     def handle_response_cancel(self, conn_id: str) -> list[ServerEvent]:
@@ -579,7 +651,7 @@ class RealtimeService:
     ) -> list[ServerEvent] | None:
         cfg = self._state(conn_id).runtime_config
         with cfg.transcript_barrier_state_guard():
-            if cfg.transcript_barrier_failed:
+            if cfg.private_protocol_failed:
                 logger.debug("Dropping pipeline event after private barrier failure")
                 return []
             if cfg.transcript_barrier_enabled and isinstance(
@@ -823,7 +895,18 @@ class RealtimeService:
         nothing.
         """
         state = self._state(conn_id)
-        private_barrier = state.runtime_config.transcript_barrier_private
+        private_barrier = state.runtime_config.sensitive_content
+        if event.message == HOME_ASSISTANT_SELECTOR_REJECTED and state.runtime_config.home_assistant_guard_enabled:
+            if not state.in_response:
+                return []
+            guard_events: list[ServerEvent] = [
+                self.poison_home_assistant_guard(
+                    conn_id,
+                    "home_assistant_selector_rejected",
+                )
+            ]
+            guard_events.extend(self.response.finish_response(conn_id, status="failed"))
+            return guard_events
         if private_barrier:
             message = "Private response failed."
             logger.info("Private response failed; content redacted")
