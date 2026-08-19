@@ -275,6 +275,7 @@ def _guard_tools():
 def _complete_response(
     *,
     content="",
+    refusal=None,
     calls=(),
     finish_reason="stop",
     choice_index=0,
@@ -284,7 +285,7 @@ def _complete_response(
         choices = [
             SimpleNamespace(
                 index=choice_index,
-                message=SimpleNamespace(content=content, refusal=None, tool_calls=list(calls)),
+                message=SimpleNamespace(content=content, refusal=refusal, tool_calls=list(calls)),
                 finish_reason=finish_reason,
             )
         ]
@@ -368,6 +369,9 @@ def test_guarded_turn_preserves_safe_ordinary_speech_and_registered_non_ha_call(
     [
         (_complete_response(content=""), "auto"),
         (_complete_response(content="I used Get Live Context."), "auto"),
+        (_complete_response(content="I used Ｇｅｔ Ｌｉｖｅ Ｃｏｎｔｅｘｔ."), "auto"),
+        (_complete_response(content="The ｈｏｍｅ＿ａｓｓｉｓｔａｎｔ server answered."), "auto"),
+        (_complete_response(content=None, refusal="I cannot help with that."), "auto"),
         (_complete_response(content="tool name: unknown"), "auto"),
         (
             _complete_response(
@@ -433,6 +437,9 @@ def test_guarded_turn_preserves_safe_ordinary_speech_and_registered_non_ha_call(
     ids=[
         "empty",
         "spoken-tool-name",
+        "normalized-spoken-tool-name",
+        "normalized-home-assistant",
+        "refusal",
         "protocol-label",
         "nonfinite-json",
         "duplicate-json-key",

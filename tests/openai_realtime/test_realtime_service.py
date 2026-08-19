@@ -3561,3 +3561,36 @@ def test_guarded_invalid_function_output_poison_is_sticky(
     assert isinstance(later, RealtimeErrorEvent)
     assert later.error.type == "private_session_failed"
     assert text_prompt_queue.empty()
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        TranscriptionCompletedEvent(transcript="PRIVATE_STT_CANARY", turn_id="turn-race", turn_revision=0),
+        AssistantTextEvent(text="PRIVATE_ASSISTANT_CANARY", turn_id="turn-race", turn_revision=0),
+    ],
+    ids=["transcription", "assistant-text"],
+)
+def test_guard_failure_after_stale_check_still_blocks_synchronous_pipeline_sinks(
+    service: RealtimeService,
+    conn_id: str,
+    runtime_config,
+    text_prompt_queue: Queue,
+    monkeypatch: pytest.MonkeyPatch,
+    event,
+) -> None:
+    """The final failure check and every synchronous sink share one lock."""
+    _activate_home_assistant_guard(service, conn_id)
+
+    def poison_during_stale_check(*_args, **_kwargs) -> bool:
+        runtime_config.fail_home_assistant_guard()
+        return False
+
+    monkeypatch.setattr(service, "_is_stale_turn_event", poison_during_stale_check)
+
+    emitted = service.dispatch_pipeline_event(conn_id, event)
+
+    assert emitted == []
+    assert runtime_config.home_assistant_guard_failed
+    assert runtime_config.chat.buffer == []
+    assert text_prompt_queue.empty()

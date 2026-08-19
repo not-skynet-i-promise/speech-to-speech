@@ -5,6 +5,7 @@ import logging
 import math
 import re
 import time
+import unicodedata
 from collections.abc import Iterator
 from typing import Any, cast
 
@@ -333,9 +334,9 @@ class ChatCompletionsApiModelHandler(BaseOpenAICompatibleHandler):
             raise HomeAssistantSelectorRejected("selector text must be a string")
         if refusal is not None and not isinstance(refusal, str):
             raise HomeAssistantSelectorRejected("selector refusal must be a string")
-        if raw_content and refusal:
-            raise HomeAssistantSelectorRejected("selector text and refusal are ambiguous")
-        text = raw_content or refusal or ""
+        if refusal is not None:
+            raise HomeAssistantSelectorRejected("guarded selector refusal is not an answer")
+        text = raw_content or ""
         if len(text) > MAX_GUARDED_TEXT_CHARS:
             raise HomeAssistantSelectorRejected("selector text exceeded its bound")
 
@@ -406,12 +407,13 @@ class ChatCompletionsApiModelHandler(BaseOpenAICompatibleHandler):
         surfaces = tuple(registered) + home_assistant_suffixes + _PROTOCOL_SURFACES
         spoken = remove_unspeechable(text)
         for visible_text in (text, spoken):
-            folded = visible_text.casefold()
-            if _PROTOCOL_MARKER.search(visible_text):
+            normalized_visible_text = unicodedata.normalize("NFKC", visible_text)
+            folded = normalized_visible_text.casefold()
+            if _PROTOCOL_MARKER.search(normalized_visible_text):
                 raise HomeAssistantSelectorRejected("selector exposed protocol syntax")
             if any(identifier.casefold() in folded for identifier in surfaces):
                 raise HomeAssistantSelectorRejected("selector exposed an internal identifier")
-            if _contains_visible_surface(visible_text, surfaces):
+            if _contains_visible_surface(normalized_visible_text, surfaces):
                 raise HomeAssistantSelectorRejected("selector spoke an internal identifier")
 
         home_assistant_calls = [call for call in normalized_calls if call.name.startswith(HOME_ASSISTANT_TOOL_PREFIX)]

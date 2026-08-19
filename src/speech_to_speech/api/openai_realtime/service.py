@@ -689,16 +689,6 @@ class RealtimeService:
         wait_for_pending_reopen: bool,
     ) -> list[ServerEvent] | None:
         cfg = self._state(conn_id).runtime_config
-        with cfg.transcript_barrier_state_guard():
-            if cfg.private_protocol_failed:
-                logger.debug("Dropping pipeline event after private barrier failure")
-                return []
-            if cfg.transcript_barrier_enabled and isinstance(
-                event,
-                (PartialTranscriptionEvent, TranscriptionCompletedEvent),
-            ):
-                logger.info("Rejecting ordinary transcription event after private barrier activation")
-                return [self.poison_transcript_barrier(conn_id, "invalid_transcript_barrier_event")]
         is_stale = self._is_stale_turn_event(event, wait_for_pending_reopen=wait_for_pending_reopen)
         if is_stale is None:
             return None
@@ -711,18 +701,28 @@ class RealtimeService:
             )
             return []
 
-        self._observe_turn_event(event)
-        if isinstance(event, AssistantTextEvent):
-            return self.response.on_assistant_text(
-                conn_id,
+        with cfg.transcript_barrier_state_guard():
+            if cfg.private_protocol_failed:
+                logger.debug("Dropping pipeline event after private barrier failure")
+                return []
+            if cfg.transcript_barrier_enabled and isinstance(
                 event,
-                wait_for_pending_reopen=wait_for_pending_reopen,
-            )
-        handler = self._pipeline_dispatch.get(type(event))
-        if handler is None:
-            logger.debug("Unhandled pipeline event type: %s", type(event).__name__)
-            return []
-        return handler(conn_id, event)
+                (PartialTranscriptionEvent, TranscriptionCompletedEvent),
+            ):
+                logger.info("Rejecting ordinary transcription event after private barrier activation")
+                return [self.poison_transcript_barrier(conn_id, "invalid_transcript_barrier_event")]
+            self._observe_turn_event(event)
+            if isinstance(event, AssistantTextEvent):
+                return self.response.on_assistant_text(
+                    conn_id,
+                    event,
+                    wait_for_pending_reopen=wait_for_pending_reopen,
+                )
+            handler = self._pipeline_dispatch.get(type(event))
+            if handler is None:
+                logger.debug("Unhandled pipeline event type: %s", type(event).__name__)
+                return []
+            return handler(conn_id, event)
 
     def _is_stale_turn_event(self, event: PipelineEvent, *, wait_for_pending_reopen: bool = True) -> bool | None:
         if self.speculative_turns is None:
