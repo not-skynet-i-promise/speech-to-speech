@@ -406,15 +406,19 @@ class RealtimeService:
     def private_protocol_failed(self, conn_id: str) -> bool:
         return self._state(conn_id).runtime_config.private_protocol_failed
 
-    def transcript_barrier_poisoned(self) -> bool:
-        """Return whether the single-session unit must drop queued work."""
+    def private_protocol_poisoned(self) -> bool:
+        """Return whether any private protocol must drop queued work."""
         if len(self._conns) != 1:
             return False
-        return next(iter(self._conns.values())).runtime_config.transcript_barrier_failed
+        return next(iter(self._conns.values())).runtime_config.private_protocol_failed
+
+    def transcript_barrier_poisoned(self) -> bool:
+        """Backward-compatible name for the complete private failure gate."""
+        return self.private_protocol_poisoned()
 
     @contextmanager
     def transcript_barrier_pipeline_state_guard(self) -> Iterator[tuple[bool, bool]]:
-        """Linearize notifier content side effects with barrier poison."""
+        """Linearize notifier routing with every private-protocol failure."""
         if len(self._conns) != 1:
             # A pipeline transcription without its one live connection is
             # stale work, never an ordinary turn for a future session.
@@ -422,7 +426,17 @@ class RealtimeService:
             return
         cfg = next(iter(self._conns.values())).runtime_config
         with cfg.transcript_barrier_state_guard():
-            yield cfg.transcript_barrier_private, cfg.transcript_barrier_failed
+            yield cfg.transcript_barrier_private, cfg.private_protocol_failed
+
+    @contextmanager
+    def sensitive_pipeline_state_guard(self) -> Iterator[tuple[bool, bool]]:
+        """Linearize STT content sinks with all private protocol state."""
+        if len(self._conns) != 1:
+            yield True, True
+            return
+        cfg = next(iter(self._conns.values())).runtime_config
+        with cfg.transcript_barrier_state_guard():
+            yield cfg.sensitive_content, cfg.private_protocol_failed
 
     def transcript_barrier_audio_allowed(self, conn_id: str) -> bool:
         cfg = self._state(conn_id).runtime_config

@@ -548,8 +548,9 @@ def _build_realtime_pipeline_unit(
             "text_output_queue": text_output_queue,
             "should_listen": should_listen,
             "transcript_barrier_enabled": service.transcript_barrier_private,
-            "transcript_barrier_failed": service.transcript_barrier_poisoned,
+            "transcript_barrier_failed": service.private_protocol_poisoned,
             "transcript_barrier_state_guard": service.transcript_barrier_pipeline_state_guard,
+            "private_content_enabled": service.sensitive_content,
         },
         module_kwargs=module_kwargs,
         vad_handler_kwargs=vad_kw,
@@ -572,9 +573,9 @@ def _build_realtime_pipeline_unit(
     for h in handlers:
         h.pipeline_index = index
         if isinstance(h, BaseSTTHandler):
-            h.set_transcript_barrier_enabled(service.transcript_barrier_private)
-            h.set_transcript_barrier_failed(service.transcript_barrier_poisoned)
-            h.set_transcript_barrier_state_guard(service.transcript_barrier_pipeline_state_guard)
+            h.set_transcript_barrier_enabled(service.sensitive_content)
+            h.set_transcript_barrier_failed(service.private_protocol_poisoned)
+            h.set_transcript_barrier_state_guard(service.sensitive_pipeline_state_guard)
 
     cancellation_consumers = tuple(
         getattr(handler, "cancel_scope") for handler in handlers if hasattr(handler, "cancel_scope")

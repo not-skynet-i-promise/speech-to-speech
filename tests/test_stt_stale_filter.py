@@ -7,6 +7,7 @@ from typing import Iterator, Literal
 
 import numpy as np
 
+from speech_to_speech.api.openai_realtime.service import RealtimeService
 from speech_to_speech.pipeline.messages import PIPELINE_END, PartialTranscription, Transcription, VADAudio
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
 from speech_to_speech.STT.base_stt_handler import BaseSTTHandler
@@ -73,6 +74,32 @@ def test_stt_handler_drops_queued_input_and_output_after_private_barrier_failure
     assert handler.should_process_input(_vad_audio()) is False
     assert handler.should_emit_output(Transcription(text="private")) is False
     assert handler.processed == []
+
+
+def test_stt_handler_uses_home_assistant_privacy_and_sticky_failure_state():
+    service = RealtimeService()
+    connection_id = service.register()
+    runtime_config = service._state(connection_id).runtime_config
+    runtime_config.home_assistant_guard_version = 1
+    runtime_config.home_assistant_guard_nonce = "cd" * 32
+    runtime_config.home_assistant_guard_contract_sha256 = "ef" * 32
+    runtime_config.home_assistant_guard_tool_count = 1
+    runtime_config.home_assistant_guard_tool_names = ("home_assistant__GetLiveContext",)
+    tracker = SpeculativeTurnTracker()
+    tracker.observe("turn_1", 0)
+    handler = _handler(tracker, Queue(), Queue())
+    handler.set_transcript_barrier_enabled(service.sensitive_content)
+    handler.set_transcript_barrier_failed(service.private_protocol_poisoned)
+    handler.set_transcript_barrier_state_guard(service.sensitive_pipeline_state_guard)
+
+    with handler.transcript_content_allowed() as allowed:
+        assert allowed is False
+    assert handler.should_process_input(_vad_audio()) is True
+
+    service.poison_home_assistant_guard(connection_id, "test_failure")
+
+    assert handler.should_process_input(_vad_audio()) is False
+    assert handler.should_emit_output(Transcription(text="private")) is False
 
 
 def test_stt_handler_drops_stale_queued_audio_without_processing():

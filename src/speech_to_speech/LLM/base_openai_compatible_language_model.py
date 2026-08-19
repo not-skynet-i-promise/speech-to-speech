@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
@@ -136,6 +137,22 @@ def _reject_nonfinite_json_constant(value: str) -> None:
     raise ValueError(f"non-finite JSON constant is not allowed: {value}")
 
 
+def _parse_finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite JSON number is not allowed: {value}")
+    return parsed
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key is not allowed: {key}")
+        result[key] = value
+    return result
+
+
 def _guarded_selector_output_allowed(
     events: list[ProviderEvent],
     runtime_config: RuntimeConfig,
@@ -201,7 +218,12 @@ def _guarded_selector_output_allowed(
         if len(tool.arguments) > MAX_GUARDED_TEXT_CHARS:
             return False
         try:
-            arguments = json.loads(tool.arguments, parse_constant=_reject_nonfinite_json_constant)
+            arguments = json.loads(
+                tool.arguments,
+                parse_constant=_reject_nonfinite_json_constant,
+                parse_float=_parse_finite_json_float,
+                object_pairs_hook=_unique_json_object,
+            )
         except (TypeError, ValueError):
             return False
         if not isinstance(arguments, dict):
@@ -218,7 +240,7 @@ def _guarded_selector_output_allowed(
         folded_text = visible_text.casefold()
         if any(name.casefold() in folded_text for name in registered_tool_surface_names(tuple(registered_names))):
             return False
-        if HOME_ASSISTANT_TOOL_PREFIX in visible_text:
+        if HOME_ASSISTANT_TOOL_PREFIX.casefold() in folded_text:
             return False
 
     home_assistant_tools = [tool for tool in tools if tool.name.startswith(HOME_ASSISTANT_TOOL_PREFIX)]
@@ -675,6 +697,8 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             # the default conversation, or the out-of-band context). The provider
             # would reject this; fail with a clear message instead of an opaque error.
             error_message = "Cannot generate a response: no instructions and no input were provided."
+            if turn.runtime_config.home_assistant_guard_enabled:
+                error_message = HOME_ASSISTANT_SELECTOR_REJECTED
 
         try:
             if error_message is None:

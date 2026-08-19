@@ -458,6 +458,38 @@ class TestHandleSessionUpdate:
         assert runtime_config.home_assistant_guard_enabled is False
         assert runtime_config.home_assistant_guard_failed is True
 
+    def test_home_assistant_guard_rejects_duplicate_function_names(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+    ):
+        tools = _home_assistant_tools()
+        tools[1] = {
+            **tools[0],
+            "description": "A conflicting schema with the same provider identity.",
+            "parameters": {"type": "object", "properties": {"entity_id": {"type": "string"}}},
+        }
+
+        result = service.handle_session_update(
+            conn_id,
+            self._make_update(
+                instructions="Use the exposed tools.",
+                tools=tools,
+                reachy_home_assistant_guard={
+                    "version": 1,
+                    "nonce": "1b" * 32,
+                    "session_contract_sha256": "00" * 32,
+                    "tool_count": 2,
+                },
+            ),
+        )
+
+        assert isinstance(result, RealtimeErrorEvent)
+        assert result.error.type == "invalid_home_assistant_guard"
+        assert runtime_config.home_assistant_guard_enabled is False
+        assert runtime_config.home_assistant_guard_failed is True
+
     def test_required_home_assistant_backend_rejects_first_update_without_guard(
         self,
         service,

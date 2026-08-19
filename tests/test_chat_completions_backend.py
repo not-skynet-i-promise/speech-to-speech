@@ -925,6 +925,8 @@ def test_home_assistant_guard_keeps_deliberate_cancellation_non_poisoning_on_pro
         ("<tool_call>private</tool_call>", None, None),
         ("Let me use GetLiveContext to check.", "home_assistant__GetLiveContext", "{}"),
         ("Let me use GetLive\u200bContext to check.", "home_assistant__GetLiveContext", "{}"),
+        ("HOME_ASSISTANT__UnknownTool", None, None),
+        ("HOME\u200b_ASSISTANT__UnknownTool", None, None),
         ("Let me use `GetLiveContext` to check.", "home_assistant__GetLiveContext", "{}"),
         ("<function_call>GetLiveContext</function_call>", "home_assistant__GetLiveContext", "{}"),
         (r"Let me use \u0047etLiveContext to check.", "home_assistant__GetLiveContext", "{}"),
@@ -938,6 +940,12 @@ def test_home_assistant_guard_keeps_deliberate_cancellation_non_poisoning_on_pro
         ("Checking.", "home_assistant__GetLiveContext", '{"area":NaN}'),
         ("Checking.", "home_assistant__GetLiveContext", '{"area":Infinity}'),
         ("Checking.", "home_assistant__GetLiveContext", '{"area":-Infinity}'),
+        ("Checking.", "home_assistant__GetLiveContext", '{"value":1e9999}'),
+        (
+            "Checking.",
+            "home_assistant__GetLiveContext",
+            '{"area":"bedroom","area":"garage"}',
+        ),
         ("Checking.", "home_assistant__GetLiveContext", '{"value":"' + "x" * 16_384 + '"}'),
         ("Checking. Still checking.", "home_assistant__GetLiveContext", "{}"),
     ],
@@ -1502,6 +1510,32 @@ def test_empty_input_emits_failed_end_of_response():
     assert called["n"] == 0, "no API call should be made when there is nothing to send"
     assert end is not None and end.error is not None
     assert text == ""
+
+
+def test_guarded_empty_input_emits_sticky_selector_rejection_without_provider_call():
+    h = _make_handler(stream=True)
+    called = {"n": 0}
+
+    def fake_create(**kwargs):
+        called["n"] += 1
+        return _FakeStream([])
+
+    h.client.chat.completions.create = fake_create
+    text, tools, usage, chat, end = _drive(
+        h,
+        tools=_guard_tools(),
+        user="",
+        instructions="",
+        chat=Chat(10),
+        home_assistant_guard=True,
+    )
+
+    assert called["n"] == 0
+    assert text == ""
+    assert tools == []
+    assert usage is None
+    assert end is not None and end.error == HOME_ASSISTANT_SELECTOR_REJECTED
+    assert chat._pending_tool_calls == {}
 
 
 def test_generation_error_emits_failed_end_of_response():

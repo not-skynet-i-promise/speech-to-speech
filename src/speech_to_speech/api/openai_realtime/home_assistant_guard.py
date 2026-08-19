@@ -64,6 +64,8 @@ def session_contract(
         if tool.get("type") != "function" or not isinstance(tool.get("name"), str) or not tool["name"]:
             raise ValueError("only named function tools are supported by the guard")
         names.append(tool["name"])
+    if len(names) != len(set(names)):
+        raise ValueError("guarded function tool names must be unique")
     payload = json.dumps(
         {"instructions": instructions or "", "tools": serialized_tools},
         ensure_ascii=True,

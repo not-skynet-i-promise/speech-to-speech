@@ -130,6 +130,43 @@ def test_poisoned_private_session_keeps_stt_redaction_sticky_while_work_drains(c
     assert canary not in caplog.text
 
 
+def test_home_assistant_guard_redacts_live_transcripts_and_drops_them_after_poison(caplog):
+    text_output_queue = Queue()
+    service = RealtimeService()
+    connection_id = service.register()
+    runtime_config = service._state(connection_id).runtime_config
+    runtime_config.home_assistant_guard_version = 1
+    runtime_config.home_assistant_guard_nonce = "cd" * 32
+    runtime_config.home_assistant_guard_contract_sha256 = "ef" * 32
+    runtime_config.home_assistant_guard_tool_count = 1
+    runtime_config.home_assistant_guard_tool_names = ("home_assistant__GetLiveContext",)
+    notifier = object.__new__(TranscriptionNotifier)
+    notifier.setup(
+        text_output_queue=text_output_queue,
+        transcript_barrier_state_guard=service.transcript_barrier_pipeline_state_guard,
+        private_content_enabled=service.sensitive_content,
+    )
+    canary = "HOME_ASSISTANT_PRIVATE_TRANSCRIPT_CANARY"
+
+    with caplog.at_level(logging.DEBUG, logger="speech_to_speech.STT.transcription_notifier"):
+        assert list(notifier.process(PartialTranscription(text=canary))) == []
+        assert list(notifier.process(Transcription(text=canary, language_code="en"))) == []
+
+    assert isinstance(text_output_queue.get_nowait(), PartialTranscriptionEvent)
+    assert isinstance(text_output_queue.get_nowait(), TranscriptionCompletedEvent)
+    assert text_output_queue.empty()
+    assert canary not in caplog.text
+    assert "private content redacted" in caplog.text
+
+    service.poison_home_assistant_guard(connection_id, "test_failure")
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="speech_to_speech.STT.transcription_notifier"):
+        assert list(notifier.process(Transcription(text=canary, language_code="en"))) == []
+
+    assert text_output_queue.empty()
+    assert canary not in caplog.text
+
+
 def test_realtime_state_guard_linearizes_notifier_side_effects_before_later_poison(caplog):
     service = RealtimeService()
     connection_id = service.register()
