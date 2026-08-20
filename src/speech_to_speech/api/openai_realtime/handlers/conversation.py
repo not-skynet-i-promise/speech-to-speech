@@ -15,7 +15,7 @@ from openai.types.realtime.conversation_item_input_audio_transcription_completed
 )
 
 from speech_to_speech.api.openai_realtime.handlers.base import RealtimeBaseHandler
-from speech_to_speech.LLM.chat import ChatItemError, add_supported_item
+from speech_to_speech.LLM.chat import ChatItemError, add_supported_item, add_supported_items_atomically
 from speech_to_speech.pipeline.events import PartialTranscriptionEvent, TranscriptionCompletedEvent
 
 if TYPE_CHECKING:
@@ -57,10 +57,14 @@ class ConversationHandler(RealtimeBaseHandler):
         try:
             self._append_item(conn_id, item)
         except ChatItemError as exc:
+            if self._state(conn_id).runtime_config.home_assistant_guard_operational:
+                return [self._service.poison_home_assistant_guard(conn_id, "invalid_conversation_item")]
             return [self.make_client_content_error(conn_id, str(exc), "invalid_conversation_item")]
 
-        if not item:
-            return []
+        return [] if not item else [self._item_created_event(conn_id, item)]
+
+    def _item_created_event(self, conn_id: str, item: ConversationItem) -> ConversationItemCreatedEvent:
+        """Build the acknowledgement for an item already committed to chat."""
         st = self._state(conn_id)
         event = ConversationItemCreatedEvent(
             type="conversation.item.created",
@@ -69,7 +73,7 @@ class ConversationHandler(RealtimeBaseHandler):
             item=item,
         )
         st.last_item_id = item.id
-        return [event]
+        return event
 
     def flush_deferred_items(self, conn_id: str) -> list[ServerEvent]:
         """Apply items buffered during a response, in arrival order.
@@ -83,10 +87,13 @@ class ConversationHandler(RealtimeBaseHandler):
             return []
         items = st.deferred_items
         st.deferred_items = []
-        events: list[ServerEvent] = []
-        for item in items:
-            events.extend(self._apply_item(conn_id, item))
-        return events
+        try:
+            add_supported_items_atomically(st.runtime_config.chat, items)
+        except ChatItemError as exc:
+            if st.runtime_config.home_assistant_guard_operational:
+                return [self._service.poison_home_assistant_guard(conn_id, "invalid_conversation_item")]
+            return [self.make_client_content_error(conn_id, str(exc), "invalid_conversation_item")]
+        return [self._item_created_event(conn_id, item) for item in items if item]
 
     def _append_item(self, conn_id: str, item: ConversationItem) -> None:
         """Narrow ``ConversationItem`` to ``SupportedItem`` and delegate to ``Chat.add_item``.

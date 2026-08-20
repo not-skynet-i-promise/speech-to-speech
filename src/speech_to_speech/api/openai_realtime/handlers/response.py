@@ -196,7 +196,7 @@ class ResponseHandler(RealtimeBaseHandler):
                     message="Only string tool_choice values are supported for now (auto, required, none).",
                     _type="tool_choice_not_supported",
                 )
-        if st.in_response:
+        if st.in_response or (st.response_pending and st.runtime_config.home_assistant_guard_operational):
             return self.make_error(
                 message="Cannot create response while another response is in progress.",
                 _type="conversation_already_has_active_response",
@@ -209,7 +209,7 @@ class ResponseHandler(RealtimeBaseHandler):
         # the input rides along on the request and seeds a throwaway chat in the LM.
         if not out_of_band and event.response and event.response.input:
             try:
-                if st.runtime_config.transcript_barrier_private:
+                if st.runtime_config.sensitive_content:
                     add_supported_items_atomically(st.runtime_config.chat, list(event.response.input))
                 else:
                     # Preserve the default Realtime behavior: accepted prefix items
@@ -218,6 +218,8 @@ class ResponseHandler(RealtimeBaseHandler):
                     for item in event.response.input:
                         add_supported_item(st.runtime_config.chat, item)
             except ChatItemError as exc:
+                if st.runtime_config.home_assistant_guard_operational:
+                    return self._service.poison_home_assistant_guard(conn_id, "invalid_input_item")
                 return self.make_client_content_error(conn_id, str(exc), "invalid_input_item")
 
         st.in_response = True
@@ -309,12 +311,22 @@ class ResponseHandler(RealtimeBaseHandler):
                 )
             )
             self._end_response(conn_id, status)
+        elif st.response_pending:
+            st.response_pending = False
         # Apply any client items that arrived mid-generation now that in_response
         # is cleared and the generation's own write-back has landed. Done outside
         # the in_response guard so a stray terminal call still drains the buffer.
         cfg = st.runtime_config
-        if not cfg.transcript_barrier_pending and not cfg.transcript_barrier_failed:
-            events.extend(self._service.conversation.flush_deferred_items(conn_id))
+        if cfg.sensitive_content:
+            with cfg.transcript_barrier_state_guard():
+                if not cfg.transcript_barrier_pending and not cfg.private_protocol_failed:
+                    events.extend(self._service.conversation.flush_deferred_items(conn_id))
+        elif not cfg.transcript_barrier_pending:
+            # An ordinary provider may still own the content guard while a
+            # cancelled response is closing. Private activation is separately
+            # serialized against its response lease, so do not wait here.
+            if not cfg.private_protocol_failed:
+                events.extend(self._service.conversation.flush_deferred_items(conn_id))
         return events
 
     # ── Pipeline event handlers ───────────────────

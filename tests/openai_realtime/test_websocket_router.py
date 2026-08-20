@@ -14,10 +14,12 @@ from queue import Empty, Queue
 from threading import Event as ThreadingEvent
 
 import pytest
+from openai.types.realtime.realtime_session_create_request import RealtimeSessionCreateRequest
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketState
 
 import speech_to_speech.api.openai_realtime.websocket_router as router_module
+from speech_to_speech.api.openai_realtime.home_assistant_guard import session_contract
 from speech_to_speech.api.openai_realtime.pipeline_unit import PipelineUnit
 from speech_to_speech.api.openai_realtime.service import CHUNK_SIZE_BYTES, RealtimeService
 from speech_to_speech.api.openai_realtime.websocket_router import create_app
@@ -184,6 +186,76 @@ class TestConnection:
 
 
 class TestClientEventDispatch:
+    def test_home_assistant_guard_ready_precedes_the_input_lane(self, setup):
+        app, service, *_ = setup
+        service.home_assistant_guard_supported = True
+        tools = [
+            {
+                "type": "function",
+                "name": "home_assistant__GetLiveContext",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ]
+        contract = RealtimeSessionCreateRequest(type="realtime", instructions="private", tools=tools)
+        digest, count, _names = session_contract(contract.instructions, contract.tools)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                assert ws.receive_json()["type"] == "session.created"
+                ws.send_json(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "realtime",
+                            "instructions": "private",
+                            "tools": tools,
+                            "reachy_home_assistant_guard": {
+                                "version": 1,
+                                "nonce": "ab" * 32,
+                                "session_contract_sha256": digest,
+                                "tool_count": count,
+                            },
+                        },
+                    }
+                )
+                ready = ws.receive_json()
+                assert ready["type"] == "reachy.home_assistant_guard.ready"
+                assert ready["nonce"] == "ab" * 32
+
+                ws.send_json(
+                    {
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "Is the bedroom light on?"}],
+                        },
+                    }
+                )
+                assert ws.receive_json()["type"] == "conversation.item.created"
+
+    def test_required_home_assistant_guard_closes_input_before_handshake(self, setup):
+        app, service, *_ = setup
+        service.home_assistant_guard_supported = True
+        service.home_assistant_guard_required = True
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                assert ws.receive_json()["type"] == "session.created"
+                ws.send_json(
+                    {
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "private canary"}],
+                        },
+                    }
+                )
+                failure = ws.receive_json()
+                assert failure["type"] == "error"
+                assert failure["error"]["type"] == "invalid_home_assistant_guard"
+
     def test_audio_append_forwarded_to_input_queue(self, setup):
         app, _, input_queue, *_ = setup
         audio_b64 = base64.b64encode(_pcm_bytes(512)).decode("ascii")

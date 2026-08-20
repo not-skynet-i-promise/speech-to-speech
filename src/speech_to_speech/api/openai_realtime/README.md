@@ -143,6 +143,43 @@ session-voice, WebSocket-route, and send-loop failures use the same sticky
 redaction boundary. Clients that do not request this extension keep the
 standard Realtime behavior described above.
 
+### Required Home Assistant selector guard
+
+`--require_home_assistant_guard true` is a dedicated realtime
+Chat-Completions mode for trusted local clients. It marks the socket private at
+connect and accepts no input before the exact first `session.update` contains a
+version-1 `reachy_home_assistant_guard` request. That request carries a fresh
+64-character lowercase hexadecimal nonce, the SHA-256 digest of the complete
+ordered instructions-and-tools contract, and its total tool count. Every tool
+must use the canonical flat Realtime function shape, names must be unique, and
+the catalog must include at least one `home_assistant__*` tool. The matching
+`reachy.home_assistant_guard.ready` acknowledgement is the boundary after which
+audio or conversation input is accepted. The guard and private transcript
+barrier may be activated atomically in the same update; their ready events are
+then emitted in that order.
+
+The acknowledged action contract cannot be replaced. Every action-capable
+response uses the acknowledged instructions and tools; explicit values must
+hash to that same contract, while omission inherits it. An out-of-band private
+narration response is allowed only with `tool_choice="none"` and an omitted or
+empty tool list. Missing, malformed, duplicate, late, or mismatched negotiation
+and semantic-invalid guarded client items make the session sticky-failed and
+close it without retaining an accepted action-bearing prefix. Ordinary
+backends do not infer guard authority from tool names and keep their existing
+behavior.
+
+Guarded provider turns deliberately use one non-streaming Chat Completion even
+when ordinary turns stream. The complete response is validated before any
+history, client, TTS, or native-tool event is constructed: exactly one choice
+at index 0; a matching `stop` or `tool_calls` finish reason; bounded nonempty
+speech or registered calls; strict finite JSON-object arguments with unique
+keys; and the effective `auto`, `required`, or `none` tool choice. A Home
+Assistant selection is exactly one call with at most one short progress
+sentence. Mixed, duplicate, unregistered, malformed, truncated, oversized,
+JSON/code-shaped, or spoken protocol/tool-name output fails content-free and
+sticky before every sink. Provider/parse/timeout failures take the same path.
+Cancellation that wins before validation remains non-poisoning.
+
 ---
 
 ## Tool Calling Design

@@ -525,6 +525,8 @@ def _build_realtime_pipeline_unit(
         chat_size=chat_size,
         speculative_turns=speculative_turns,
         cancel_scope=cancel_scope,
+        home_assistant_guard_supported=module_kwargs.llm_backend == "chat-completions",
+        home_assistant_guard_required=module_kwargs.require_home_assistant_guard,
     )
 
     if module_kwargs.enable_live_transcription:
@@ -546,8 +548,9 @@ def _build_realtime_pipeline_unit(
             "text_output_queue": text_output_queue,
             "should_listen": should_listen,
             "transcript_barrier_enabled": service.transcript_barrier_private,
-            "transcript_barrier_failed": service.transcript_barrier_poisoned,
+            "transcript_barrier_failed": service.private_protocol_poisoned,
             "transcript_barrier_state_guard": service.transcript_barrier_pipeline_state_guard,
+            "private_content_enabled": service.sensitive_content,
         },
         module_kwargs=module_kwargs,
         vad_handler_kwargs=vad_kw,
@@ -570,9 +573,9 @@ def _build_realtime_pipeline_unit(
     for h in handlers:
         h.pipeline_index = index
         if isinstance(h, BaseSTTHandler):
-            h.set_transcript_barrier_enabled(service.transcript_barrier_private)
-            h.set_transcript_barrier_failed(service.transcript_barrier_poisoned)
-            h.set_transcript_barrier_state_guard(service.transcript_barrier_pipeline_state_guard)
+            h.set_transcript_barrier_enabled(service.sensitive_content)
+            h.set_transcript_barrier_failed(service.private_protocol_poisoned)
+            h.set_transcript_barrier_state_guard(service.sensitive_pipeline_state_guard)
 
     cancellation_consumers = tuple(
         getattr(handler, "cancel_scope") for handler in handlers if hasattr(handler, "cancel_scope")
@@ -1032,6 +1035,11 @@ def main() -> None:
             f"--num_pipelines > 1 is only supported with --mode realtime "
             f"(got mode={args.module_kwargs.mode!r}, num_pipelines={args.module_kwargs.num_pipelines})"
         )
+
+    if args.module_kwargs.require_home_assistant_guard and (
+        args.module_kwargs.mode != "realtime" or args.module_kwargs.llm_backend != "chat-completions"
+    ):
+        raise ValueError("--require_home_assistant_guard requires --mode realtime and --llm_backend chat-completions")
 
     # On Apple Silicon, all MLX inference serializes through a global lock (utils/mlx_lock.py).
     # The progressive STT path uses a short timeout and drops work under contention, producing

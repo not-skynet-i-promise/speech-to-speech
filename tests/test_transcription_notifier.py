@@ -130,6 +130,32 @@ def test_poisoned_private_session_keeps_stt_redaction_sticky_while_work_drains(c
     assert canary not in caplog.text
 
 
+def test_home_assistant_guard_redacts_live_stt_and_drops_it_after_poison(caplog) -> None:
+    text_output_queue = Queue()
+    runtime_config = RuntimeConfig(
+        home_assistant_guard_version=1,
+        home_assistant_guard_nonce="ab" * 32,
+        home_assistant_guard_contract_sha256="cd" * 32,
+        home_assistant_guard_tool_count=1,
+        home_assistant_guard_tool_names=("home_assistant__GetLiveContext",),
+    )
+    notifier = _notifier(text_output_queue=text_output_queue, runtime_config=runtime_config)
+    canary = "PRIVATE_HOME_TRANSCRIPT_CANARY"
+
+    with caplog.at_level(logging.INFO, logger="speech_to_speech.STT.transcription_notifier"):
+        initial = list(notifier.process(Transcription(text=canary, language_code="en")))
+        runtime_config.fail_home_assistant_guard()
+        assert list(notifier.process(Transcription(text="LATE_PRIVATE_CANARY", language_code="en"))) == []
+
+    assert len(initial) == 1 and isinstance(initial[0], GenerateResponseRequest)
+    event = text_output_queue.get_nowait()
+    assert isinstance(event, TranscriptionCompletedEvent)
+    assert event.transcript == canary
+    assert text_output_queue.empty()
+    assert canary not in caplog.text
+    assert "LATE_PRIVATE_CANARY" not in caplog.text
+
+
 def test_realtime_state_guard_linearizes_notifier_side_effects_before_later_poison(caplog):
     service = RealtimeService()
     connection_id = service.register()

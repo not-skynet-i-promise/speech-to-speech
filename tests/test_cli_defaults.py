@@ -36,6 +36,7 @@ def test_release_defaults_match_responses_api_parakeet_qwen3_realtime_profile():
     assert module_args.log_level == "info"
     assert module_args.enable_live_transcription is True
     assert module_args.live_transcription_update_interval == 0.5
+    assert module_args.require_home_assistant_guard is False
 
     assert vad_args.thresh == 0.6
     assert vad_args.min_silence_ms == 64
@@ -114,6 +115,24 @@ def test_parse_arguments_accepts_qwen3_tts_backend_override():
         sys.argv = original_argv
 
     assert args.qwen3_tts_handler_kwargs.qwen3_tts_backend == "torch"
+
+
+def test_parse_arguments_accepts_required_home_assistant_guard():
+    original_argv = sys.argv[:]
+    try:
+        sys.argv = [
+            "speech-to-speech",
+            "--llm_backend",
+            "chat-completions",
+            "--require_home_assistant_guard",
+            "true",
+        ]
+        args = parse_arguments()
+    finally:
+        sys.argv = original_argv
+
+    assert args.module_kwargs.llm_backend == "chat-completions"
+    assert args.module_kwargs.require_home_assistant_guard is True
 
 
 def test_parse_arguments_transformers_backend():

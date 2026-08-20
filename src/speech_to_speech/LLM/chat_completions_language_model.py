@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import re
 import time
+import unicodedata
 from collections.abc import Iterator
 from typing import Any, cast
 
@@ -24,6 +27,14 @@ from openai.types.realtime.realtime_conversation_item_assistant_message import (
 from openai.types.responses import ResponseFunctionToolCall
 from openai.types.shared_params import FunctionDefinition
 
+from speech_to_speech.api.openai_realtime.home_assistant_guard import (
+    GUARDED_TOOL_CHOICES,
+    HOME_ASSISTANT_TOOL_PREFIX,
+    MAX_GUARDED_TEXT_CHARS,
+    HomeAssistantSelectorRejected,
+    identifier_visible_words,
+)
+from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.LLM.base_openai_compatible_language_model import (
     WARMUP_MAX_RETRIES,
     AssistantMessage,
@@ -33,12 +44,66 @@ from speech_to_speech.LLM.base_openai_compatible_language_model import (
     TextDelta,
     ToolCall,
     Usage,
+    _Turn,
 )
 from speech_to_speech.LLM.chat import Chat
 from speech_to_speech.LLM.compaction_prompt import CompactGenerateFn
+from speech_to_speech.LLM.tool_call.function_tool import MAX_TOOL_CALLS_PER_RESPONSE
+from speech_to_speech.LLM.utils import remove_unspeechable
 from speech_to_speech.utils.utils import _generate_id
 
 logger = logging.getLogger(__name__)
+
+_VISIBLE_WORD = re.compile(r"[^\W_]+", re.UNICODE)
+_PROTOCOL_MARKER = re.compile(
+    r"(?:[`<>\\]|['\"](?:name|arguments|tool_name)['\"]\s*:"
+    r"|[{}\[\]=]|(?<![A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_]*\s*\()",
+    re.IGNORECASE,
+)
+_PROTOCOL_SURFACES = (
+    "tool_name",
+    "arguments",
+    "function_call",
+    "tool_call",
+    "server_alias",
+    "remote_tool_name",
+    "namespaced_tool_name",
+    "structured_content",
+    "home_assistant",
+)
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant is not allowed: {value}")
+
+
+def _finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite JSON number is not allowed: {value}")
+    return parsed
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key is not allowed: {key}")
+        result[key] = value
+    return result
+
+
+def _contains_visible_surface(text: str, identifiers: tuple[str, ...]) -> bool:
+    visible = tuple(match.group(0).casefold() for match in _VISIBLE_WORD.finditer(text))
+    for identifier in identifiers:
+        words = identifier_visible_words(identifier)
+        if (
+            words
+            and len(words) <= len(visible)
+            and any(visible[index : index + len(words)] == words for index in range(len(visible) - len(words) + 1))
+        ):
+            return True
+    return False
 
 
 def _to_chat_tools(req_tools: Any) -> list[ChatCompletionToolParam] | None:
@@ -203,6 +268,172 @@ class ChatCompletionsApiModelHandler(BaseOpenAICompatibleHandler):
             timeout=self.request_timeout,
             **create_kwargs,
         )
+
+    def _request_for_turn(
+        self,
+        api_input: list[dict[str, Any]],
+        optional_kwargs: dict[str, Any],
+        turn: _Turn,
+    ) -> tuple[Any, bool]:
+        """Guarded selectors use one complete response; ordinary turns still stream."""
+        if not turn.runtime_config.home_assistant_guard_operational:
+            return super()._request_for_turn(api_input, optional_kwargs, turn)
+        return (
+            self.client.chat.completions.create(
+                model=self.model_name,
+                messages=api_input,  # type: ignore[arg-type]
+                stream=False,
+                extra_body=self._extra_body,
+                timeout=self.request_timeout,
+                **optional_kwargs,
+            ),
+            False,
+        )
+
+    def _events_for_turn(
+        self,
+        api_response: Any,
+        optional_kwargs: dict[str, Any],
+        turn: _Turn,
+        *,
+        streaming: bool,
+    ) -> Iterator[ProviderEvent]:
+        if not turn.runtime_config.home_assistant_guard_operational:
+            return super()._events_for_turn(api_response, optional_kwargs, turn, streaming=streaming)
+        if streaming:
+            raise HomeAssistantSelectorRejected("guarded selector unexpectedly streamed")
+        try:
+            events = self._guarded_response_events(
+                api_response,
+                turn.runtime_config,
+                tool_choice=optional_kwargs.get("tool_choice"),
+            )
+        except (MemoryError, RecursionError, TypeError, UnicodeError, ValueError):
+            raise HomeAssistantSelectorRejected("guarded selector output rejected") from None
+        return iter(events)
+
+    @staticmethod
+    def _guarded_response_events(
+        api_response: Any,
+        runtime_config: RuntimeConfig,
+        *,
+        tool_choice: object,
+    ) -> list[ProviderEvent]:
+        """Validate one complete selector envelope before constructing sink events."""
+        choices = api_response.choices or []
+        choice_index = getattr(choices[0], "index", None) if choices else None
+        if len(choices) != 1 or type(choice_index) is not int or choice_index != 0:
+            raise HomeAssistantSelectorRejected("selector must return exactly choice zero")
+        choice = choices[0]
+        message = choice.message
+        raw_content = message.content
+        refusal = getattr(message, "refusal", None)
+        if raw_content is not None and not isinstance(raw_content, str):
+            raise HomeAssistantSelectorRejected("selector text must be a string")
+        if refusal is not None and not isinstance(refusal, str):
+            raise HomeAssistantSelectorRejected("selector refusal must be a string")
+        if refusal is not None:
+            raise HomeAssistantSelectorRejected("guarded selector refusal is not an answer")
+        text = raw_content or ""
+        if len(text) > MAX_GUARDED_TEXT_CHARS:
+            raise HomeAssistantSelectorRejected("selector text exceeded its bound")
+
+        calls = message.tool_calls or []
+        if len(calls) > MAX_TOOL_CALLS_PER_RESPONSE:
+            raise HomeAssistantSelectorRejected("selector returned too many calls")
+        effective_choice = "auto" if tool_choice is None else tool_choice
+        if type(effective_choice) is not str or effective_choice not in GUARDED_TOOL_CHOICES:
+            raise HomeAssistantSelectorRejected("selector tool choice is unsupported")
+        if effective_choice == "none" and calls:
+            raise HomeAssistantSelectorRejected("tools-disabled response returned a call")
+        if effective_choice == "required" and not calls:
+            raise HomeAssistantSelectorRejected("required response omitted its call")
+        if not calls and not text.strip():
+            raise HomeAssistantSelectorRejected("selector returned no answer")
+        expected_finish = "tool_calls" if calls else "stop"
+        if getattr(choice, "finish_reason", None) != expected_finish:
+            raise HomeAssistantSelectorRejected("selector terminal reason is incomplete")
+
+        registered = set(runtime_config.home_assistant_guard_tool_names)
+        seen_ids: set[str] = set()
+        seen_calls: set[tuple[str, str]] = set()
+        normalized_calls: list[ResponseFunctionToolCall] = []
+        for call in calls:
+            function = getattr(call, "function", None)
+            provider_id = getattr(call, "id", None)
+            name = getattr(function, "name", None)
+            arguments = getattr(function, "arguments", None)
+            if (
+                function is None
+                or not isinstance(provider_id, str)
+                or not provider_id
+                or provider_id in seen_ids
+                or not isinstance(name, str)
+                or not name
+                or name not in registered
+                or not isinstance(arguments, str)
+                or not arguments
+                or len(arguments) > MAX_GUARDED_TEXT_CHARS
+            ):
+                raise HomeAssistantSelectorRejected("selector call is malformed or unregistered")
+            parsed = json.loads(
+                arguments,
+                parse_constant=_reject_json_constant,
+                parse_float=_finite_json_float,
+                object_pairs_hook=_unique_json_object,
+            )
+            if not isinstance(parsed, dict) or (name, arguments) in seen_calls:
+                raise HomeAssistantSelectorRejected("selector arguments must be one unique JSON object")
+            seen_ids.add(provider_id)
+            seen_calls.add((name, arguments))
+            normalized_calls.append(
+                ResponseFunctionToolCall(
+                    type="function_call",
+                    name=name,
+                    arguments=arguments,
+                    call_id=_generate_id("call"),
+                    id=_generate_id("fc"),
+                    status="completed",
+                )
+            )
+
+        home_assistant_suffixes = tuple(
+            name.removeprefix(HOME_ASSISTANT_TOOL_PREFIX)
+            for name in registered
+            if name.startswith(HOME_ASSISTANT_TOOL_PREFIX)
+        )
+        surfaces = tuple(registered) + home_assistant_suffixes + _PROTOCOL_SURFACES
+        spoken = remove_unspeechable(text)
+        for visible_text in (text, spoken):
+            normalized_visible_text = unicodedata.normalize("NFKC", visible_text)
+            folded = normalized_visible_text.casefold()
+            if _PROTOCOL_MARKER.search(normalized_visible_text):
+                raise HomeAssistantSelectorRejected("selector exposed protocol syntax")
+            if any(identifier.casefold() in folded for identifier in surfaces):
+                raise HomeAssistantSelectorRejected("selector exposed an internal identifier")
+            if _contains_visible_surface(normalized_visible_text, surfaces):
+                raise HomeAssistantSelectorRejected("selector spoke an internal identifier")
+
+        home_assistant_calls = [call for call in normalized_calls if call.name.startswith(HOME_ASSISTANT_TOOL_PREFIX)]
+        if home_assistant_calls:
+            stripped = spoken.strip()
+            if (
+                len(normalized_calls) != 1
+                or len(stripped) > 160
+                or "\n" in stripped
+                or len(re.findall(r"[.!?]+", stripped)) > 1
+            ):
+                raise HomeAssistantSelectorRejected("Home Assistant selection must be one call and short progress")
+
+        events: list[ProviderEvent] = []
+        usage = getattr(api_response, "usage", None)
+        if usage is not None:
+            events.append(Usage(input_tokens=usage.prompt_tokens or 0, output_tokens=usage.completion_tokens or 0))
+        if text:
+            events.append(AssistantMessage(content=[AssistantContent(type="output_text", text=text)]))
+            events.append(TextDelta(text=text))
+        events.extend(ToolCall(item=call) for call in normalized_calls)
+        return events
 
     def _iter_stream_events(
         self,

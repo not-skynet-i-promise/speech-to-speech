@@ -38,6 +38,11 @@ from speech_to_speech.api.openai_realtime.handlers import (
     ResponseHandler,
     SessionHandler,
 )
+from speech_to_speech.api.openai_realtime.home_assistant_guard import (
+    HomeAssistantGuardReadyEvent,
+    session_contract,
+    valid_guarded_tool_choice,
+)
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.api.openai_realtime.transcript_barrier import (
     TRANSCRIPT_BARRIER_MAX_CHARS,
@@ -65,7 +70,7 @@ from speech_to_speech.pipeline.events import (
 from speech_to_speech.pipeline.messages import GenerateResponseRequest
 from speech_to_speech.pipeline.queue_types import TextPromptItem
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
-from speech_to_speech.utils.utils import _generate_id
+from speech_to_speech.utils.utils import _generate_id, is_out_of_band
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +116,7 @@ ServerEvent = Union[
     ResponseFunctionCallArgumentsDoneEvent,
     ResponseTextDeltaEvent,
     ResponseTextDoneEvent,
+    HomeAssistantGuardReadyEvent,
     TranscriptBarrierReadyEvent,
     TranscriptBarrierCompletedServerEvent,
     TranscriptBarrierDiscardedServerEvent,
@@ -229,12 +235,18 @@ class RealtimeService:
         chat_size: int = 10,
         speculative_turns: SpeculativeTurnTracker | None = None,
         cancel_scope: CancelScope | None = None,
+        home_assistant_guard_supported: bool = False,
+        home_assistant_guard_required: bool = False,
     ) -> None:
         self.text_prompt_queue = text_prompt_queue
         self.should_listen = should_listen
         self._chat_size = chat_size
         self.speculative_turns = speculative_turns
         self.cancel_scope = cancel_scope
+        self.home_assistant_guard_supported = home_assistant_guard_supported
+        self.home_assistant_guard_required = home_assistant_guard_required
+        if home_assistant_guard_required and not home_assistant_guard_supported:
+            raise ValueError("required Home Assistant guard needs the Chat Completions backend")
         self._cancel_scope_wiring_verified = False
         self._conns: dict[str, ConnState] = {}
         self.total_usage = GlobalUsageMetrics()
@@ -279,7 +291,7 @@ class RealtimeService:
         return state.session_id
 
     def unregister(self, conn_id: str) -> None:
-        self.scrub_transcript_barrier_for_disconnect(conn_id)
+        self.scrub_private_protocols_for_disconnect(conn_id)
         st = self._conns.pop(conn_id, None)
         if st is not None:
             # Suppress any in-flight compaction splice so a daemon worker can't
@@ -310,10 +322,17 @@ class RealtimeService:
 
     def parse_client_event(
         self,
-        raw: Mapping[str, object],
+        raw: object,
         *,
         redact_private_content: bool = False,
     ) -> Optional[ClientEvent]:
+        if not isinstance(raw, Mapping):
+            logger.warning(
+                "Private client event must be an object; content redacted"
+                if redact_private_content
+                else "Client event must be a JSON object"
+            )
+            return None
         raw_type = raw.get("type")
         event_type: Optional[str] = raw_type if isinstance(raw_type, str) else None
         if event_type is None:
@@ -345,7 +364,11 @@ class RealtimeService:
     def build_session_created(self, conn_id: str) -> SessionCreatedEvent:
         return self.session.build_session_created(conn_id)
 
-    def handle_session_update(self, conn_id: str, event: SessionUpdateEvent) -> ServerEvent | None:
+    def handle_session_update(
+        self,
+        conn_id: str,
+        event: SessionUpdateEvent,
+    ) -> ServerEvent | list[ServerEvent] | None:
         return self.session.handle_session_update(conn_id, event)
 
     def transcript_barrier_enabled(self) -> bool:
@@ -360,14 +383,39 @@ class RealtimeService:
             return False
         return next(iter(self._conns.values())).runtime_config.transcript_barrier_private
 
+    def sensitive_content(self) -> bool:
+        if len(self._conns) != 1:
+            return False
+        return next(iter(self._conns.values())).runtime_config.sensitive_content
+
+    def home_assistant_guard_enabled(self) -> bool:
+        if len(self._conns) != 1:
+            return False
+        return next(iter(self._conns.values())).runtime_config.home_assistant_guard_enabled
+
+    def home_assistant_guard_failed(self, conn_id: str) -> bool:
+        return self._state(conn_id).runtime_config.home_assistant_guard_failed
+
+    def home_assistant_guard_pending(self, conn_id: str) -> bool:
+        cfg = self._state(conn_id).runtime_config
+        return self.home_assistant_guard_required and not (
+            cfg.home_assistant_guard_enabled or cfg.home_assistant_guard_failed
+        )
+
+    def private_protocol_failed(self, conn_id: str) -> bool:
+        return self._state(conn_id).runtime_config.private_protocol_failed
+
+    def private_protocol_poisoned(self) -> bool:
+        if len(self._conns) != 1:
+            return False
+        return next(iter(self._conns.values())).runtime_config.private_protocol_failed
+
     def transcript_barrier_failed(self, conn_id: str) -> bool:
         return self._state(conn_id).runtime_config.transcript_barrier_failed
 
     def transcript_barrier_poisoned(self) -> bool:
-        """Return whether the single-session unit must drop queued work."""
-        if len(self._conns) != 1:
-            return False
-        return next(iter(self._conns.values())).runtime_config.transcript_barrier_failed
+        """Backward-compatible name for the complete private failure gate."""
+        return self.private_protocol_poisoned()
 
     @contextmanager
     def transcript_barrier_pipeline_state_guard(self) -> Iterator[tuple[bool, bool]]:
@@ -379,11 +427,31 @@ class RealtimeService:
             return
         cfg = next(iter(self._conns.values())).runtime_config
         with cfg.transcript_barrier_state_guard():
-            yield cfg.transcript_barrier_private, cfg.transcript_barrier_failed
+            yield cfg.transcript_barrier_private, cfg.private_protocol_failed
+
+    @contextmanager
+    def sensitive_pipeline_state_guard(self) -> Iterator[tuple[bool, bool]]:
+        if len(self._conns) != 1:
+            yield True, True
+            return
+        cfg = next(iter(self._conns.values())).runtime_config
+        with cfg.transcript_barrier_state_guard():
+            yield cfg.sensitive_content, cfg.private_protocol_failed
 
     def transcript_barrier_audio_allowed(self, conn_id: str) -> bool:
         cfg = self._state(conn_id).runtime_config
-        return not cfg.transcript_barrier_failed and not cfg.transcript_barrier_pending
+        return not cfg.private_protocol_failed and not cfg.transcript_barrier_pending
+
+    def poison_home_assistant_guard(self, conn_id: str, error_type: str) -> RealtimeErrorEvent:
+        st = self._state(conn_id)
+        cfg = st.runtime_config
+        completed = cfg.home_assistant_guard_enabled
+        cfg.fail_home_assistant_guard()
+        with cfg.transcript_barrier_state_guard():
+            if not completed:
+                cfg.chat.reset(private_content_logging=True, suspend_compaction=True)
+            st.deferred_items.clear()
+        return self.make_error("Home Assistant guard protocol violation.", error_type)
 
     def poison_transcript_barrier(self, conn_id: str, error_type: str) -> RealtimeErrorEvent:
         st = self._state(conn_id)
@@ -425,24 +493,69 @@ class RealtimeService:
                 cfg.chat.suspend_compaction()
             st.deferred_items.clear()
 
+    def scrub_private_protocols_for_disconnect(self, conn_id: str) -> None:
+        self.scrub_transcript_barrier_for_disconnect(conn_id)
+        st = self._conns.get(conn_id)
+        if st is None or not st.runtime_config.home_assistant_guard_enabled:
+            return
+        st.runtime_config.fail_home_assistant_guard()
+        st.deferred_items.clear()
+
     def handle_audio_append(self, conn_id: str, event: InputAudioBufferAppendEvent) -> list[bytes]:
-        if not self.transcript_barrier_audio_allowed(conn_id):
-            self.poison_transcript_barrier(conn_id, "transcript_barrier_pending")
-            return []
-        self._state(conn_id).audio_append_seen = True
-        return self.audio.handle_audio_append(conn_id, event)
+        cfg = self._state(conn_id).runtime_config
+        with cfg.transcript_barrier_state_guard():
+            if cfg.private_protocol_failed:
+                return []
+            if not self.transcript_barrier_audio_allowed(conn_id):
+                self.poison_transcript_barrier(conn_id, "transcript_barrier_pending")
+                return []
+            self._state(conn_id).audio_append_seen = True
+            return self.audio.handle_audio_append(conn_id, event)
 
     def handle_audio_commit(self, conn_id: str) -> RealtimeErrorEvent | None:
-        return self.audio.handle_audio_commit(conn_id)
+        cfg = self._state(conn_id).runtime_config
+        with cfg.transcript_barrier_state_guard():
+            if cfg.private_protocol_failed:
+                return self.make_error("Private session failed.", "private_session_failed")
+            return self.audio.handle_audio_commit(conn_id)
 
     def encode_audio_chunk(self, conn_id: str, audio: bytes) -> list[ServerEvent]:
         return self.audio.encode_audio_chunk(conn_id, audio)
 
     def handle_response_create(self, conn_id: str, event: ResponseCreateEvent) -> ServerEvent | None:
         cfg = self._state(conn_id).runtime_config
-        if cfg.transcript_barrier_pending:
-            return self.poison_transcript_barrier(conn_id, "transcript_barrier_pending")
-        return self.response.handle_response_create(conn_id, event)
+        with cfg.transcript_barrier_state_guard():
+            if cfg.private_protocol_failed:
+                return self.make_error("Private session failed.", "private_session_failed")
+            if cfg.transcript_barrier_pending:
+                return self.poison_transcript_barrier(conn_id, "transcript_barrier_pending")
+            if self.home_assistant_guard_pending(conn_id):
+                return self.poison_home_assistant_guard(conn_id, "invalid_home_assistant_guard")
+            response = event.response
+            if cfg.home_assistant_guard_enabled and response is not None:
+                if not valid_guarded_tool_choice(response.tool_choice):
+                    return self.poison_home_assistant_guard(conn_id, "invalid_home_assistant_guard")
+                explicit_tools = "tools" in response.model_fields_set
+                tools_disabled = response.tool_choice == "none" and (not explicit_tools or response.tools == [])
+                if is_out_of_band(response) and not tools_disabled:
+                    return self.poison_home_assistant_guard(conn_id, "invalid_home_assistant_guard")
+                if not tools_disabled:
+                    effective_instructions = response.instructions or cfg.session.instructions
+                    effective_tools = response.tools if explicit_tools else cfg.session.tools
+                    try:
+                        digest, tool_count, tool_names = session_contract(
+                            effective_instructions,
+                            effective_tools,
+                        )
+                    except (TypeError, ValueError):
+                        return self.poison_home_assistant_guard(conn_id, "invalid_home_assistant_guard")
+                    if (
+                        digest != cfg.home_assistant_guard_contract_sha256
+                        or tool_count != cfg.home_assistant_guard_tool_count
+                        or tool_names != cfg.home_assistant_guard_tool_names
+                    ):
+                        return self.poison_home_assistant_guard(conn_id, "invalid_home_assistant_guard")
+            return self.response.handle_response_create(conn_id, event)
 
     def handle_response_cancel(self, conn_id: str) -> list[ServerEvent]:
         return self.response.handle_response_cancel(conn_id)
@@ -457,9 +570,12 @@ class RealtimeService:
 
     def handle_conversation_item_create(self, conn_id: str, event: ConversationItemCreateEvent) -> list[ServerEvent]:
         cfg = self._state(conn_id).runtime_config
-        if cfg.transcript_barrier_pending:
-            return [self.poison_transcript_barrier(conn_id, "transcript_barrier_pending")]
-        return self.conversation.handle_conversation_item_create(conn_id, event)
+        with cfg.transcript_barrier_state_guard():
+            if cfg.private_protocol_failed:
+                return []
+            if cfg.transcript_barrier_pending:
+                return [self.poison_transcript_barrier(conn_id, "transcript_barrier_pending")]
+            return self.conversation.handle_conversation_item_create(conn_id, event)
 
     def handle_transcript_barrier_resolve(
         self,
@@ -578,40 +694,52 @@ class RealtimeService:
         wait_for_pending_reopen: bool,
     ) -> list[ServerEvent] | None:
         cfg = self._state(conn_id).runtime_config
-        with cfg.transcript_barrier_state_guard():
-            if cfg.transcript_barrier_failed:
-                logger.debug("Dropping pipeline event after private barrier failure")
+        while True:
+            # The speculative tracker may wait for its reopen grace. Never do
+            # that while holding the private-failure lock: provider rejection
+            # must be able to poison the session immediately.
+            is_stale = self._is_stale_turn_event(event, wait_for_pending_reopen=wait_for_pending_reopen)
+            if is_stale is None:
+                return None
+            if is_stale:
+                logger.info(
+                    "Ignoring stale %s for turn=%s rev=%s",
+                    event.type,
+                    getattr(event, "turn_id", None),
+                    getattr(event, "turn_revision", None),
+                )
                 return []
-            if cfg.transcript_barrier_enabled and isinstance(
-                event,
-                (PartialTranscriptionEvent, TranscriptionCompletedEvent),
-            ):
-                logger.info("Rejecting ordinary transcription event after private barrier activation")
-                return [self.poison_transcript_barrier(conn_id, "invalid_transcript_barrier_event")]
-        is_stale = self._is_stale_turn_event(event, wait_for_pending_reopen=wait_for_pending_reopen)
-        if is_stale is None:
-            return None
-        if is_stale:
-            logger.info(
-                "Ignoring stale %s for turn=%s rev=%s",
-                event.type,
-                getattr(event, "turn_id", None),
-                getattr(event, "turn_revision", None),
-            )
-            return []
 
-        self._observe_turn_event(event)
-        if isinstance(event, AssistantTextEvent):
-            return self.response.on_assistant_text(
-                conn_id,
-                event,
-                wait_for_pending_reopen=wait_for_pending_reopen,
-            )
-        handler = self._pipeline_dispatch.get(type(event))
-        if handler is None:
-            logger.debug("Unhandled pipeline event type: %s", type(event).__name__)
-            return []
-        return handler(conn_id, event)
+            with cfg.transcript_barrier_state_guard():
+                if cfg.private_protocol_failed:
+                    logger.debug("Dropping pipeline event after private barrier failure")
+                    return []
+                if cfg.transcript_barrier_enabled and isinstance(
+                    event,
+                    (PartialTranscriptionEvent, TranscriptionCompletedEvent),
+                ):
+                    logger.info("Rejecting ordinary transcription event after private barrier activation")
+                    return [self.poison_transcript_barrier(conn_id, "invalid_transcript_barrier_event")]
+                if isinstance(event, AssistantTextEvent):
+                    events = self.response.on_assistant_text(
+                        conn_id,
+                        event,
+                        wait_for_pending_reopen=False,
+                    )
+                    if events is None:
+                        if not wait_for_pending_reopen:
+                            return None
+                        # A reopen began after the outside-lock check. Retry so
+                        # its bounded wait occurs only after releasing this lock.
+                        continue
+                    self._observe_turn_event(event)
+                    return events
+                self._observe_turn_event(event)
+                handler = self._pipeline_dispatch.get(type(event))
+                if handler is None:
+                    logger.debug("Unhandled pipeline event type: %s", type(event).__name__)
+                    return []
+                return handler(conn_id, event)
 
     def _is_stale_turn_event(self, event: PipelineEvent, *, wait_for_pending_reopen: bool = True) -> bool | None:
         if self.speculative_turns is None:
