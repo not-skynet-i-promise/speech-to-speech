@@ -1211,6 +1211,38 @@ class TestCompaction:
         assert chat.buffer == before
         assert chat._shutdown.is_set() is False
 
+    def test_user_deletion_invalidates_an_inflight_compaction_snapshot(self):
+        chat = Chat(size=2)
+        gate = threading.Event()
+        started = threading.Event()
+
+        def compactor(_snapshot):
+            started.set()
+            assert gate.wait(timeout=2.0)
+            return CompactionResult(
+                user_summary="summary containing deleted content",
+                assistant_summary="summary",
+            )
+
+        for index in range(3):
+            item = _user(f"user {index}")
+            item.id = f"msg_{index}"
+            chat.add_item(item)
+            chat.add_item(_assistant(f"assistant {index}"))
+        chat.add_item(_user("latest"))
+        chat.trim_if_needed(compactor)
+        assert started.wait(timeout=2.0)
+
+        assert chat.remove_user_message("msg_0")
+        gate.set()
+        _wait_thread(chat)
+
+        assert all(
+            getattr(part, "text", None) != "summary containing deleted content"
+            for item in chat.buffer
+            for part in getattr(item, "content", [])
+        )
+
     def test_suspended_compaction_stays_frozen_until_explicit_resume(self):
         chat = Chat(size=2)
         started = threading.Event()

@@ -323,20 +323,16 @@ class Chat:
                     continue
                 del self.buffer[index]
                 self._user_turn_count -= 1
+                # A summary already running from an older snapshot must not
+                # splice deleted user content back into live history.
+                self._gen_counter += 1
+                self._compact_in_flight = False
                 if self._private_content_logging:
                     logger.debug("Removed private speculative user message; content redacted")
                 else:
                     logger.debug("Removed speculative user message %s", item_id)
                 return True
         return False
-
-    def latest_item_id(self) -> str | None:
-        """Return the newest buffered conversation item ID under the chat lock."""
-        with self._lock:
-            for item in reversed(self.buffer):
-                if item.id:
-                    return item.id
-        return None
 
     def to_responses_api_chat(self, items: list[SupportedItem] | None = None) -> ResponseInputParam:
         """Serialize the chat (system prompt + buffer) for the OpenAI Responses API.

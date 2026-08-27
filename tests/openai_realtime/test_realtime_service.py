@@ -886,7 +886,9 @@ class TestHandleConversationItemDelete:
         assert stored.id is not None
         st.speculative_input_item_id = "item_audio"
         st.speculative_user_item_id = stored.id
-        st.last_item_id = "item_audio"
+        st.audio_input_item_ids.add("item_audio")
+        st.input_item_chat_ids["item_audio"] = stored.id
+        st.record_protocol_item("item_audio")
 
         events = service.handle_conversation_item_delete(
             conn_id,
@@ -917,6 +919,166 @@ class TestHandleConversationItemDelete:
         assert isinstance(events[0], RealtimeErrorEvent)
         assert events[0].error.type == "item_not_found"
         assert events[0].error.event_id == "event_delete"
+
+    def test_untranscribed_audio_delete_never_removes_the_prior_turn(self, service, conn_id):
+        st = service._state(conn_id)
+        first = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_1", turn_revision=0),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="keep me", turn_id="turn_1", turn_revision=0),
+        )
+        second = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_2", turn_revision=0),
+        )[0]
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(
+                type="conversation.item.delete",
+                event_id="delete_second",
+                item_id=second.item_id,
+            ),
+        )
+
+        assert isinstance(deleted[0], ConversationItemDeletedEvent)
+        assert [item.content[0].text for item in st.runtime_config.chat.buffer] == ["keep me"]
+        assert st.last_item_id == first.item_id
+
+    def test_deleted_speculative_turn_cannot_reopen_or_recreate_history(self):
+        tracker = SpeculativeTurnTracker()
+        service = RealtimeService(speculative_turns=tracker)
+        conn_id = service.register()
+        st = service._state(conn_id)
+        started = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_1", turn_revision=0),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="assistant echo", turn_id="turn_1", turn_revision=0),
+        )
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(
+                type="conversation.item.delete",
+                event_id="delete_turn",
+                item_id=started.item_id,
+            ),
+        )
+
+        assert tracker.begin_reopen_candidate("turn_1", 0) is None
+        assert (
+            service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id="turn_1", turn_revision=1, reopened=True),
+            )
+            == []
+        )
+        assert (
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(transcript="assistant echo again", turn_id="turn_1", turn_revision=1),
+            )
+            == []
+        )
+        assert st.runtime_config.chat.buffer == []
+        service.unregister(conn_id)
+
+    def test_audio_tail_delete_restores_protocol_visible_predecessor(self, service, conn_id):
+        first = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_1", turn_revision=0),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="first", turn_id="turn_1", turn_revision=0),
+        )
+        second = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_2", turn_revision=0),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="second", turn_id="turn_2", turn_revision=0),
+        )
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=second.item_id),
+        )
+
+        created = service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "msg_after",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "after"}],
+                },
+            ),
+        )[0]
+
+        assert created.previous_item_id == first.item_id
+
+    def test_deferred_flush_never_uses_an_unacknowledged_item_as_predecessor(self, service, conn_id):
+        service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "msg_a",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "a"}],
+                },
+            ),
+        )
+        st = service._state(conn_id)
+        st.in_response = True
+        for item_id in ("msg_b", "msg_c"):
+            service.handle_conversation_item_create(
+                conn_id,
+                ConversationItemCreateEvent(
+                    type="conversation.item.create",
+                    item={
+                        "id": item_id,
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": item_id}],
+                    },
+                ),
+            )
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="msg_a"),
+        )
+
+        created = service.conversation.flush_deferred_items(conn_id)
+
+        assert [(event.item.id, event.previous_item_id) for event in created] == [
+            ("msg_b", None),
+            ("msg_c", "msg_b"),
+        ]
+
+    def test_barrier_rejection_keeps_delete_event_correlation(self, service, conn_id):
+        service._state(conn_id).runtime_config.transcript_barrier_pending_sequence = 1
+
+        error = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(
+                type="conversation.item.delete",
+                event_id="delete_pending",
+                item_id="msg_x",
+            ),
+        )[0]
+
+        assert error.error.type == "transcript_barrier_pending"
+        assert error.error.event_id == "delete_pending"
 
 
 class TestDeferConversationItemsDuringResponse:

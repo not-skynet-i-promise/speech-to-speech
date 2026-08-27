@@ -364,8 +364,7 @@ class ResponseHandler(RealtimeBaseHandler):
         st = self._state(conn_id)
         events: list[ServerEvent] = []
         need_created = st.current_response_id is None
-        resp_id, initial_item_id = self._ensure_response(conn_id)
-        last_item_id = initial_item_id
+        resp_id, _ = self._ensure_response(conn_id)
         if need_created:
             events.append(
                 ResponseCreatedEvent(
@@ -426,6 +425,5 @@ class ResponseHandler(RealtimeBaseHandler):
                         response_id=resp_id,
                     )
                 )
-            last_item_id = item_id
-        st.last_item_id = last_item_id
+            st.record_protocol_item(item_id)
         return events

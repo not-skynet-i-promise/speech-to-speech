@@ -80,6 +80,7 @@ PIPELINE_SAMPLE_RATE = 16000
 CHUNK_SAMPLES = 512
 BYTES_PER_SAMPLE = 2
 CHUNK_SIZE_BYTES = CHUNK_SAMPLES * BYTES_PER_SAMPLE
+MAX_TRACKED_PROTOCOL_ITEMS = 2048
 
 _ResponseStatus = Literal["completed", "cancelled", "failed", "incomplete", "in_progress"]
 _StatusReason = Literal["turn_detected", "client_cancelled", "max_output_tokens", "content_filter"]
@@ -223,6 +224,31 @@ class ConnState(BaseModel):
     # once the response completes. See ConversationHandler.flush_deferred_items.
     deferred_items: list[ConversationItem] = Field(default_factory=list)
     transcript_barrier_replacement_item_ids: set[str] = Field(default_factory=set)
+    protocol_item_ids: list[str] = Field(default_factory=list)
+    audio_input_item_ids: set[str] = Field(default_factory=set)
+    input_item_chat_ids: dict[str, str] = Field(default_factory=dict)
+    input_item_turn_ids: dict[str, str] = Field(default_factory=dict)
+    turn_input_item_ids: dict[str, str] = Field(default_factory=dict)
+    deleted_input_item_ids: set[str] = Field(default_factory=set)
+
+    def record_protocol_item(self, item_id: str) -> None:
+        """Record one protocol-visible conversation item in creation order."""
+        if item_id not in self.protocol_item_ids:
+            self.protocol_item_ids.append(item_id)
+        while len(self.protocol_item_ids) > MAX_TRACKED_PROTOCOL_ITEMS:
+            retired_item_id = self.protocol_item_ids.pop(0)
+            self.audio_input_item_ids.discard(retired_item_id)
+            self.input_item_chat_ids.pop(retired_item_id, None)
+            retired_turn_id = self.input_item_turn_ids.pop(retired_item_id, None)
+            if retired_turn_id is not None and self.turn_input_item_ids.get(retired_turn_id) == retired_item_id:
+                self.turn_input_item_ids.pop(retired_turn_id, None)
+            self.deleted_input_item_ids.discard(retired_item_id)
+        self.last_item_id = item_id
+
+    def remove_protocol_item(self, item_id: str) -> None:
+        """Remove one protocol item and expose only the surviving protocol tail."""
+        self.protocol_item_ids = [existing for existing in self.protocol_item_ids if existing != item_id]
+        self.last_item_id = self.protocol_item_ids[-1] if self.protocol_item_ids else None
 
 
 class RealtimeService:
@@ -589,7 +615,9 @@ class RealtimeService:
             if cfg.private_protocol_failed:
                 return []
             if cfg.transcript_barrier_pending:
-                return [self.poison_transcript_barrier(conn_id, "transcript_barrier_pending")]
+                error = self.poison_transcript_barrier(conn_id, "transcript_barrier_pending")
+                error.error.event_id = event.event_id
+                return [error]
             return self.conversation.handle_conversation_item_delete(conn_id, event)
 
     def handle_transcript_barrier_resolve(
@@ -797,13 +825,29 @@ class RealtimeService:
     def _on_transcription_completed(self, conn_id: str, event: TranscriptionCompletedEvent) -> list[ServerEvent]:
         """Emit and store a final transcription, then trigger LM when configured."""
         st = self._state(conn_id)
+        input_item_id = (
+            st.turn_input_item_ids.get(event.turn_id)
+            if event.turn_id is not None
+            else st.speculative_input_item_id
+        )
+        if input_item_id is None:
+            input_item_id = self.response._current_item_id(conn_id)
+            st.speculative_input_item_id = input_item_id
+            st.audio_input_item_ids.add(input_item_id)
+            st.record_protocol_item(input_item_id)
+            if event.turn_id is not None:
+                st.input_item_turn_ids[input_item_id] = event.turn_id
+                st.turn_input_item_ids[event.turn_id] = input_item_id
+        if input_item_id in st.deleted_input_item_ids:
+            logger.debug("Ignoring transcription for a deleted input item")
+            return []
         same_speculative_turn = event.turn_id is not None and event.turn_id == st.speculative_user_turn_id
         if same_speculative_turn:
             st.response_usage.audio_duration_s -= st.speculative_audio_duration_s
         else:
             st.speculative_audio_duration_s = 0.0
 
-        events = self.conversation.on_transcription_completed(conn_id, event)
+        events = self.conversation.on_transcription_completed(conn_id, event, item_id=input_item_id)
         if event.turn_id is not None:
             st.speculative_audio_duration_s = st.input_audio_duration_s
 
@@ -818,8 +862,11 @@ class RealtimeService:
             else:
                 item = cfg.chat.add_item(make_user_message(transcript))
                 st.speculative_user_item_id = item.id
+            if st.speculative_user_item_id is not None:
+                st.input_item_chat_ids[input_item_id] = st.speculative_user_item_id
         elif same_speculative_turn and st.speculative_user_item_id:
             cfg.chat.remove_user_message(st.speculative_user_item_id)
+            st.input_item_chat_ids.pop(input_item_id, None)
             st.speculative_user_item_id = None
         elif event.turn_id is not None and event.turn_id != st.speculative_user_turn_id:
             st.speculative_user_item_id = None

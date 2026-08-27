@@ -454,7 +454,12 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                         if redact_private_content
                         else f"Unknown or invalid event: {raw_type}"
                     )
-                    await _send_event(ws, unit.service.make_error(message, "unknown_or_invalid_event"))
+                    error = unit.service.make_error(message, "unknown_or_invalid_event")
+                    if raw_type == "conversation.item.delete" and isinstance(raw, Mapping):
+                        raw_event_id = raw.get("event_id")
+                        if isinstance(raw_event_id, str) and raw_event_id:
+                            error.error.event_id = raw_event_id
+                    await _send_event(ws, error)
                     continue
 
                 if unit.service.home_assistant_guard_pending(session_id) and not isinstance(event, SessionUpdateEvent):

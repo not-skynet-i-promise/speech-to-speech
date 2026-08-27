@@ -552,6 +552,17 @@ class TestSDKTextInput:
             assert missing.error.type == "item_not_found"
             assert missing.error.event_id == "event_delete_missing"
 
+            await conn.send(
+                {
+                    "type": "conversation.item.delete",
+                    "event_id": "event_delete_malformed",
+                }
+            )
+            malformed = await _recv(conn)
+            assert malformed.type == ERROR
+            assert malformed.error.type == "unknown_or_invalid_event"
+            assert malformed.error.event_id == "event_delete_malformed"
+
     @pytest.mark.asyncio
     async def test_text_input_previous_item_id_chain(self, server_env):
         """Sequential text items chain via previous_item_id."""

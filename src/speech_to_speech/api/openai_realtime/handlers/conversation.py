@@ -69,13 +69,15 @@ class ConversationHandler(RealtimeBaseHandler):
     def _item_created_event(self, conn_id: str, item: ConversationItem) -> ConversationItemCreatedEvent:
         """Build the acknowledgement for an item already committed to chat."""
         st = self._state(conn_id)
+        previous_item_id = st.last_item_id
         event = ConversationItemCreatedEvent(
             type="conversation.item.created",
             event_id=self._next_event_id(),
-            previous_item_id=st.last_item_id,
+            previous_item_id=previous_item_id,
             item=item,
         )
-        st.last_item_id = item.id
+        if item.id is not None:
+            st.record_protocol_item(item.id)
         return event
 
     def flush_deferred_items(self, conn_id: str) -> list[ServerEvent]:
@@ -112,13 +114,13 @@ class ConversationHandler(RealtimeBaseHandler):
     ) -> list[ServerEvent]:
         """Remove one exact user item and acknowledge only after history changed."""
         st = self._state(conn_id)
-        chat_item_id = (
-            st.speculative_user_item_id
-            if event.item_id == st.speculative_input_item_id and st.speculative_user_item_id is not None
-            else event.item_id
-        )
-        removed = st.runtime_config.chat.remove_user_message(chat_item_id)
-        if not removed:
+        input_item = event.item_id in st.audio_input_item_ids
+        chat_item_id = st.input_item_chat_ids.get(event.item_id, event.item_id)
+        mapped_input = input_item and event.item_id in st.input_item_chat_ids
+        removed = st.runtime_config.chat.remove_user_message(chat_item_id) if mapped_input or not input_item else False
+        if input_item and not mapped_input:
+            removed = event.item_id in st.protocol_item_ids
+        if not removed and not input_item:
             for index, item in enumerate(st.deferred_items):
                 if isinstance(item, RealtimeConversationItemUserMessage) and item.id in {
                     event.item_id,
@@ -132,17 +134,15 @@ class ConversationHandler(RealtimeBaseHandler):
             error.error.event_id = event.event_id
             return [error]
 
+        if input_item:
+            turn_id = st.input_item_turn_ids.get(event.item_id)
+            st.deleted_input_item_ids.add(event.item_id)
+            if self._service.speculative_turns is not None:
+                self._service.speculative_turns.discard(turn_id)
+            st.input_item_chat_ids.pop(event.item_id, None)
         if st.speculative_user_item_id == chat_item_id:
             st.speculative_user_item_id = None
-        if st.last_item_id in {event.item_id, chat_item_id}:
-            st.last_item_id = next(
-                (
-                    item.id
-                    for item in reversed(st.deferred_items)
-                    if getattr(item, "id", None) is not None
-                ),
-                st.runtime_config.chat.latest_item_id(),
-            )
+        st.remove_protocol_item(event.item_id)
         return [
             ConversationItemDeletedEvent(
                 type="conversation.item.deleted",
@@ -165,7 +165,13 @@ class ConversationHandler(RealtimeBaseHandler):
             )
         ]
 
-    def on_transcription_completed(self, conn_id: str, event: TranscriptionCompletedEvent) -> list[ServerEvent]:
+    def on_transcription_completed(
+        self,
+        conn_id: str,
+        event: TranscriptionCompletedEvent,
+        *,
+        item_id: str | None = None,
+    ) -> list[ServerEvent]:
         """Handle transcription_completed: accumulate duration and emit completed event."""
         st = self._state(conn_id)
         st.response_usage.audio_duration_s += st.input_audio_duration_s
@@ -174,7 +180,7 @@ class ConversationHandler(RealtimeBaseHandler):
                 type="conversation.item.input_audio_transcription.completed",
                 event_id=self._next_event_id(),
                 content_index=0,
-                item_id=self._input_item_id(conn_id),
+                item_id=item_id or self._input_item_id(conn_id),
                 transcript=event.transcript,
                 usage=UsageTranscriptTextUsageDuration(
                     seconds=st.input_audio_duration_s,

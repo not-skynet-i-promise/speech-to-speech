@@ -34,11 +34,14 @@ class SpeculativeTurnTracker:
         self._committed_revision: dict[str, int] = {}
         self._pending_reopen: dict[str, _PendingReopen] = {}
         self._reopen_grace: dict[str, _ReopenGrace] = {}
+        self._discarded_turn_ids: OrderedDict[str, None] = OrderedDict()
 
     def observe(self, turn_id: str | None, revision: int | None) -> None:
         if turn_id is None or revision is None:
             return
         with self._condition:
+            if turn_id in self._discarded_turn_ids:
+                return
             current = self._latest_revision.get(turn_id, -1)
             if revision > current:
                 self._latest_revision[turn_id] = revision
@@ -46,6 +49,24 @@ class SpeculativeTurnTracker:
                 self._prune_tracked_turns()
                 logger.debug("Observed speculative turn %s revision %d", turn_id, revision)
                 self._condition.notify_all()
+
+    def discard(self, turn_id: str | None) -> None:
+        """Make every current or later revision of one turn permanently stale."""
+        if turn_id is None:
+            return
+        with self._condition:
+            self._committed_revision.pop(turn_id, None)
+            self._pending_reopen.pop(turn_id, None)
+            self._reopen_grace.pop(turn_id, None)
+            self._latest_revision[turn_id] = -1
+            self._latest_revision.move_to_end(turn_id)
+            self._discarded_turn_ids[turn_id] = None
+            self._discarded_turn_ids.move_to_end(turn_id)
+            if self._max_tracked_turns > 0:
+                while len(self._discarded_turn_ids) > self._max_tracked_turns:
+                    retired_turn_id, _ = self._discarded_turn_ids.popitem(last=False)
+                    self._latest_revision.pop(retired_turn_id, None)
+            self._condition.notify_all()
 
     def is_latest(self, turn_id: str | None, revision: int | None) -> bool:
         if turn_id is None or revision is None:
@@ -395,7 +416,9 @@ class SpeculativeTurnTracker:
         prunable_turn_ids = [
             turn_id
             for turn_id in self._latest_revision
-            if turn_id not in self._pending_reopen and turn_id not in self._reopen_grace
+            if turn_id not in self._pending_reopen
+            and turn_id not in self._reopen_grace
+            and turn_id not in self._discarded_turn_ids
         ]
         while len(prunable_turn_ids) > self._max_tracked_turns:
             turn_id = prunable_turn_ids.pop(0)
@@ -415,4 +438,5 @@ class SpeculativeTurnTracker:
             self._committed_revision.clear()
             self._pending_reopen.clear()
             self._reopen_grace.clear()
+            self._discarded_turn_ids.clear()
             self._condition.notify_all()
