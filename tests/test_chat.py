@@ -1243,6 +1243,54 @@ class TestCompaction:
             for part in getattr(item, "content", [])
         )
 
+    def test_completed_compaction_can_restore_and_delete_one_exact_user(self):
+        chat = Chat(size=2)
+        users = []
+        for index in range(3):
+            user = chat.add_item(make_user_message(f"user-{index}"))
+            assert user.id is not None
+            chat.mark_user_message_deletable(user.id)
+            users.append(user)
+            chat.add_item(make_assistant_message(f"assistant-{index}"))
+
+        chat.trim_if_needed(_make_stub_compactor("summary-user", "summary-assistant"))
+        _wait_thread(chat)
+        assert any(
+            getattr(part, "text", None) == "summary-user"
+            for item in chat.buffer
+            for part in getattr(item, "content", [])
+        )
+
+        assert chat.remove_user_message(users[0].id)
+
+        texts = [
+            part.text for item in chat.buffer for part in getattr(item, "content", []) if getattr(part, "text", None)
+        ]
+        assert "user-0" not in texts
+        assert "assistant-0" in texts
+        assert "user-1" in texts
+        assert "assistant-1" in texts
+        assert "user-2" in texts
+        assert "summary-user" not in texts
+
+    def test_retiring_all_ids_releases_completed_compaction_provenance(self):
+        chat = Chat(size=2)
+        users = []
+        for index in range(3):
+            user = chat.add_item(make_user_message(f"user-{index}"))
+            assert user.id is not None
+            chat.mark_user_message_deletable(user.id)
+            users.append(user)
+            chat.add_item(make_assistant_message(f"assistant-{index}"))
+        chat.trim_if_needed(_make_stub_compactor())
+        _wait_thread(chat)
+        assert chat._compaction_nodes
+
+        chat.retire_user_message_deletable(users[0].id)
+        chat.retire_user_message_deletable(users[1].id)
+
+        assert chat._compaction_nodes == {}
+
     def test_suspended_compaction_stays_frozen_until_explicit_resume(self):
         chat = Chat(size=2)
         started = threading.Event()

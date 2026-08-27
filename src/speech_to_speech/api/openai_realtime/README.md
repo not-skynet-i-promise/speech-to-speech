@@ -60,6 +60,7 @@ flowchart LR
 | `input_audio_buffer.append` | Stream base64 PCM audio. Decoded, resampled to 16 kHz, and chunked for the VAD. |
 | `session.update` | Deep-merge session config (instructions, tools, voice, turn detection, audio format). |
 | `conversation.item.create` | Inject `input_text` or `function_call_output` into the LLM context without triggering generation. |
+| `conversation.item.delete` | Delete one exact protocol-visible user item. An input-audio item ID removes its mapped transcript and cancels only a queued or active response owned by that turn. |
 | `response.create` | Trigger LLM generation. Supports per-response `instructions` and `tool_choice` overrides. |
 | `response.cancel` | Cancel the in-progress response and re-enable listening. |
 
@@ -77,6 +78,7 @@ should begin.
 | `input_audio_buffer.speech_started` | VAD detected user speech. |
 | `input_audio_buffer.speech_stopped` | End of user speech segment. |
 | `conversation.item.created` | Acknowledges injected `input_text` from `conversation.item.create`. |
+| `conversation.item.deleted` | Acknowledges an exact user-item deletion only after the live or compacted history no longer contains that item. |
 | `conversation.item.input_audio_transcription.delta` | Streaming partial transcript (when live transcription is enabled). |
 | `conversation.item.input_audio_transcription.completed` | Final transcript for the user turn (with duration usage). |
 | `response.created` | Emitted before the first assistant output part or outbound audio chunk, whichever arrives first (response is `in_progress`). |

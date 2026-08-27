@@ -433,9 +433,14 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                         await ws.close(code=1008, reason="Private transcript barrier negotiation failed")
                         return
                     if home_assistant_context:
+                        error = unit.service.poison_home_assistant_guard(session_id, "invalid_home_assistant_guard")
+                        if raw_type == "conversation.item.delete" and isinstance(raw, Mapping):
+                            raw_event_id = raw.get("event_id")
+                            if isinstance(raw_event_id, str) and raw_event_id:
+                                error.error.event_id = raw_event_id
                         await _send_event(
                             ws,
-                            unit.service.poison_home_assistant_guard(session_id, "invalid_home_assistant_guard"),
+                            error,
                         )
                         await ws.close(code=1008, reason="Home Assistant guard failed")
                         return
@@ -463,9 +468,12 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                     continue
 
                 if unit.service.home_assistant_guard_pending(session_id) and not isinstance(event, SessionUpdateEvent):
+                    error = unit.service.poison_home_assistant_guard(session_id, "invalid_home_assistant_guard")
+                    if isinstance(event, ConversationItemDeleteEvent):
+                        error.error.event_id = event.event_id
                     await _send_event(
                         ws,
-                        unit.service.poison_home_assistant_guard(session_id, "invalid_home_assistant_guard"),
+                        error,
                     )
                     await ws.close(code=1008, reason="Home Assistant guard negotiation failed")
                     return
@@ -534,7 +542,13 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                         return
 
                 elif isinstance(event, ConversationItemDeleteEvent):
+                    generation_before_delete = unit.cancel_scope.generation
                     events = unit.service.handle_conversation_item_delete(session_id, event)
+                    if unit.cancel_scope.generation != generation_before_delete:
+                        _flush_queue(unit.output_queue, preserve=_keep_audio_sentinel)
+                        _flush_queue(unit.text_output_queue, preserve=_keep_user_text_event)
+                        unit.response_playing.clear()
+                        unit.should_listen.set()
                     if events:
                         await _send_events(ws, events)
                     if unit.service.private_protocol_failed(session_id):

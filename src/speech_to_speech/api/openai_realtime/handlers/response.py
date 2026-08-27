@@ -42,7 +42,11 @@ class ResponseHandler(RealtimeBaseHandler):
             st.current_response_id = _generate_id("resp")
             self._start_item(conn_id)
             st.in_response = True
+            st.active_response_turn_id = st.pending_response_turn_id
+            st.active_response_turn_revision = st.pending_response_turn_revision
         st.response_pending = False
+        st.pending_response_turn_id = None
+        st.pending_response_turn_revision = None
         return st.current_response_id, self._current_item_id(conn_id)
 
     def _end_response(self, conn_id: str, status: _ResponseStatus = "completed") -> None:
@@ -69,6 +73,10 @@ class ResponseHandler(RealtimeBaseHandler):
         st.content_index = 0
         st.in_response = False
         st.response_pending = False
+        st.pending_response_turn_id = None
+        st.pending_response_turn_revision = None
+        st.active_response_turn_id = None
+        st.active_response_turn_revision = None
         st.current_response_params = None
         st.next_output_index = 0
         st.current_output_index = None
@@ -224,6 +232,10 @@ class ResponseHandler(RealtimeBaseHandler):
 
         st.in_response = True
         st.response_pending = False
+        st.pending_response_turn_id = None
+        st.pending_response_turn_revision = None
+        st.active_response_turn_id = None if out_of_band else st.speculative_user_turn_id
+        st.active_response_turn_revision = None if out_of_band else st.speculative_user_turn_revision
 
         st.current_response_params = event.response
         st.current_response_id = _generate_id("resp")
@@ -313,6 +325,8 @@ class ResponseHandler(RealtimeBaseHandler):
             self._end_response(conn_id, status)
         elif st.response_pending:
             st.response_pending = False
+            st.pending_response_turn_id = None
+            st.pending_response_turn_revision = None
         # Apply any client items that arrived mid-generation now that in_response
         # is cleared and the generation's own write-back has landed. Done outside
         # the in_response guard so a stray terminal call still drains the buffer.

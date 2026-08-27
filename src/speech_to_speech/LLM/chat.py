@@ -4,6 +4,7 @@ import json
 import logging
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, Literal, Union
 
 from openai.types.realtime import ConversationItem
@@ -71,6 +72,21 @@ SupportedItem = Union[
 ]
 
 
+@dataclass
+class _CompactionNode:
+    """Reversible provenance for one summary pair.
+
+    Nodes nest instead of flattening older summaries. Once all protocol-visible
+    user IDs below a child retire, that child can collapse back to its two-item
+    summary and release the original content it no longer needs to delete.
+    """
+
+    user_summary: RealtimeConversationItemUserMessage
+    assistant_summary: RealtimeConversationItemAssistantMessage
+    originals: list[SupportedItem | "_CompactionNode"]
+    deletable_user_ids: set[str]
+
+
 CompactFn = Callable[[ResponseInputParam], CompactionResult]
 
 
@@ -101,6 +117,8 @@ class Chat:
         self.buffer: list[SupportedItem] = []
         self._pending_tool_calls: dict[str, RealtimeConversationItemFunctionCall] = {}
         self._user_turn_count: int = 0
+        self._deletable_user_ids: set[str] = set()
+        self._compaction_nodes: dict[str, _CompactionNode] = {}
 
         # All state mutations and serializations go through _lock. Public methods
         # acquire it once; internal callers that already hold it use the
@@ -119,11 +137,17 @@ class Chat:
         """Remove items from the front until the next user message boundary."""
         if not self.buffer:
             return
+        removed: list[SupportedItem] = []
         first = self.buffer.pop(0)
+        removed.append(first)
         if isinstance(first, RealtimeConversationItemUserMessage):
             self._user_turn_count -= 1
         while self.buffer and not isinstance(self.buffer[0], RealtimeConversationItemUserMessage):
-            self.buffer.pop(0)
+            removed.append(self.buffer.pop(0))
+        for item in removed:
+            if item.id is not None:
+                self._deletable_user_ids.discard(item.id)
+                self._compaction_nodes.pop(item.id, None)
 
     def _has_call_id_in_buffer(self, call_id: str) -> bool:
         for entry in self.buffer:
@@ -314,8 +338,67 @@ class Chat:
                 return True
         return False
 
+    def mark_user_message_deletable(self, item_id: str) -> None:
+        """Preserve enough compaction provenance to delete a protocol item later."""
+
+        with self._lock:
+            self._deletable_user_ids.add(item_id)
+
+    def retire_user_message_deletable(self, item_id: str) -> None:
+        """Release provenance after a user item leaves the bounded protocol index."""
+
+        with self._lock:
+            self._deletable_user_ids.discard(item_id)
+            for summary_id, node in list(self._compaction_nodes.items()):
+                if item_id not in node.deletable_user_ids:
+                    continue
+                self._retire_from_compaction_node(node, item_id)
+                if not node.deletable_user_ids:
+                    self._compaction_nodes.pop(summary_id, None)
+
+    def _retire_from_compaction_node(self, node: _CompactionNode, item_id: str) -> None:
+        """Retire one ID and collapse child provenance that no longer serves deletes."""
+
+        node.deletable_user_ids.discard(item_id)
+        collapsed: list[SupportedItem | _CompactionNode] = []
+        for original in node.originals:
+            if not isinstance(original, _CompactionNode):
+                collapsed.append(original)
+                continue
+            if item_id in original.deletable_user_ids:
+                self._retire_from_compaction_node(original, item_id)
+            if original.deletable_user_ids:
+                collapsed.append(original)
+            else:
+                collapsed.extend((original.user_summary, original.assistant_summary))
+        node.originals = collapsed
+
+    def _restore_compaction_node_without(
+        self,
+        node: _CompactionNode,
+        item_id: str,
+    ) -> tuple[list[SupportedItem], list[_CompactionNode]]:
+        """Expand only the branch containing *item_id* and preserve all siblings."""
+
+        restored: list[SupportedItem] = []
+        surviving_nodes: list[_CompactionNode] = []
+        for original in node.originals:
+            if isinstance(original, _CompactionNode):
+                if item_id in original.deletable_user_ids:
+                    nested_items, nested_nodes = self._restore_compaction_node_without(original, item_id)
+                    restored.extend(nested_items)
+                    surviving_nodes.extend(nested_nodes)
+                else:
+                    restored.extend((original.user_summary, original.assistant_summary))
+                    surviving_nodes.append(original)
+                continue
+            if isinstance(original, RealtimeConversationItemUserMessage) and original.id == item_id:
+                continue
+            restored.append(original)
+        return restored, surviving_nodes
+
     def remove_user_message(self, item_id: str) -> bool:
-        """Remove an existing user message from the bounded chat buffer."""
+        """Remove an exact user message, restoring a compacted snapshot if needed."""
 
         with self._lock:
             for index, item in enumerate(self.buffer):
@@ -323,6 +406,8 @@ class Chat:
                     continue
                 del self.buffer[index]
                 self._user_turn_count -= 1
+                self._deletable_user_ids.discard(item_id)
+                self._compaction_nodes.pop(item_id, None)
                 # A summary already running from an older snapshot must not
                 # splice deleted user content back into live history.
                 self._gen_counter += 1
@@ -331,6 +416,39 @@ class Chat:
                     logger.debug("Removed private speculative user message; content redacted")
                 else:
                     logger.debug("Removed speculative user message %s", item_id)
+                return True
+            for summary_id, node in list(self._compaction_nodes.items()):
+                if item_id not in node.deletable_user_ids:
+                    continue
+                summary_ids = {node.user_summary.id, node.assistant_summary.id}
+                indexes = [index for index, item in enumerate(self.buffer) if item.id in summary_ids]
+                if not indexes:
+                    self._compaction_nodes.pop(summary_id, None)
+                    continue
+                insert_at = min(indexes)
+                restored, surviving_nodes = self._restore_compaction_node_without(node, item_id)
+                self.buffer = [item for item in self.buffer if item.id not in summary_ids]
+                self.buffer[insert_at:insert_at] = restored
+                self._compaction_nodes.pop(summary_id, None)
+                for surviving in surviving_nodes:
+                    assert surviving.user_summary.id is not None
+                    self._compaction_nodes[surviving.user_summary.id] = surviving
+                self._deletable_user_ids.discard(item_id)
+                self._user_turn_count = sum(
+                    1 for item in self.buffer if isinstance(item, RealtimeConversationItemUserMessage)
+                )
+                self._gen_counter += 1
+                self._compact_in_flight = False
+                if self._private_content_logging:
+                    logger.debug("Removed compacted private user message; content redacted")
+                else:
+                    logger.debug("Removed compacted user message %s", item_id)
+                return True
+            # Lossy eviction may already have removed the item from model context.
+            # It remains protocol-visible until its bounded index entry retires, so
+            # acknowledge the exact deletion while releasing its retained marker.
+            if item_id in self._deletable_user_ids:
+                self._deletable_user_ids.remove(item_id)
                 return True
         return False
 
@@ -485,6 +603,8 @@ class Chat:
             clone.buffer = list(self.buffer)
             clone._pending_tool_calls = dict(self._pending_tool_calls)
             clone._user_turn_count = self._user_turn_count
+            clone._deletable_user_ids = set(self._deletable_user_ids)
+            clone._compaction_nodes = dict(self._compaction_nodes)
             clone._compaction_suspended = self._compaction_suspended
             clone._private_content_logging = self._private_content_logging
             return clone
@@ -505,6 +625,8 @@ class Chat:
             self.init_chat_message = None
             self._pending_tool_calls = {}
             self._user_turn_count = 0
+            self._deletable_user_ids = set()
+            self._compaction_nodes = {}
 
     def close(self) -> None:
         """Permanently shut down the chat. In-flight compaction splice is suppressed.
@@ -701,10 +823,41 @@ class Chat:
             drop_ids = marker_ids - fc_ids_to_keep
             remaining = [x for x in self.buffer if x.id not in drop_ids]
 
+            originals: list[SupportedItem | _CompactionNode] = []
+            consumed_summary_ids: set[str] = set()
+            for item in self.buffer:
+                if item.id not in drop_ids or item.id in consumed_summary_ids:
+                    continue
+                nested = self._compaction_nodes.pop(item.id or "", None)
+                if nested is not None:
+                    originals.append(nested)
+                    if nested.assistant_summary.id is not None:
+                        consumed_summary_ids.add(nested.assistant_summary.id)
+                else:
+                    originals.append(item)
+
             user_msg = make_user_message(result.user_summary)
             user_msg.id = _generate_id("msg")
             asst_msg = make_assistant_message(result.assistant_summary)
             asst_msg.id = _generate_id("msg")
+
+            deletable_user_ids = {
+                original.id
+                for original in originals
+                if isinstance(original, RealtimeConversationItemUserMessage)
+                and original.id is not None
+                and original.id in self._deletable_user_ids
+            }
+            for original in originals:
+                if isinstance(original, _CompactionNode):
+                    deletable_user_ids.update(original.deletable_user_ids)
+            if deletable_user_ids:
+                self._compaction_nodes[user_msg.id] = _CompactionNode(
+                    user_summary=user_msg,
+                    assistant_summary=asst_msg,
+                    originals=originals,
+                    deletable_user_ids=deletable_user_ids,
+                )
 
             self.buffer = [user_msg, asst_msg, *remaining]
             self._user_turn_count = sum(1 for x in self.buffer if isinstance(x, RealtimeConversationItemUserMessage))

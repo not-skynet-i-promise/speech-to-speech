@@ -314,6 +314,12 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             return True
         return self.speculative_turns.is_latest_after_reopen_grace(turn_id, turn_revision)
 
+    def _turn_owns_writeback_now(self, turn_id: str | None, turn_revision: int | None) -> bool:
+        """Fail closed on a stale or concurrently reopening turn without waiting."""
+        if self.speculative_turns is None:
+            return True
+        return self.speculative_turns.try_is_latest_after_reopen_grace(turn_id, turn_revision) is True
+
     def _fail_home_assistant_guard_for_current_turn(
         self,
         runtime_config: RuntimeConfig,
@@ -423,7 +429,11 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             logger.info("LLM generation cancelled (stale speculative turn)")
             return
         with turn.runtime_config.transcript_barrier_state_guard():
-            if turn.runtime_config.private_protocol_failed:
+            if (
+                turn.runtime_config.private_protocol_failed
+                or self._generation_is_stale(turn.gen)
+                or not self._turn_owns_writeback_now(turn.turn_id, turn.turn_revision)
+            ):
                 return
             if not is_out_of_band(turn.response):
                 # Flush assistant text accumulated before this call first (so history
@@ -694,7 +704,11 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             # default conversation (their context was a throwaway chat).
             if not is_out_of_band(turn.response):
                 with turn.runtime_config.transcript_barrier_state_guard():
-                    if not turn.runtime_config.private_protocol_failed:
+                    if (
+                        not turn.runtime_config.private_protocol_failed
+                        and not self._generation_is_stale(turn.gen)
+                        and self._turn_owns_writeback_now(turn.turn_id, turn.turn_revision)
+                    ):
                         # Tool calls (and any assistant text preceding them) were already
                         # written eagerly in _record_tool_call; only trailing items remain.
                         for item in state.pending:

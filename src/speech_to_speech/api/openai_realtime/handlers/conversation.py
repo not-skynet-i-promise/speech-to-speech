@@ -49,11 +49,31 @@ class ConversationHandler(RealtimeBaseHandler):
         completes — see :meth:`flush_deferred_items`.
         """
         st = self._state(conn_id)
+        if self._item_id_exists(st, event.item):
+            return [self._duplicate_item_error(conn_id, event.event_id)]
         if st.in_response:
             st.deferred_items.append(event.item)
             logger.debug("Deferred conversation item until the active response completes")
             return []
         return self._apply_item(conn_id, event.item)
+
+    @staticmethod
+    def _item_id_exists(st, item: ConversationItem) -> bool:
+        item_id = getattr(item, "id", None)
+        if item_id is None:
+            return False
+        return item_id in st.protocol_item_ids or any(
+            getattr(existing, "id", None) == item_id for existing in st.deferred_items
+        )
+
+    def _duplicate_item_error(self, conn_id: str, event_id: str | None = None) -> ServerEvent:
+        st = self._state(conn_id)
+        if st.runtime_config.home_assistant_guard_operational:
+            error = self._service.poison_home_assistant_guard(conn_id, "invalid_conversation_item")
+        else:
+            error = self.make_client_content_error(conn_id, "Conversation item ID already exists.", "duplicate_item_id")
+        error.error.event_id = event_id
+        return error
 
     def _apply_item(self, conn_id: str, item: ConversationItem) -> list[ServerEvent]:
         """Add one item to the chat and build its ``conversation.item.created``."""
@@ -78,6 +98,8 @@ class ConversationHandler(RealtimeBaseHandler):
         )
         if item.id is not None:
             st.record_protocol_item(item.id)
+            if isinstance(item, RealtimeConversationItemUserMessage):
+                st.runtime_config.chat.mark_user_message_deletable(item.id)
         return event
 
     def flush_deferred_items(self, conn_id: str) -> list[ServerEvent]:
@@ -92,6 +114,13 @@ class ConversationHandler(RealtimeBaseHandler):
             return []
         items = st.deferred_items
         st.deferred_items = []
+        seen_ids = set(st.protocol_item_ids)
+        for item in items:
+            item_id = getattr(item, "id", None)
+            if item_id is not None and item_id in seen_ids:
+                return [self._duplicate_item_error(conn_id)]
+            if item_id is not None:
+                seen_ids.add(item_id)
         try:
             add_supported_items_atomically(st.runtime_config.chat, items)
         except ChatItemError as exc:
@@ -115,9 +144,14 @@ class ConversationHandler(RealtimeBaseHandler):
         """Remove one exact user item and acknowledge only after history changed."""
         st = self._state(conn_id)
         input_item = event.item_id in st.audio_input_item_ids
+        protocol_item = event.item_id in st.protocol_item_ids
         chat_item_id = st.input_item_chat_ids.get(event.item_id, event.item_id)
         mapped_input = input_item and event.item_id in st.input_item_chat_ids
-        removed = st.runtime_config.chat.remove_user_message(chat_item_id) if mapped_input or not input_item else False
+        removed = (
+            st.runtime_config.chat.remove_user_message(chat_item_id)
+            if mapped_input or (not input_item and protocol_item)
+            else False
+        )
         if input_item and not mapped_input:
             removed = event.item_id in st.protocol_item_ids
         if not removed and not input_item:
@@ -134,21 +168,52 @@ class ConversationHandler(RealtimeBaseHandler):
             error.error.event_id = event.event_id
             return [error]
 
+        turn_id = st.input_item_turn_ids.get(event.item_id) if input_item else None
         if input_item:
-            turn_id = st.input_item_turn_ids.get(event.item_id)
-            st.deleted_input_item_ids.add(event.item_id)
+            st.record_deleted_input_item(event.item_id)
             if self._service.speculative_turns is not None:
                 self._service.speculative_turns.discard(turn_id)
             st.input_item_chat_ids.pop(event.item_id, None)
         if st.speculative_user_item_id == chat_item_id:
             st.speculative_user_item_id = None
+        if st.speculative_input_item_id == event.item_id:
+            st.speculative_input_item_id = None
+        if turn_id is not None and st.speculative_turn_id == turn_id:
+            st.speculative_turn_id = None
+            st.speculative_turn_revision = None
+        if turn_id is not None and st.speculative_user_turn_id == turn_id:
+            st.speculative_user_turn_id = None
+            st.speculative_user_turn_revision = None
+            st.speculative_user_speech_stopped_at_s = None
+            st.speculative_audio_duration_s = 0.0
+
+        pending_matches = turn_id is not None and st.pending_response_turn_id == turn_id
+        active_matches = turn_id is not None and st.active_response_turn_id == turn_id
+        if pending_matches:
+            st.response_pending = False
+            st.pending_response_turn_id = None
+            st.pending_response_turn_revision = None
+        if (active_matches or (pending_matches and not st.in_response)) and self._service.cancel_scope is not None:
+            self._service.cancel_scope.cancel()
+        response_events: list[ServerEvent] = []
+        if active_matches:
+            response_events = self._service.response.finish_response(
+                conn_id,
+                status="cancelled",
+                reason="client_cancelled",
+            )
+        if active_matches or pending_matches:
+            should_listen = self._should_listen(conn_id)
+            if should_listen is not None:
+                should_listen.set()
         st.remove_protocol_item(event.item_id)
         return [
             ConversationItemDeletedEvent(
                 type="conversation.item.deleted",
                 event_id=self._next_event_id(),
                 item_id=event.item_id,
-            )
+            ),
+            *response_events,
         ]
 
     # ── Pipeline event handlers ────────────────────

@@ -214,6 +214,12 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             return True
         return self.speculative_turns.is_latest_after_reopen_grace(turn_id, turn_revision)
 
+    def _turn_owns_writeback_now(self, turn_id: str | None, turn_revision: int | None) -> bool:
+        """Fail closed on a stale or concurrently reopening turn without waiting."""
+        if self.speculative_turns is None:
+            return True
+        return self.speculative_turns.try_is_latest_after_reopen_grace(turn_id, turn_revision) is True
+
     @abstractmethod
     def _load_model(
         self,
@@ -796,7 +802,16 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             commit_allowed = turn_output_allowed and not out_of_band
             if commit_allowed:
                 with runtime_config.transcript_barrier_state_guard():
-                    if not runtime_config.transcript_barrier_failed:
+                    generation_stale = (
+                        ctx.cancel_generation is not None
+                        and self.cancel_scope is not None
+                        and self.cancel_scope.is_stale(ctx.cancel_generation)
+                    )
+                    if (
+                        not runtime_config.transcript_barrier_failed
+                        and not generation_stale
+                        and self._turn_owns_writeback_now(ctx.turn_id, ctx.turn_revision)
+                    ):
                         original_chat.add_item(make_assistant_message(ctx.generated_text))
                         for t in ctx.tools:
                             original_chat.add_item(

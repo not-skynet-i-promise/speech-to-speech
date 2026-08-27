@@ -1,4 +1,5 @@
 import logging
+from collections import OrderedDict
 from collections.abc import Mapping
 from contextlib import contextmanager
 from queue import Queue
@@ -218,6 +219,10 @@ class ConnState(BaseModel):
     speculative_user_item_id: Optional[str] = None
     speculative_input_item_id: Optional[str] = None
     speculative_audio_duration_s: float = 0.0
+    pending_response_turn_id: Optional[str] = None
+    pending_response_turn_revision: Optional[int] = None
+    active_response_turn_id: Optional[str] = None
+    active_response_turn_revision: Optional[int] = None
     # Client conversation.item.create items that arrived while a response was
     # generating. Applying them mid-generation races the LLM handler's chat
     # write-back (cross-thread), so they are buffered here and flushed in order
@@ -229,21 +234,38 @@ class ConnState(BaseModel):
     input_item_chat_ids: dict[str, str] = Field(default_factory=dict)
     input_item_turn_ids: dict[str, str] = Field(default_factory=dict)
     turn_input_item_ids: dict[str, str] = Field(default_factory=dict)
-    deleted_input_item_ids: set[str] = Field(default_factory=set)
+    deleted_input_item_ids: OrderedDict[str, None] = Field(default_factory=OrderedDict)
 
     def record_protocol_item(self, item_id: str) -> None:
         """Record one protocol-visible conversation item in creation order."""
-        if item_id not in self.protocol_item_ids:
+        newly_created = item_id not in self.protocol_item_ids
+        if newly_created:
             self.protocol_item_ids.append(item_id)
         while len(self.protocol_item_ids) > MAX_TRACKED_PROTOCOL_ITEMS:
             retired_item_id = self.protocol_item_ids.pop(0)
             self.audio_input_item_ids.discard(retired_item_id)
-            self.input_item_chat_ids.pop(retired_item_id, None)
+            retired_chat_id = self.input_item_chat_ids.pop(retired_item_id, retired_item_id)
+            self.runtime_config.chat.retire_user_message_deletable(retired_chat_id)
             retired_turn_id = self.input_item_turn_ids.pop(retired_item_id, None)
             if retired_turn_id is not None and self.turn_input_item_ids.get(retired_turn_id) == retired_item_id:
                 self.turn_input_item_ids.pop(retired_turn_id, None)
-            self.deleted_input_item_ids.discard(retired_item_id)
-        self.last_item_id = item_id
+            self.deleted_input_item_ids.pop(retired_item_id, None)
+        if newly_created:
+            self.last_item_id = item_id
+
+    def record_deleted_input_item(self, item_id: str) -> None:
+        """Remember a deleted audio item without allowing per-session state growth."""
+        self.deleted_input_item_ids[item_id] = None
+        self.deleted_input_item_ids.move_to_end(item_id)
+        while len(self.deleted_input_item_ids) > MAX_TRACKED_PROTOCOL_ITEMS:
+            retired_item_id, _ = self.deleted_input_item_ids.popitem(last=False)
+            self.audio_input_item_ids.discard(retired_item_id)
+            retired_chat_id = self.input_item_chat_ids.pop(retired_item_id, None)
+            if retired_chat_id is not None:
+                self.runtime_config.chat.retire_user_message_deletable(retired_chat_id)
+            retired_turn_id = self.input_item_turn_ids.pop(retired_item_id, None)
+            if retired_turn_id is not None and self.turn_input_item_ids.get(retired_turn_id) == retired_item_id:
+                self.turn_input_item_ids.pop(retired_turn_id, None)
 
     def remove_protocol_item(self, item_id: str) -> None:
         """Remove one protocol item and expose only the surviving protocol tail."""
@@ -794,8 +816,11 @@ class RealtimeService:
                 TranscriptionCompletedEvent,
                 TranscriptBarrierCompletedEvent,
                 TranscriptBarrierDiscardedEvent,
+                SpeechStartedEvent,
+                SpeechStoppedEvent,
                 AssistantTextEvent,
                 TokenUsageEvent,
+                ResponseFailedEvent,
             ),
         ):
             return False
@@ -826,9 +851,7 @@ class RealtimeService:
         """Emit and store a final transcription, then trigger LM when configured."""
         st = self._state(conn_id)
         input_item_id = (
-            st.turn_input_item_ids.get(event.turn_id)
-            if event.turn_id is not None
-            else st.speculative_input_item_id
+            st.turn_input_item_ids.get(event.turn_id) if event.turn_id is not None else st.speculative_input_item_id
         )
         if input_item_id is None:
             input_item_id = self.response._current_item_id(conn_id)
@@ -864,6 +887,7 @@ class RealtimeService:
                 st.speculative_user_item_id = item.id
             if st.speculative_user_item_id is not None:
                 st.input_item_chat_ids[input_item_id] = st.speculative_user_item_id
+                cfg.chat.mark_user_message_deletable(st.speculative_user_item_id)
         elif same_speculative_turn and st.speculative_user_item_id:
             cfg.chat.remove_user_message(st.speculative_user_item_id)
             st.input_item_chat_ids.pop(input_item_id, None)
@@ -879,6 +903,8 @@ class RealtimeService:
         queue = self.text_prompt_queue
         if queue and transcript and cfg.create_response_enabled:
             st.response_pending = True
+            st.pending_response_turn_id = event.turn_id
+            st.pending_response_turn_revision = event.turn_revision
             queue.put(
                 GenerateResponseRequest(
                     runtime_config=cfg,

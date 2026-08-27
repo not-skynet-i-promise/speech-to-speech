@@ -791,6 +791,30 @@ def test_streaming_text_and_usage():
     assert any(getattr(i, "role", None) == "assistant" for i in chat.buffer)
 
 
+def test_turn_deletion_at_locked_writeback_fence_cannot_restore_assistant_history(monkeypatch):
+    handler = _make_handler(stream=False)
+    handler.client.chat.completions.next_result = _complete_response(content="must not persist")
+    tracker = SpeculativeTurnTracker()
+    tracker.observe("t", 0)
+    handler.speculative_turns = tracker
+    original_check = handler._turn_owns_writeback_now
+
+    def delete_then_check(turn_id, turn_revision):
+        tracker.discard(turn_id)
+        return original_check(turn_id, turn_revision)
+
+    monkeypatch.setattr(handler, "_turn_owns_writeback_now", delete_then_check)
+
+    _text, _tools, _usage, chat, _end = _drive(handler)
+
+    assert [getattr(item, "role", None) for item in chat.buffer] == ["user"]
+    assert not any(
+        getattr(part, "text", None) == "must not persist"
+        for item in chat.buffer
+        for part in getattr(item, "content", [])
+    )
+
+
 def test_streaming_tool_call_accumulates_arguments():
     h = _make_handler(stream=True)
     # Arguments arrive split across deltas, as real servers stream them.

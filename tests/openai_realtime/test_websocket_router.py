@@ -256,6 +256,45 @@ class TestClientEventDispatch:
                 assert failure["type"] == "error"
                 assert failure["error"]["type"] == "invalid_home_assistant_guard"
 
+    def test_required_guard_pre_handshake_delete_error_keeps_event_id(self, setup):
+        app, service, *_ = setup
+        service.home_assistant_guard_supported = True
+        service.home_assistant_guard_required = True
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                assert ws.receive_json()["type"] == "session.created"
+                ws.send_json(
+                    {
+                        "type": "conversation.item.delete",
+                        "event_id": "delete_before_guard",
+                        "item_id": "item_audio",
+                    }
+                )
+                failure = ws.receive_json()
+
+        assert failure["error"]["type"] == "invalid_home_assistant_guard"
+        assert failure["error"]["event_id"] == "delete_before_guard"
+
+    def test_required_guard_malformed_delete_error_keeps_raw_event_id(self, setup):
+        app, service, *_ = setup
+        service.home_assistant_guard_supported = True
+        service.home_assistant_guard_required = True
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                assert ws.receive_json()["type"] == "session.created"
+                ws.send_json(
+                    {
+                        "type": "conversation.item.delete",
+                        "event_id": "malformed_delete_before_guard",
+                    }
+                )
+                failure = ws.receive_json()
+
+        assert failure["error"]["type"] == "invalid_home_assistant_guard"
+        assert failure["error"]["event_id"] == "malformed_delete_before_guard"
+
     def test_audio_append_forwarded_to_input_queue(self, setup):
         app, _, input_queue, *_ = setup
         audio_b64 = base64.b64encode(_pcm_bytes(512)).decode("ascii")
