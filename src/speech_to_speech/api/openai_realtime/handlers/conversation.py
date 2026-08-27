@@ -7,9 +7,12 @@ from openai.types.realtime import (
     ConversationItem,
     ConversationItemCreatedEvent,
     ConversationItemCreateEvent,
+    ConversationItemDeletedEvent,
+    ConversationItemDeleteEvent,
     ConversationItemInputAudioTranscriptionCompletedEvent,
     ConversationItemInputAudioTranscriptionDeltaEvent,
 )
+from openai.types.realtime.conversation_item import RealtimeConversationItemUserMessage
 from openai.types.realtime.conversation_item_input_audio_transcription_completed_event import (
     UsageTranscriptTextUsageDuration,
 )
@@ -101,6 +104,52 @@ class ConversationHandler(RealtimeBaseHandler):
         Raises :class:`ChatItemError` on validation failure or unsupported type.
         """
         add_supported_item(self._state(conn_id).runtime_config.chat, item)
+
+    def handle_conversation_item_delete(
+        self,
+        conn_id: str,
+        event: ConversationItemDeleteEvent,
+    ) -> list[ServerEvent]:
+        """Remove one exact user item and acknowledge only after history changed."""
+        st = self._state(conn_id)
+        chat_item_id = (
+            st.speculative_user_item_id
+            if event.item_id == st.speculative_input_item_id and st.speculative_user_item_id is not None
+            else event.item_id
+        )
+        removed = st.runtime_config.chat.remove_user_message(chat_item_id)
+        if not removed:
+            for index, item in enumerate(st.deferred_items):
+                if isinstance(item, RealtimeConversationItemUserMessage) and item.id in {
+                    event.item_id,
+                    chat_item_id,
+                }:
+                    del st.deferred_items[index]
+                    removed = True
+                    break
+        if not removed:
+            error = self.make_client_content_error(conn_id, "Conversation item was not found.", "item_not_found")
+            error.error.event_id = event.event_id
+            return [error]
+
+        if st.speculative_user_item_id == chat_item_id:
+            st.speculative_user_item_id = None
+        if st.last_item_id in {event.item_id, chat_item_id}:
+            st.last_item_id = next(
+                (
+                    item.id
+                    for item in reversed(st.deferred_items)
+                    if getattr(item, "id", None) is not None
+                ),
+                st.runtime_config.chat.latest_item_id(),
+            )
+        return [
+            ConversationItemDeletedEvent(
+                type="conversation.item.deleted",
+                event_id=self._next_event_id(),
+                item_id=event.item_id,
+            )
+        ]
 
     # ── Pipeline event handlers ────────────────────
 

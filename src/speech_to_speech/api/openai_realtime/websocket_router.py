@@ -11,6 +11,7 @@ import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from openai.types.realtime import (
     ConversationItemCreateEvent,
+    ConversationItemDeleteEvent,
     InputAudioBufferAppendEvent,
     InputAudioBufferCommitEvent,
     ResponseCancelEvent,
@@ -521,6 +522,14 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
 
                 elif isinstance(event, ConversationItemCreateEvent):
                     events = unit.service.handle_conversation_item_create(session_id, event)
+                    if events:
+                        await _send_events(ws, events)
+                    if unit.service.private_protocol_failed(session_id):
+                        await ws.close(code=1008, reason="Private session failed")
+                        return
+
+                elif isinstance(event, ConversationItemDeleteEvent):
+                    events = unit.service.handle_conversation_item_delete(session_id, event)
                     if events:
                         await _send_events(ws, events)
                     if unit.service.private_protocol_failed(session_id):

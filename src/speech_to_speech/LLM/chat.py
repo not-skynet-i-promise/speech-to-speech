@@ -330,6 +330,14 @@ class Chat:
                 return True
         return False
 
+    def latest_item_id(self) -> str | None:
+        """Return the newest buffered conversation item ID under the chat lock."""
+        with self._lock:
+            for item in reversed(self.buffer):
+                if item.id:
+                    return item.id
+        return None
+
     def to_responses_api_chat(self, items: list[SupportedItem] | None = None) -> ResponseInputParam:
         """Serialize the chat (system prompt + buffer) for the OpenAI Responses API.
 

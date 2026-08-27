@@ -9,6 +9,8 @@ from openai.types.realtime import (
     ConversationItem,
     ConversationItemCreatedEvent,
     ConversationItemCreateEvent,
+    ConversationItemDeletedEvent,
+    ConversationItemDeleteEvent,
     ConversationItemInputAudioTranscriptionCompletedEvent,
     ConversationItemInputAudioTranscriptionDeltaEvent,
     InputAudioBufferAppendEvent,
@@ -86,6 +88,7 @@ _EVENT_TYPE_TO_MODEL: dict[str, type[BaseModel]] = {
     "input_audio_buffer.append": InputAudioBufferAppendEvent,
     "session.update": SessionUpdateEvent,
     "conversation.item.create": ConversationItemCreateEvent,
+    "conversation.item.delete": ConversationItemDeleteEvent,
     "response.create": ResponseCreateEvent,
     "response.cancel": ResponseCancelEvent,
     "reachy.transcript_barrier.resolve": TranscriptBarrierResolveEvent,
@@ -95,6 +98,7 @@ ClientEvent = Union[
     InputAudioBufferAppendEvent,
     SessionUpdateEvent,
     ConversationItemCreateEvent,
+    ConversationItemDeleteEvent,
     ResponseCreateEvent,
     ResponseCancelEvent,
     TranscriptBarrierResolveEvent,
@@ -106,6 +110,7 @@ ServerEvent = Union[
     InputAudioBufferSpeechStartedEvent,
     InputAudioBufferSpeechStoppedEvent,
     ConversationItemCreatedEvent,
+    ConversationItemDeletedEvent,
     ConversationItemInputAudioTranscriptionDeltaEvent,
     ConversationItemInputAudioTranscriptionCompletedEvent,
     ResponseCreatedEvent,
@@ -576,6 +581,16 @@ class RealtimeService:
             if cfg.transcript_barrier_pending:
                 return [self.poison_transcript_barrier(conn_id, "transcript_barrier_pending")]
             return self.conversation.handle_conversation_item_create(conn_id, event)
+
+    def handle_conversation_item_delete(self, conn_id: str, event: ConversationItemDeleteEvent) -> list[ServerEvent]:
+        """Delete one exact user item while preserving the guarded session fence."""
+        cfg = self._state(conn_id).runtime_config
+        with cfg.transcript_barrier_state_guard():
+            if cfg.private_protocol_failed:
+                return []
+            if cfg.transcript_barrier_pending:
+                return [self.poison_transcript_barrier(conn_id, "transcript_barrier_pending")]
+            return self.conversation.handle_conversation_item_delete(conn_id, event)
 
     def handle_transcript_barrier_resolve(
         self,

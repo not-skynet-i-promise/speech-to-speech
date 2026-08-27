@@ -146,6 +146,7 @@ SPEECH_STOPPED = "input_audio_buffer.speech_stopped"
 TRANSCRIPTION_DELTA = "conversation.item.input_audio_transcription.delta"
 TRANSCRIPTION_COMPLETED = "conversation.item.input_audio_transcription.completed"
 ITEM_CREATED = "conversation.item.created"
+ITEM_DELETED = "conversation.item.deleted"
 RESPONSE_CREATED = "response.created"
 RESPONSE_DONE = "response.done"
 AUDIO_DELTA = "response.output_audio.delta"
@@ -523,6 +524,33 @@ class TestSDKTextInput:
             assert event.item.role == "user"
             assert event.item.content[0].text == "Hello from SDK"
             assert event.previous_item_id is None
+
+    @pytest.mark.asyncio
+    async def test_delete_waits_for_exact_server_acknowledgement(self, server_env):
+        """The SDK receives deletion proof and a correlated error for a missing item."""
+        client = server_env.make_client()
+        async with client.realtime.connect(model="test") as conn:
+            await _recv(conn)
+            await conn.conversation.item.create(
+                item={
+                    "id": "msg_sdk_delete",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "assistant echo"}],
+                }
+            )
+            assert (await _recv(conn)).type == ITEM_CREATED
+
+            await conn.conversation.item.delete(item_id="msg_sdk_delete", event_id="event_delete")
+            deleted = await _recv(conn)
+            assert deleted.type == ITEM_DELETED
+            assert deleted.item_id == "msg_sdk_delete"
+
+            await conn.conversation.item.delete(item_id="msg_sdk_delete", event_id="event_delete_missing")
+            missing = await _recv(conn)
+            assert missing.type == ERROR
+            assert missing.error.type == "item_not_found"
+            assert missing.error.event_id == "event_delete_missing"
 
     @pytest.mark.asyncio
     async def test_text_input_previous_item_id_chain(self, server_env):

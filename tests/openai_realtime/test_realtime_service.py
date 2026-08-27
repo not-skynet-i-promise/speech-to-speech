@@ -15,6 +15,8 @@ import pytest
 from openai.types.realtime import (
     ConversationItemCreatedEvent,
     ConversationItemCreateEvent,
+    ConversationItemDeletedEvent,
+    ConversationItemDeleteEvent,
     ConversationItemInputAudioTranscriptionCompletedEvent,
     ConversationItemInputAudioTranscriptionDeltaEvent,
     InputAudioBufferAppendEvent,
@@ -206,6 +208,12 @@ class TestParseClientEvent:
         }
         evt = service.parse_client_event(raw)
         assert isinstance(evt, ConversationItemCreateEvent)
+
+    def test_parse_valid_conversation_item_delete(self, service):
+        evt = service.parse_client_event(
+            {"type": "conversation.item.delete", "event_id": "event_delete", "item_id": "item_audio"}
+        )
+        assert isinstance(evt, ConversationItemDeleteEvent)
 
     def test_parse_valid_response_create(self, service):
         raw = {"type": "response.create"}
@@ -831,6 +839,84 @@ class TestHandleConversationItemCreate:
         assert last.content[0].text == "What is this?"
         assert last.content[1].type == "input_image"
         assert last.content[1].image_url == "data:image/png;base64,abc123"
+
+
+class TestHandleConversationItemDelete:
+    def test_deletes_exact_created_user_item(self, service, conn_id):
+        created = service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "msg_echo",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "echo"}],
+                },
+            ),
+        )
+        assert isinstance(created[0], ConversationItemCreatedEvent)
+
+        events = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(
+                type="conversation.item.delete",
+                event_id="event_delete",
+                item_id="msg_echo",
+            ),
+        )
+
+        assert len(events) == 1
+        assert isinstance(events[0], ConversationItemDeletedEvent)
+        assert events[0].item_id == "msg_echo"
+        assert service._state(conn_id).runtime_config.chat.buffer == []
+
+    def test_audio_item_id_deletes_its_exact_stored_transcript(self, service, conn_id):
+        st = service._state(conn_id)
+        stored = st.runtime_config.chat.add_item(
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "assistant echo"}],
+                },
+            ).item
+        )
+        assert stored.id is not None
+        st.speculative_input_item_id = "item_audio"
+        st.speculative_user_item_id = stored.id
+        st.last_item_id = "item_audio"
+
+        events = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(
+                type="conversation.item.delete",
+                event_id="event_delete",
+                item_id="item_audio",
+            ),
+        )
+
+        assert isinstance(events[0], ConversationItemDeletedEvent)
+        assert events[0].item_id == "item_audio"
+        assert st.runtime_config.chat.buffer == []
+        assert st.speculative_user_item_id is None
+        assert st.last_item_id is None
+
+    def test_missing_item_returns_correlated_error(self, service, conn_id):
+        events = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(
+                type="conversation.item.delete",
+                event_id="event_delete",
+                item_id="item_missing",
+            ),
+        )
+
+        assert len(events) == 1
+        assert isinstance(events[0], RealtimeErrorEvent)
+        assert events[0].error.type == "item_not_found"
+        assert events[0].error.event_id == "event_delete"
 
 
 class TestDeferConversationItemsDuringResponse:
