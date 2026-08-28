@@ -8,6 +8,7 @@ old tests) so there is no cross-test state.
 
 import asyncio
 import base64
+import json
 import logging
 import time
 from queue import Empty, Queue
@@ -1517,7 +1518,7 @@ class TestSendLoop:
         assert queued_assistant.text == "queued after boundary"
         assert text_output_queue.empty()
 
-    def test_assistant_retained_after_boundary_cannot_reopen_closed_response(self, setup):
+    def test_closing_assistant_after_boundary_is_sent_before_response_done(self, setup):
         _, service, input_queue, output_queue, text_output_queue, should_listen, _, response_playing, cancel_scope = (
             setup
         )
@@ -1566,13 +1567,15 @@ class TestSendLoop:
         ws = _FakeWebSocket()
 
         asyncio.run(router_module._drain_pending_response_events(ws, unit, conn_id))
-        service.finish_response(conn_id)
+        done_events = service.finish_response(conn_id)
         boundary = text_output_queue.get_nowait()
-        retained = text_output_queue.get_nowait()
 
         assert isinstance(boundary, SpeechStartedEvent)
-        assert isinstance(retained, AssistantTextEvent)
-        assert service.dispatch_pipeline_event(conn_id, retained) == []
+        assert text_output_queue.empty()
+        sent_text = json.dumps(ws.sent)
+        assert "old response before boundary" in sent_text
+        assert "old response after boundary" in sent_text
+        assert [event.type for event in done_events] == ["response.done"]
         state = service._state(conn_id)
         assert state.current_response_id is None
         assert not state.in_response

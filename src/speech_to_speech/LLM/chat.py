@@ -1026,12 +1026,32 @@ class Chat:
             )
             if not target_present:
                 logger.warning("Queued response user %s was unavailable in live and admission history", target_user_id)
+            excluded_ids = set(excluded_item_ids or set())
+            excluded_call_ids = {
+                item.call_id
+                for item in self.buffer
+                if item.id in excluded_ids
+                and isinstance(
+                    item,
+                    (RealtimeConversationItemFunctionCall, RealtimeConversationItemFunctionCallOutput),
+                )
+            }
+            excluded_ids.update(
+                item.id
+                for item in self.buffer
+                if item.id is not None
+                and isinstance(
+                    item,
+                    (RealtimeConversationItemFunctionCall, RealtimeConversationItemFunctionCallOutput),
+                )
+                and item.call_id in excluded_call_ids
+            )
             clone = Chat(self.size)
             clone.init_chat_message = (
                 fallback_init_message
                 if self.init_chat_message is not None
                 and self.init_chat_message.id is not None
-                and self.init_chat_message.id in (excluded_item_ids or set())
+                and self.init_chat_message.id in excluded_ids
                 else self.init_chat_message
             )
             selected = [
@@ -1040,7 +1060,7 @@ class Chat:
                 if not (
                     item.id is not None
                     and (
-                        item.id in (excluded_item_ids or set())
+                        item.id in excluded_ids
                         or (isinstance(item, RealtimeConversationItemUserMessage) and item.id in later_user_ids)
                     )
                 )

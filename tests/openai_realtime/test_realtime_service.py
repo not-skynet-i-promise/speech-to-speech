@@ -2205,6 +2205,59 @@ class TestHandleConversationItemDelete:
         assert "new value" not in serialized_text
         service.unregister(conn_id)
 
+    def test_deleted_audio_id_reused_as_user_item_loses_stale_audio_identity(self, service, conn_id):
+        created = service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "msg_reused_audio",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "old audio transcript"}],
+                },
+            ),
+        )
+        assert created[0].type == "conversation.item.created"
+        state = service._state(conn_id)
+        state.audio_input_item_ids.add("msg_reused_audio")
+        state.input_item_chat_ids["msg_reused_audio"] = "msg_reused_audio"
+        state.input_item_turn_ids["msg_reused_audio"] = "turn_old_audio"
+        state.turn_input_item_ids["turn_old_audio"] = "msg_reused_audio"
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="msg_reused_audio"),
+        )
+        assert deleted[0].type == "conversation.item.deleted"
+        assert "msg_reused_audio" in state.audio_input_item_ids
+        assert "msg_reused_audio" in state.deleted_input_item_ids
+
+        recreated = service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "msg_reused_audio",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "new text item"}],
+                },
+            ),
+        )
+        assert recreated[0].type == "conversation.item.created"
+        assert "msg_reused_audio" not in state.audio_input_item_ids
+        assert "msg_reused_audio" not in state.deleted_input_item_ids
+        assert "msg_reused_audio" not in state.input_item_turn_ids
+        assert "turn_old_audio" not in state.turn_input_item_ids
+
+        deleted_again = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="msg_reused_audio"),
+        )
+        assert deleted_again[0].type == "conversation.item.deleted"
+        assert state.runtime_config.chat.user_message("msg_reused_audio") is None
+
     def test_untranscribed_audio_delete_never_removes_the_prior_turn(self, service, conn_id):
         st = service._state(conn_id)
         first = service.dispatch_pipeline_event(

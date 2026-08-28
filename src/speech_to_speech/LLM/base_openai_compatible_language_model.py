@@ -316,11 +316,11 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             return True
         return self.speculative_turns.is_latest_after_reopen_grace(turn_id, turn_revision)
 
-    def _turn_owns_writeback_now(self, turn_id: str | None, turn_revision: int | None) -> bool | None:
-        """Check writeback ownership without waiting; ``None`` asks the caller to retry."""
+    def _turn_commits_writeback_now(self, turn_id: str | None, turn_revision: int | None) -> bool | None:
+        """Commit writeback ownership without waiting; ``None`` asks for a retry."""
         if self.speculative_turns is None:
             return True
-        return self.speculative_turns.try_is_latest_after_reopen_grace(turn_id, turn_revision)
+        return self.speculative_turns.try_commit_if_latest_after_reopen_grace(turn_id, turn_revision)
 
     def _fail_home_assistant_guard_for_current_turn(
         self,
@@ -430,30 +430,36 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         if self._generation_is_stale(turn.gen) or not self._turn_output_allowed(turn.turn_id, turn.turn_revision):
             logger.info("LLM generation cancelled (stale speculative turn)")
             return
-        with turn.runtime_config.transcript_barrier_state_guard():
-            if (
-                turn.runtime_config.private_protocol_failed
-                or self._generation_is_stale(turn.gen)
-                or not self._turn_owns_writeback_now(turn.turn_id, turn.turn_revision)
-            ):
+        while True:
+            with turn.runtime_config.transcript_barrier_state_guard():
+                if turn.runtime_config.private_protocol_failed or self._generation_is_stale(turn.gen):
+                    return
+                commits_writeback = self._turn_commits_writeback_now(turn.turn_id, turn.turn_revision)
+                if commits_writeback is not None:
+                    if not commits_writeback:
+                        return
+                    if not is_out_of_band(turn.response):
+                        # Flush assistant text accumulated before this call first (so history
+                        # order matches what the client received), then persist the call —
+                        # all before the chunk leaves for the client.
+                        chat = turn.runtime_config.chat
+                        for pending_item in state.pending:
+                            chat.add_response_item(
+                                pending_item,
+                                after_user_id=turn.response_user_item_id,
+                                owner_user_ids=turn.response_user_item_ids,
+                            )
+                        state.pending.clear()
+                        chat.add_response_item(
+                            fc_item,
+                            after_user_id=turn.response_user_item_id,
+                            owner_user_ids=turn.response_user_item_ids,
+                        )
+                    break
+            # A reopen began after the blocking output check. Resolve it only
+            # outside the private state lock, then retry the atomic commit fence.
+            if not self._turn_output_allowed(turn.turn_id, turn.turn_revision):
                 return
-            if not is_out_of_band(turn.response):
-                # Flush assistant text accumulated before this call first (so history
-                # order matches what the client received), then persist the call —
-                # all before the chunk leaves for the client.
-                chat = turn.runtime_config.chat
-                for pending_item in state.pending:
-                    chat.add_response_item(
-                        pending_item,
-                        after_user_id=turn.response_user_item_id,
-                        owner_user_ids=turn.response_user_item_ids,
-                    )
-                state.pending.clear()
-                chat.add_response_item(
-                    fc_item,
-                    after_user_id=turn.response_user_item_id,
-                    owner_user_ids=turn.response_user_item_ids,
-                )
         yield self._chunk(turn, tools=[item])
 
     # ── consumption ─────────────────────────────────────────────────────────--
@@ -717,9 +723,9 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     with turn.runtime_config.transcript_barrier_state_guard():
                         if turn.runtime_config.private_protocol_failed or self._generation_is_stale(turn.gen):
                             break
-                        owns_writeback = self._turn_owns_writeback_now(turn.turn_id, turn.turn_revision)
-                        if owns_writeback is not None:
-                            if owns_writeback:
+                        commits_writeback = self._turn_commits_writeback_now(turn.turn_id, turn.turn_revision)
+                        if commits_writeback is not None:
+                            if commits_writeback:
                                 # Tool calls (and any assistant text preceding them) were already
                                 # written eagerly in _record_tool_call; only trailing items remain.
                                 for item in state.pending:

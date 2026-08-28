@@ -220,6 +220,41 @@ async def _drain_pending_response_events(
     if session_id is None:
         return
 
+    state = unit.service._state(session_id)
+    closing_turn_id = state.active_response_turn_id if state.in_response else state.pending_response_turn_id
+    closing_turn_revision = (
+        state.active_response_turn_revision if state.in_response else state.pending_response_turn_revision
+    )
+    closing_generation = (
+        state.active_response_cancel_generation
+        if state.in_response
+        else (
+            state.pending_response_request.cancel_generation
+            if state.response_pending and state.pending_response_request is not None
+            else None
+        )
+    )
+
+    def belongs_to_closing_response(event: AssistantTextEvent) -> bool:
+        """Require positive owner correlation after a non-response boundary."""
+
+        matched = False
+        if event.turn_id is not None and closing_turn_id is not None:
+            if event.turn_id != closing_turn_id:
+                return False
+            if (
+                event.turn_revision is not None
+                and closing_turn_revision is not None
+                and event.turn_revision != closing_turn_revision
+            ):
+                return False
+            matched = True
+        if event.cancel_generation is not None and closing_generation is not None:
+            if event.cancel_generation != closing_generation:
+                return False
+            matched = True
+        return matched
+
     preserved: list[Any] = []
     drained_assistant = 0
     drained_usage = 0
@@ -241,7 +276,7 @@ async def _drain_pending_response_events(
                 if ws is not None and events:
                     send = _send_events_unlocked if lock_held else _send_events
                     await send(ws, events)
-            elif drain_assistant_events and isinstance(item, AssistantTextEvent):
+            elif isinstance(item, AssistantTextEvent) and (drain_assistant_events or belongs_to_closing_response(item)):
                 drained_assistant += 1
                 if _generation_is_discardable(unit, item.cancel_generation):
                     continue

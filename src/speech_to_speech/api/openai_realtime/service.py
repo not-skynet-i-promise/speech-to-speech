@@ -264,6 +264,30 @@ class ConnState(BaseModel):
     turn_input_item_ids: dict[str, str] = Field(default_factory=dict)
     deleted_input_item_ids: OrderedDict[str, None] = Field(default_factory=OrderedDict)
 
+    def retire_reused_audio_item_id(self, item_id: str) -> None:
+        """Drop stale audio identity before a deleted protocol ID is reused.
+
+        Deleted audio IDs intentionally remain tombstoned so late STT events
+        cannot recreate them.  A later client-created item may legally reuse
+        the protocol ID, however, and must then be treated as that new item on
+        deletion rather than as an unmapped audio placeholder.
+        """
+
+        if item_id not in self.audio_input_item_ids and item_id not in self.deleted_input_item_ids:
+            return
+        self.audio_input_item_ids.discard(item_id)
+        self.deleted_input_item_ids.pop(item_id, None)
+        retired_chat_id = self.input_item_chat_ids.pop(item_id, None)
+        if retired_chat_id is not None:
+            self.runtime_config.chat.retire_user_message_deletable(retired_chat_id)
+        retired_turn_id = self.input_item_turn_ids.pop(item_id, None)
+        if retired_turn_id is not None and self.turn_input_item_ids.get(retired_turn_id) == item_id:
+            self.turn_input_item_ids.pop(retired_turn_id, None)
+        if self.speculative_input_item_id == item_id:
+            self.speculative_input_item_id = None
+        if retired_chat_id is not None and self.speculative_user_item_id == retired_chat_id:
+            self.speculative_user_item_id = None
+
     def record_protocol_item(self, item_id: str) -> None:
         """Record one protocol-visible conversation item in creation order."""
         newly_created = item_id not in self.protocol_item_ids

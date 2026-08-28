@@ -1491,6 +1491,29 @@ class TestCompaction:
         assert chat.user_message(target.id) is not None
         assert [item.content[0].text for item in snapshot.buffer if item.role == "user"] == ["exact queued request"]
 
+    def test_queued_response_snapshot_excludes_both_sides_of_future_tool_result(self):
+        chat = Chat(size=10)
+        owner = chat.add_item(_user("older tool owner"))
+        target = chat.add_item(_user("queued target"))
+        assert owner.id is not None and target.id is not None
+        function_call = chat.add_response_item(_fc("future_pair"), after_user_id=owner.id)
+        assert isinstance(function_call, RealtimeConversationItemFunctionCall)
+        output = _fco("future_pair", "future result")
+        chat.add_item(output)
+        assert output.id is not None
+
+        snapshot = chat.snapshot_for_response_turn(
+            target.id,
+            set(),
+            excluded_item_ids={output.id},
+        )
+
+        assert not any(
+            isinstance(item, (RealtimeConversationItemFunctionCall, RealtimeConversationItemFunctionCallOutput))
+            and item.call_id == "call_future_pair"
+            for item in snapshot.buffer
+        )
+
     def test_completed_compaction_can_restore_and_delete_one_exact_user(self):
         chat = Chat(size=2)
         users = []

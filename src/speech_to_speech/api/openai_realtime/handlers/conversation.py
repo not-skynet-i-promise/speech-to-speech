@@ -96,6 +96,8 @@ class ConversationHandler(RealtimeBaseHandler):
                 return [self._service.poison_home_assistant_guard(conn_id, "invalid_conversation_item")]
             return [self.make_client_content_error(conn_id, str(exc), "invalid_conversation_item")]
 
+        if item.id is not None:
+            self._state(conn_id).retire_reused_audio_item_id(item.id)
         return [] if not item else [self._item_created_event(conn_id, item)]
 
     def _item_created_event(self, conn_id: str, item: ConversationItem) -> ConversationItemCreatedEvent:
@@ -170,6 +172,9 @@ class ConversationHandler(RealtimeBaseHandler):
             if st.runtime_config.home_assistant_guard_operational:
                 return [self._service.poison_home_assistant_guard(conn_id, "invalid_conversation_item")]
             return [self.make_client_content_error(conn_id, str(exc), "invalid_conversation_item")]
+        for item in items:
+            if item.id is not None:
+                st.retire_reused_audio_item_id(item.id)
         return [self._item_created_event(conn_id, item) for item in items if item]
 
     def _append_item(self, conn_id: str, item: ConversationItem) -> None:

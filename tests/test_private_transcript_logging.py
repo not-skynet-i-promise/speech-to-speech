@@ -433,7 +433,7 @@ def test_local_llm_retries_writeback_after_transient_pending_reopen(monkeypatch)
     handler.enable_lang_prompt = False
     handler.compactor = None
     handler.tokenizer = type("Tokenizer", (), {"encode": staticmethod(lambda _text: [])})()
-    original_check = handler._turn_owns_writeback_now
+    original_check = handler._turn_commits_writeback_now
     calls = 0
 
     def transient_reopen(turn_id, turn_revision):
@@ -445,7 +445,7 @@ def test_local_llm_retries_writeback_after_transient_pending_reopen(monkeypatch)
             return None
         return original_check(turn_id, turn_revision)
 
-    monkeypatch.setattr(handler, "_turn_owns_writeback_now", transient_reopen)
+    monkeypatch.setattr(handler, "_turn_commits_writeback_now", transient_reopen)
     runtime_config = RuntimeConfig(chat=Chat(10), session=RealtimeSessionCreateRequest(type="realtime"))
     user = runtime_config.chat.add_item(make_user_message("local request"))
 
@@ -461,6 +461,7 @@ def test_local_llm_retries_writeback_after_transient_pending_reopen(monkeypatch)
     )
 
     assert calls >= 2
+    assert tracker.is_committed("turn", 0)
     assert any(
         getattr(part, "text", None) == "local writeback survives transient reopen"
         for item in runtime_config.chat.buffer

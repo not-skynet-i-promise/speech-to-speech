@@ -214,11 +214,11 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             return True
         return self.speculative_turns.is_latest_after_reopen_grace(turn_id, turn_revision)
 
-    def _turn_owns_writeback_now(self, turn_id: str | None, turn_revision: int | None) -> bool | None:
-        """Check writeback ownership without waiting; ``None`` asks the caller to retry."""
+    def _turn_commits_writeback_now(self, turn_id: str | None, turn_revision: int | None) -> bool | None:
+        """Commit writeback ownership without waiting; ``None`` asks for a retry."""
         if self.speculative_turns is None:
             return True
-        return self.speculative_turns.try_is_latest_after_reopen_grace(turn_id, turn_revision)
+        return self.speculative_turns.try_commit_if_latest_after_reopen_grace(turn_id, turn_revision)
 
     @abstractmethod
     def _load_model(
@@ -813,9 +813,9 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                         )
                         if runtime_config.transcript_barrier_failed or generation_stale:
                             break
-                        owns_writeback = self._turn_owns_writeback_now(ctx.turn_id, ctx.turn_revision)
-                        if owns_writeback is not None:
-                            if owns_writeback:
+                        commits_writeback = self._turn_commits_writeback_now(ctx.turn_id, ctx.turn_revision)
+                        if commits_writeback is not None:
+                            if commits_writeback:
                                 original_chat.add_response_item(
                                     make_assistant_message(ctx.generated_text),
                                     after_user_id=request.response_user_item_id,
