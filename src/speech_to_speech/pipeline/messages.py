@@ -17,6 +17,7 @@ from openai.types.responses.response_function_tool_call import ResponseFunctionT
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
+from speech_to_speech.LLM.chat import Chat
 
 # ── Base class ────────────────────────────────────────────────────────
 
@@ -183,15 +184,19 @@ class GenerateResponseRequest(PipelineMessage):
     """Triggers LLM generation for a realtime session.
 
     Carries everything the LM handler needs to produce a response so it
-    never has to reach back into shared objects.  ``runtime_config``
-    holds the per-connection session config *and* the conversation chat;
-    ``response`` carries per-response overrides from ``response.create``.
+    never has to reach back into shared objects. ``runtime_config`` retains
+    the canonical per-connection configuration and conversation for guarded
+    state and response write-back. ``chat_snapshot`` freezes the history this
+    particular turn may read, so a deferred request cannot observe a later
+    turn appended to the shared conversation. ``response`` carries
+    per-response overrides from ``response.create``.
     Downstream handlers resolve each attribute by preferring the
     per-response value over the session default.
     """
 
     tag: Literal["generate_response"] = "generate_response"
     runtime_config: RuntimeConfig
+    chat_snapshot: Chat | None = Field(default=None, exclude=True, repr=False)
     response: RealtimeResponseCreateParams | None = None
     language_code: Optional[str] = None
     turn_id: str | None = None

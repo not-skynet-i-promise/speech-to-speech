@@ -163,6 +163,36 @@ def test_process_streams_text_from_response_events():
     assert isinstance(outputs[2], EndOfResponse)
 
 
+def test_process_serializes_request_chat_snapshot_not_later_shared_turns():
+    handler = _make_handler()
+    captured = {}
+
+    def fake_create(**kwargs):
+        captured.update(kwargs)
+        return _make_stream([_make_text_delta_event("Okay."), _make_output_item_done_event(content="Okay.")])
+
+    handler.client = SimpleNamespace(responses=SimpleNamespace(create=fake_create))
+    cfg = _make_runtime_config(chat_size=10)
+    cfg.chat.add_item(make_user_message("queued turn"))
+    snapshot = cfg.chat.copy()
+    cfg.chat.add_item(make_user_message("later turn"))
+
+    list(handler.process(GenerateResponseRequest(runtime_config=cfg, chat_snapshot=snapshot)))
+
+    user_text = [
+        part["text"]
+        for item in captured["input"]
+        if item.get("role") == "user"
+        for part in item["content"]
+        if part.get("type") == "input_text"
+    ]
+    assert user_text == ["queued turn"]
+    assert [item.content[0].text for item in cfg.chat.buffer if item.role == "user"] == [
+        "queued turn",
+        "later turn",
+    ]
+
+
 def test_text_only_streams_raw_deltas_without_sentence_trimming():
     """Text-only streams (so a new speech turn can interrupt it) and forwards each
     delta verbatim — no sent_tokenize (newlines / markdown survive) and no

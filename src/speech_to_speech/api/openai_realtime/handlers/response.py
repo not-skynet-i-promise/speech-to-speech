@@ -116,6 +116,7 @@ class ResponseHandler(RealtimeBaseHandler):
         st.active_response_turn_id = None
         st.active_response_turn_revision = None
         st.active_response_input_item_id = None
+        st.response_failure_pending = False
         st.current_response_params = None
         st.next_output_index = 0
         st.current_output_index = None
@@ -299,6 +300,7 @@ class ResponseHandler(RealtimeBaseHandler):
             queue.put(
                 GenerateResponseRequest(
                     runtime_config=cfg,
+                    chat_snapshot=cfg.chat.copy(),
                     response=event.response,
                     turn_id=None if out_of_band else st.response_context_turn_id,
                     turn_revision=None if out_of_band else st.response_context_turn_revision,
@@ -345,6 +347,8 @@ class ResponseHandler(RealtimeBaseHandler):
         with ``response.done``.
         """
         st = self._state(conn_id)
+        if status == "completed" and st.response_failure_pending:
+            status = "failed"
         deferred_requests: list[GenerateResponseRequest] = []
         if preserve_pending:
             if st.in_response:

@@ -189,6 +189,7 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
                 self.runtime_config.chat.add_item(make_user_message(transcript))
                 yield GenerateResponseRequest(
                     runtime_config=self.runtime_config,
+                    chat_snapshot=self.runtime_config.chat.copy(),
                     language_code=language_code,
                     turn_id=turn_id,
                     turn_revision=turn_revision,

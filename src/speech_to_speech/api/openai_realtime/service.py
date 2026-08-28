@@ -232,6 +232,10 @@ class ConnState(BaseModel):
     active_response_turn_id: Optional[str] = None
     active_response_turn_revision: Optional[int] = None
     active_response_input_item_id: Optional[str] = None
+    # A provider failure is surfaced on the text side-channel before its normal
+    # terminal sentinel reaches the audio queue. Keep the active slot owned until
+    # that sentinel arrives, otherwise it can close a newly promoted successor.
+    response_failure_pending: bool = False
     # Exact default-conversation tail that an explicit in-band
     # ``response.create`` may own. Client-created/input items clear the audio
     # turn fields so an old audio deletion cannot cancel an unrelated response.
@@ -939,6 +943,7 @@ class RealtimeService:
         if queue and transcript and cfg.create_response_enabled:
             request = GenerateResponseRequest(
                 runtime_config=cfg,
+                chat_snapshot=cfg.chat.copy(),
                 language_code=event.language_code,
                 turn_id=event.turn_id,
                 turn_revision=event.turn_revision,
@@ -1115,11 +1120,9 @@ class RealtimeService:
         Emitted when generation failed (e.g. invalid out-of-band input, or the
         provider rejecting an empty context). A top-level ``error`` event carries
         the human-readable reason — ``response.done.status_details.error`` only
-        has code/type, no message — then ``finish_response`` closes the slot.
-
-        Idempotent: gated on an active response, and ``finish_response`` is itself
-        a no-op once the slot is closed, so a later EndOfResponse-driven close does
-        nothing.
+        has code/type, no message. The active slot stays owned until the matching
+        EndOfResponse reaches the audio queue; closing it here would promote a
+        successor that the failed response's later terminal sentinel could erase.
         """
         state = self._state(conn_id)
         private_barrier = state.runtime_config.transcript_barrier_private
@@ -1129,11 +1132,24 @@ class RealtimeService:
         else:
             message = event.message
             logger.info("Response failed: %s", message)
-        if not state.in_response:
+        if (not state.in_response and not state.response_pending) or state.response_failure_pending:
             return []
-        events: list[ServerEvent] = [self.make_error(message, "response_failed")]
-        events.extend(self.response.finish_response(conn_id, status="failed"))
-        return events
+        if not state.in_response:
+            self.response._ensure_response(conn_id)
+        if event.turn_id is not None and state.active_response_turn_id is not None:
+            if event.turn_id != state.active_response_turn_id or (
+                event.turn_revision is not None
+                and state.active_response_turn_revision is not None
+                and event.turn_revision != state.active_response_turn_revision
+            ):
+                logger.debug(
+                    "Ignoring response failure for non-active turn=%s rev=%s",
+                    event.turn_id,
+                    event.turn_revision,
+                )
+                return []
+        state.response_failure_pending = True
+        return [self.make_error(message, "response_failed")]
 
     def get_usage(self) -> dict[str, Any]:
         """Return cumulative usage metrics across all completed responses."""

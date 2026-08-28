@@ -761,9 +761,10 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             return
 
         original_chat = runtime_config.chat
+        request_chat = request.chat_snapshot or original_chat
         if is_out_of_band(response):
             try:
-                active_chat = build_active_chat(original_chat, response)
+                active_chat = build_active_chat(request_chat, response)
             except ChatItemError as exc:
                 with private_content_redaction(runtime_config) as private_content:
                     guarded_failure = runtime_config.home_assistant_guard_operational
@@ -790,7 +791,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 )
                 return
         else:
-            active_chat = original_chat.copy()
+            active_chat = request_chat.copy()
         language_code = request.language_code
         instructions = (
             response.instructions if response and response.instructions else runtime_config.session.instructions

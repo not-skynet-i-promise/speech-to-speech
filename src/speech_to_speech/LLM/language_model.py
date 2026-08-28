@@ -723,10 +723,11 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         runtime_config = request.runtime_config
         response = request.response
         original_chat = runtime_config.chat
+        request_chat = request.chat_snapshot or original_chat
         out_of_band = is_out_of_band(response)
         if out_of_band:
             try:
-                active_chat = build_active_chat(original_chat, response)
+                active_chat = build_active_chat(request_chat, response)
             except ChatItemError as exc:
                 with runtime_config.transcript_barrier_content_guard() as private_content:
                     if private_content:
@@ -742,7 +743,7 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     )
                 return
         else:
-            active_chat = original_chat.copy()
+            active_chat = request_chat.copy()
         language_code = request.language_code
         instructions = (
             response.instructions if response and response.instructions else runtime_config.session.instructions

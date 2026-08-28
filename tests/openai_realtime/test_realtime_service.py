@@ -1148,7 +1148,9 @@ class TestHandleConversationItemDelete:
                 ),
             )
             if index == 0:
-                assert prompt_queue.get_nowait().turn_id == "turn_0"
+                active_request = prompt_queue.get_nowait()
+                assert active_request.turn_id == "turn_0"
+                assert [item.content[0].text for item in active_request.chat_snapshot.buffer] == ["question 0"]
                 service.dispatch_pipeline_event(
                     conn_id,
                     AssistantTextEvent(text="reply 0", turn_id="turn_0", turn_revision=0),
@@ -1158,10 +1160,24 @@ class TestHandleConversationItemDelete:
         assert st.active_response_turn_id == "turn_0"
         assert st.pending_response_turn_id == "turn_1"
         assert [request.turn_id for request in st.deferred_response_requests] == ["turn_2"]
+        assert [item.content[0].text for item in st.pending_response_request.chat_snapshot.buffer] == [
+            "question 0",
+            "question 1",
+        ]
+        assert [item.content[0].text for item in st.deferred_response_requests[0].chat_snapshot.buffer] == [
+            "question 0",
+            "question 1",
+            "question 2",
+        ]
         assert prompt_queue.empty()
 
         service.finish_response(conn_id)
-        assert prompt_queue.get_nowait().turn_id == "turn_1"
+        second_request = prompt_queue.get_nowait()
+        assert second_request.turn_id == "turn_1"
+        assert [item.content[0].text for item in second_request.chat_snapshot.buffer] == [
+            "question 0",
+            "question 1",
+        ]
         service.dispatch_pipeline_event(
             conn_id,
             AssistantTextEvent(text="reply 1", turn_id="turn_1", turn_revision=0),
@@ -3651,17 +3667,69 @@ class TestDispatchPipelineEvent:
             conn_id,
             ResponseFailedEvent(message="input must not be empty"),
         )
-        # A top-level error event carries the reason (response.done can't), then
-        # the response is closed as failed.
+        # A top-level error event carries the reason (response.done can't). The
+        # response stays active until its normal terminal sentinel reaches the
+        # audio side, preventing that sentinel from closing a successor.
         err = events[0]
         assert isinstance(err, RealtimeErrorEvent)
         assert err.error.message == "input must not be empty"
         assert err.error.type == "response_failed"
-        done = [e for e in events if isinstance(e, ResponseDoneEvent)]
+        assert not any(isinstance(event, ResponseDoneEvent) for event in events)
+        assert service._state(conn_id).in_response is True
+
+        terminal_events = service.finish_response(conn_id)
+        done = [e for e in terminal_events if isinstance(e, ResponseDoneEvent)]
         assert len(done) == 1
         assert done[0].response.status == "failed"
         # Slot released so the next response is not locked out.
         assert service._state(conn_id).in_response is False
+
+    def test_response_failure_terminal_promotes_successor_exactly_once(self):
+        tracker = SpeculativeTurnTracker()
+        prompt_queue = Queue()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            speculative_turns=tracker,
+            cancel_scope=CancelScope(),
+        )
+        conn_id = service.register()
+        for turn_id, transcript in (("turn_failed", "first"), ("turn_successor", "second")):
+            service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id=turn_id, turn_revision=0, interrupt_response=False),
+            )
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(transcript=transcript, turn_id=turn_id, turn_revision=0),
+            )
+            if turn_id == "turn_failed":
+                assert prompt_queue.get_nowait().turn_id == turn_id
+
+        state = service._state(conn_id)
+        assert state.response_pending
+        assert [request.turn_id for request in state.deferred_response_requests] == ["turn_successor"]
+
+        failure_events = service.dispatch_pipeline_event(
+            conn_id,
+            ResponseFailedEvent(message="provider failed", turn_id="turn_failed", turn_revision=0),
+        )
+
+        assert len(failure_events) == 1
+        assert isinstance(failure_events[0], RealtimeErrorEvent)
+        assert state.in_response
+        assert state.active_response_turn_id == "turn_failed"
+        assert state.pending_response_turn_id == "turn_successor"
+        assert prompt_queue.empty()
+
+        terminal_events = service.finish_response(conn_id)
+
+        done = next(event for event in terminal_events if isinstance(event, ResponseDoneEvent))
+        assert done.response.status == "failed"
+        successor = prompt_queue.get_nowait()
+        assert successor.turn_id == "turn_successor"
+        assert state.response_pending
+        assert state.pending_response_request is successor
+        service.unregister(conn_id)
 
     def test_response_failed_without_active_response_is_noop(self, service, conn_id):
         # No active response (e.g. already closed): nothing to fail, emit nothing.
