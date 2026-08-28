@@ -17,7 +17,12 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from openai.types.realtime import ResponseCreatedEvent, ResponseCreateEvent, SessionUpdateEvent
+from openai.types.realtime import (
+    ConversationItemDeleteEvent,
+    ResponseCreatedEvent,
+    ResponseCreateEvent,
+    SessionUpdateEvent,
+)
 from openai.types.realtime.conversation_item import (
     RealtimeConversationItemFunctionCall,
     RealtimeConversationItemFunctionCallOutput,
@@ -167,6 +172,44 @@ def test_process_serializes_request_chat_snapshot_not_later_shared_turns():
         "later turn",
     ]
     assert [item.role for item in chat.buffer] == ["user", "assistant", "user"]
+
+
+def test_active_deletion_removes_response_already_written_by_real_backend_path():
+    prompt_queue: queue.Queue = queue.Queue()
+    cancel_scope = CancelScope()
+    service = RealtimeService(text_prompt_queue=prompt_queue, cancel_scope=cancel_scope)
+    conn_id = service.register()
+    created = service.handle_response_create(
+        conn_id,
+        ResponseCreateEvent(
+            type="response.create",
+            response={
+                "input": [
+                    {
+                        "id": "msg_rejected_echo",
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "assistant self echo"}],
+                    }
+                ]
+            },
+        ),
+    )
+    assert isinstance(created, ResponseCreatedEvent)
+    request = prompt_queue.get_nowait()
+    handler = _make_handler(stream=False, cancel_scope=cancel_scope)
+
+    list(handler.process(request))
+    assert [item.role for item in service._state(conn_id).runtime_config.chat.buffer] == ["user", "assistant"]
+
+    deleted = service.handle_conversation_item_delete(
+        conn_id,
+        ConversationItemDeleteEvent(type="conversation.item.delete", item_id="msg_rejected_echo"),
+    )
+
+    assert [event.type for event in deleted] == ["conversation.item.deleted", "response.done"]
+    assert service._state(conn_id).runtime_config.chat.buffer == []
+    service.unregister(conn_id)
 
 
 def test_cancelled_queued_request_cannot_start_after_private_barrier_ready():

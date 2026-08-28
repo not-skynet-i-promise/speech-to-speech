@@ -7,6 +7,7 @@ from openai.types.responses import ResponseFunctionToolCall
 
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.LLM.lm_output_processor import LMOutputProcessor
+from speech_to_speech.pipeline.events import ResponseFailedEvent
 from speech_to_speech.pipeline.messages import (
     AssistantTextPart,
     AssistantToolCallPart,
@@ -43,6 +44,28 @@ def test_latest_end_of_response_is_forwarded_to_tts():
     assert len(outputs) == 1
     assert outputs[0].turn_id == "turn_1"
     assert outputs[0].turn_revision == 1
+
+
+def test_failed_response_side_channel_preserves_cancel_generation():
+    tracker = SpeculativeTurnTracker()
+    tracker.observe("turn_1", 0)
+    processor = _processor(tracker)
+
+    outputs = list(
+        processor.process(
+            EndOfResponse(
+                turn_id="turn_1",
+                turn_revision=0,
+                cancel_generation=7,
+                error="provider failed",
+            )
+        )
+    )
+
+    assert len(outputs) == 1 and outputs[0].cancel_generation == 7
+    failure = processor.text_output_queue.get_nowait()
+    assert isinstance(failure, ResponseFailedEvent)
+    assert failure.cancel_generation == 7
 
 
 def test_cancel_generation_is_forwarded_to_tts():

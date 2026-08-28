@@ -61,7 +61,7 @@ flowchart LR
 | `session.update` | Deep-merge session config (instructions, tools, voice, turn detection, audio format). |
 | `conversation.item.create` | Inject `input_text` or `function_call_output` into the LLM context without triggering generation. |
 | `conversation.item.delete` | Delete one exact protocol-visible user item. An input-audio item ID removes its mapped transcript and cancels only a queued or active response owned by that turn. |
-| `response.create` | Trigger LLM generation. Supports per-response `instructions` and `tool_choice` overrides. |
+| `response.create` | Trigger LLM generation. Supports per-response `instructions` and `tool_choice` overrides; rejected while any automatic or explicit response is active or pending. |
 | `response.cancel` | Cancel the in-progress response and re-enable listening. |
 
 `turn_detection.create_response` defaults to `true` when omitted or `null`.
@@ -81,7 +81,7 @@ should begin.
 | `conversation.item.deleted` | Acknowledges an exact user-item deletion only after the live or compacted history no longer contains that item. |
 | `conversation.item.input_audio_transcription.delta` | Streaming partial transcript (when live transcription is enabled). |
 | `conversation.item.input_audio_transcription.completed` | Final transcript for the user turn (with duration usage). |
-| `response.created` | Emitted before the first assistant output part or outbound audio chunk, whichever arrives first (response is `in_progress`). |
+| `response.created` | Emitted before the first assistant output part or outbound audio chunk, whichever arrives first, or immediately before `response.done` for a successful zero-output response (response is `in_progress`). |
 | `response.output_audio.delta` | Base64 PCM audio chunk from TTS. |
 | `response.output_audio.done` | Audio stream complete for the current output item; emitted only after at least one `response.output_audio.delta`. |
 | `response.output_audio_transcript.done` | Full assistant text transcript for the turn. |
@@ -279,7 +279,7 @@ Barge-in (user speaks while the assistant is playing audio) is handled cooperati
 - **Generation counter** (`cancel_scope.generation`): each response request is stamped when it enters the LLM queue, and pipeline threads carry that generation through LLM and TTS while checking `cancel_scope.is_stale(gen)` on every streaming token. When `cancel()` is called, the generation increments, so both already-running work and a prior request dequeued only afterward are stale before provider execution -- no timing games required.
 - **Discard flag** (`cancel_scope.discarding`): set by `cancel()`, checked by the async `_send_loop` to drop output from superseded generations that arrives between `cancel()` and `response_done()`. Cleared by `response_done(generation)` (only when the sentinel's generation matches the discarded or current one -- sentinels from unrelated older generations are ignored), by `new_response()` on an explicit `response.create`, or by `reset()` on session claim/release.
 
-Pipeline output is **generation-tagged**: `AudioOutput` chunks and `AssistantTextEvent`s carry a `cancel_generation` field stamped by the handler that produced them. The send loop's `_generation_is_discardable` drops an item if its generation is stale, or if `discarding` is set and the item is not from the current generation. Output from the *current* generation always passes through, so a fresh response is never swallowed by a lingering discard window (e.g. a superseded speculative turn whose TTS never emitted a `__RESPONSE_DONE__` sentinel).
+Pipeline output is **generation-tagged**: `AudioOutput` chunks, `AssistantTextEvent`s, and response failures carry a `cancel_generation` field stamped by the handler that produced them. The send loop drops stale audio/assistant output, and the service rejects a failure that does not own the active generation. Output from the *current* generation always passes through, so a fresh response is never swallowed or failed by a superseded turn (e.g. a speculative turn whose TTS never emitted a `__RESPONSE_DONE__` sentinel).
 
 ```mermaid
 sequenceDiagram

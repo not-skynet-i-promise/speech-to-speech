@@ -2028,6 +2028,37 @@ class TestHandleResponseCreate:
         assert isinstance(err, RealtimeErrorEvent)
         assert err.error.type == "conversation_already_has_active_response"
 
+    def test_response_create_rejects_pending_implicit_fifo_without_mutation(self):
+        prompt_queue = Queue()
+        tracker = SpeculativeTurnTracker()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            speculative_turns=tracker,
+            cancel_scope=CancelScope(),
+        )
+        conn_id = service.register()
+        for turn_id in ("turn_a", "turn_b"):
+            service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id=turn_id, turn_revision=0, interrupt_response=False),
+            )
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(transcript=turn_id, turn_id=turn_id, turn_revision=0),
+            )
+
+        rejected = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+
+        state = service._state(conn_id)
+        assert isinstance(rejected, RealtimeErrorEvent)
+        assert rejected.error.type == "conversation_already_has_active_response"
+        assert state.response_pending and not state.in_response
+        assert state.pending_response_turn_id == "turn_a"
+        assert [request.turn_id for request in state.deferred_response_requests] == ["turn_b"]
+        assert prompt_queue.get_nowait().turn_id == "turn_a"
+        assert prompt_queue.empty()
+        service.unregister(conn_id)
+
     def test_response_create_stores_overrides(self, service, conn_id, runtime_config, text_prompt_queue):
         evt = ResponseCreateEvent(
             type="response.create",
@@ -2061,6 +2092,7 @@ class TestHandleResponseCreate:
         assert initial_req.turn_id == "turn_1"
         assert initial_req.turn_revision == 2
         assert initial_req.speech_stopped_at_s == 123.0
+        service.finish_response(conn_id)
 
         result = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
 
@@ -2238,6 +2270,7 @@ class TestHandleResponseCreate:
             ),
         )
         text_prompt_queue.get()  # drain the STT-triggered request
+        service.finish_response(conn_id)
 
         result = service.handle_response_create(
             conn_id, ResponseCreateEvent(type="response.create", response={"conversation": "none"})
@@ -3816,11 +3849,45 @@ class TestDispatchPipelineEvent:
 
     # -- response_failed --
 
+    def test_zero_output_success_emits_created_and_done_for_pending_response(self):
+        prompt_queue = Queue()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            speculative_turns=SpeculativeTurnTracker(),
+            cancel_scope=CancelScope(),
+        )
+        conn_id = service.register()
+        for turn_id, transcript in (("turn_empty", "empty response"), ("turn_successor", "next response")):
+            service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id=turn_id, turn_revision=0, interrupt_response=False),
+            )
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(transcript=transcript, turn_id=turn_id, turn_revision=0),
+            )
+        request = prompt_queue.get_nowait()
+        assert request.turn_id == "turn_empty"
+
+        events = service.finish_response(conn_id)
+
+        assert [event.type for event in events] == ["response.created", "response.done"]
+        assert events[0].response.id == events[1].response.id
+        assert events[1].response.status == "completed"
+        state = service._state(conn_id)
+        successor = prompt_queue.get_nowait()
+        assert successor.turn_id == "turn_successor"
+        assert not state.in_response and state.response_pending
+        assert state.pending_response_request is successor
+        service.unregister(conn_id)
+
     def test_response_failed_emits_error_and_failed_done(self, service, conn_id):
         service.response._ensure_response(conn_id)
+        generation = service.cancel_scope.generation
+        service._state(conn_id).active_response_cancel_generation = generation
         events = service.dispatch_pipeline_event(
             conn_id,
-            ResponseFailedEvent(message="input must not be empty"),
+            ResponseFailedEvent(message="input must not be empty", cancel_generation=generation),
         )
         # A top-level error event carries the reason (response.done can't). The
         # response stays active until its normal terminal sentinel reaches the
@@ -3848,6 +3915,7 @@ class TestDispatchPipelineEvent:
             cancel_scope=CancelScope(),
         )
         conn_id = service.register()
+        failed_request = None
         for turn_id, transcript in (("turn_failed", "first"), ("turn_successor", "second")):
             service.dispatch_pipeline_event(
                 conn_id,
@@ -3858,7 +3926,10 @@ class TestDispatchPipelineEvent:
                 TranscriptionCompletedEvent(transcript=transcript, turn_id=turn_id, turn_revision=0),
             )
             if turn_id == "turn_failed":
-                assert prompt_queue.get_nowait().turn_id == turn_id
+                failed_request = prompt_queue.get_nowait()
+                assert failed_request.turn_id == turn_id
+
+        assert failed_request is not None
 
         state = service._state(conn_id)
         assert state.response_pending
@@ -3866,7 +3937,12 @@ class TestDispatchPipelineEvent:
 
         failure_events = service.dispatch_pipeline_event(
             conn_id,
-            ResponseFailedEvent(message="provider failed", turn_id="turn_failed", turn_revision=0),
+            ResponseFailedEvent(
+                message="provider failed",
+                turn_id="turn_failed",
+                turn_revision=0,
+                cancel_generation=failed_request.cancel_generation,
+            ),
         )
 
         assert len(failure_events) == 2
@@ -3898,6 +3974,7 @@ class TestDispatchPipelineEvent:
             cancel_scope=CancelScope(),
         )
         conn_id = service.register()
+        old_request = None
         for turn_id in ("turn_old", "turn_successor"):
             service.dispatch_pipeline_event(
                 conn_id,
@@ -3908,11 +3985,13 @@ class TestDispatchPipelineEvent:
                 TranscriptionCompletedEvent(transcript=turn_id, turn_id=turn_id, turn_revision=0),
             )
             if turn_id == "turn_old":
-                prompt_queue.get_nowait()
+                old_request = prompt_queue.get_nowait()
                 service.dispatch_pipeline_event(
                     conn_id,
                     AssistantTextEvent(text="old reply", turn_id=turn_id, turn_revision=0),
                 )
+
+        assert old_request is not None
 
         service.finish_response(conn_id)
         successor = prompt_queue.get_nowait()
@@ -3922,7 +4001,76 @@ class TestDispatchPipelineEvent:
 
         events = service.dispatch_pipeline_event(
             conn_id,
-            ResponseFailedEvent(message="late old failure", turn_id="turn_old", turn_revision=0),
+            ResponseFailedEvent(
+                message="late old failure",
+                turn_id="turn_old",
+                turn_revision=0,
+                cancel_generation=old_request.cancel_generation,
+            ),
+        )
+
+        assert events == []
+        assert state.response_pending and not state.in_response
+        assert state.pending_response_turn_id == "turn_successor"
+        assert not state.response_failure_pending
+        service.unregister(conn_id)
+
+    def test_idless_late_cancelled_failure_cannot_poison_successor(self):
+        prompt_queue = Queue()
+        cancel_scope = CancelScope()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            speculative_turns=SpeculativeTurnTracker(),
+            cancel_scope=cancel_scope,
+        )
+        conn_id = service.register()
+        created = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": "msg_explicit_old",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "old explicit"}],
+                        }
+                    ]
+                },
+            ),
+        )
+        assert isinstance(created, ResponseCreatedEvent)
+        old_request = prompt_queue.get_nowait()
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_successor", turn_revision=0, interrupt_response=False),
+        )
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(
+                transcript="successor",
+                turn_id="turn_successor",
+                turn_revision=0,
+            ),
+        )
+
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="msg_explicit_old"),
+        )
+        successor = prompt_queue.get_nowait()
+        state = service._state(conn_id)
+        assert successor.turn_id == "turn_successor"
+        assert state.response_pending and not state.in_response
+        assert successor.cancel_generation != old_request.cancel_generation
+
+        events = service.dispatch_pipeline_event(
+            conn_id,
+            ResponseFailedEvent(
+                message="late id-less old failure",
+                cancel_generation=old_request.cancel_generation,
+            ),
         )
 
         assert events == []
@@ -3945,11 +4093,13 @@ class TestDispatchPipelineEvent:
         state.runtime_config.transcript_barrier_version = 1
         state.runtime_config.transcript_barrier_nonce = "ab" * 32
         service.response._ensure_response(conn_id)
+        generation = service.cancel_scope.generation
+        state.active_response_cancel_generation = generation
 
         with caplog.at_level(logging.INFO):
             events = service.dispatch_pipeline_event(
                 conn_id,
-                ResponseFailedEvent(message=canary),
+                ResponseFailedEvent(message=canary, cancel_generation=generation),
             )
 
         error = events[0]

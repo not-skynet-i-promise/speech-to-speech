@@ -41,12 +41,16 @@ class ResponseHandler(RealtimeBaseHandler):
         """Ensure a response and output item exist, creating them if needed."""
         st = self._state(conn_id)
         if st.current_response_id is None:
+            active_request = st.pending_response_request
             successor = self.pop_next_deferred_request(conn_id)
             st.current_response_id = _generate_id("resp")
             self._start_item(conn_id)
             st.in_response = True
             st.active_response_turn_id = st.pending_response_turn_id
             st.active_response_turn_revision = st.pending_response_turn_revision
+            st.active_response_cancel_generation = (
+                active_request.cancel_generation if active_request is not None else None
+            )
             st.active_response_input_item_id = (
                 st.turn_input_item_ids.get(st.active_response_turn_id)
                 if st.active_response_turn_id is not None
@@ -120,6 +124,7 @@ class ResponseHandler(RealtimeBaseHandler):
         st.deferred_response_requests.clear()
         st.active_response_turn_id = None
         st.active_response_turn_revision = None
+        st.active_response_cancel_generation = None
         st.active_response_input_item_id = None
         st.active_response_input_item_ids.clear()
         st.response_failure_pending = False
@@ -250,7 +255,7 @@ class ResponseHandler(RealtimeBaseHandler):
                     message="Only string tool_choice values are supported for now (auto, required, none).",
                     _type="tool_choice_not_supported",
                 )
-        if st.in_response or (st.response_pending and st.runtime_config.home_assistant_guard_operational):
+        if st.in_response or st.response_pending:
             return self.make_error(
                 message="Cannot create response while another response is in progress.",
                 _type="conversation_already_has_active_response",
@@ -328,8 +333,10 @@ class ResponseHandler(RealtimeBaseHandler):
         st.pending_response_request = None
         st.pending_response_enqueued = False
         st.deferred_response_requests.clear()
+        active_generation = self._service.cancel_scope.generation if self._service.cancel_scope else None
         st.active_response_turn_id = None if out_of_band else st.response_context_turn_id
         st.active_response_turn_revision = None if out_of_band else st.response_context_turn_revision
+        st.active_response_cancel_generation = active_generation
         st.active_response_input_item_id = None if out_of_band else st.response_context_input_item_id
         st.active_response_input_item_ids = set() if out_of_band else set(st.response_context_input_item_ids)
 
@@ -359,7 +366,7 @@ class ResponseHandler(RealtimeBaseHandler):
                     turn_id=None if out_of_band else st.response_context_turn_id,
                     turn_revision=None if out_of_band else st.response_context_turn_revision,
                     speech_stopped_at_s=None if out_of_band else st.response_context_speech_stopped_at_s,
-                    cancel_generation=(self._service.cancel_scope.generation if self._service.cancel_scope else None),
+                    cancel_generation=active_generation,
                 )
             )
         logger.debug("response.create received, LLM generation triggered")
@@ -412,6 +419,15 @@ class ResponseHandler(RealtimeBaseHandler):
             elif st.response_pending:
                 deferred_requests.extend(st.deferred_response_requests)
         events: list[ServerEvent] = []
+        if not st.in_response and st.response_pending:
+            self._ensure_response(conn_id)
+            events.append(
+                ResponseCreatedEvent(
+                    type="response.created",
+                    event_id=self._next_event_id(),
+                    response=self._build_response(conn_id, "in_progress"),
+                )
+            )
         if st.in_response:
             resp_id, item_id = self._ensure_response(conn_id)
             if response_wants_audio(st.current_response_params) and st.audio_output_started:

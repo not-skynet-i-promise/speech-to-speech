@@ -231,6 +231,7 @@ class ConnState(BaseModel):
     deferred_response_requests: list[GenerateResponseRequest] = Field(default_factory=list)
     active_response_turn_id: Optional[str] = None
     active_response_turn_revision: Optional[int] = None
+    active_response_cancel_generation: Optional[int] = None
     active_response_input_item_id: Optional[str] = None
     active_response_input_item_ids: set[str] = Field(default_factory=set)
     # A provider failure is surfaced on the text side-channel before its normal
@@ -1142,6 +1143,23 @@ class RealtimeService:
         owner_turn_revision = (
             state.active_response_turn_revision if state.in_response else state.pending_response_turn_revision
         )
+        owner_generation = (
+            state.active_response_cancel_generation
+            if state.in_response
+            else (
+                state.pending_response_request.cancel_generation if state.pending_response_request is not None else None
+            )
+        )
+        if event.cancel_generation is not None and event.cancel_generation != owner_generation:
+            logger.debug(
+                "Ignoring response failure for non-active generation=%s (owner=%s)",
+                event.cancel_generation,
+                owner_generation,
+            )
+            return []
+        if event.cancel_generation is None and self.cancel_scope is not None:
+            logger.debug("Ignoring uncorrelated response failure while generation tracking is active")
+            return []
         if event.turn_id is not None:
             if event.turn_id != owner_turn_id or (
                 event.turn_revision is not None

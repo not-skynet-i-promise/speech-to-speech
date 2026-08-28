@@ -419,9 +419,25 @@ class TestAddItem:
         chat.add_response_item(_fc("orphan"), after_user_id=user.id)
         assert chat.remove_user_message(user.id)
 
-        with pytest.raises(ChatItemError, match="owning user turn"):
+        with pytest.raises(ChatItemError, match="No function_call"):
             chat.add_item(_fco("orphan", "must not survive"))
         assert chat.buffer == []
+
+    def test_user_deletion_removes_already_committed_owned_response_items(self):
+        chat = Chat(size=5)
+        user = chat.add_item(_user("rejected self echo"))
+        assert user.id is not None
+        chat.add_response_item(_assistant("derived answer"), after_user_id=user.id)
+        chat.add_response_item(_fc("derived"), after_user_id=user.id)
+        chat.add_item(_fco("derived", "derived result"))
+        chat.add_item(_user("later valid turn"))
+
+        assert chat.remove_user_message(user.id)
+
+        assert [(item.role, item.content[0].text) for item in chat.buffer] == [("user", "later valid turn")]
+        assert chat._pending_tool_calls == {}
+        assert chat._pending_tool_call_anchors == {}
+        assert chat._response_item_owners == {}
 
     # -- System message --
 
@@ -1363,6 +1379,29 @@ class TestCompaction:
         assert "assistant-1" in texts
         assert "user-2" in texts
         assert "summary-user" not in texts
+
+    def test_compacted_deletion_removes_owned_response_output(self):
+        chat = Chat(size=2)
+        users = []
+        for index in range(3):
+            user = chat.add_item(make_user_message(f"user-{index}"))
+            assert user.id is not None
+            chat.mark_user_message_deletable(user.id)
+            users.append(user)
+            chat.add_response_item(make_assistant_message(f"assistant-{index}"), after_user_id=user.id)
+
+        chat.trim_if_needed(_make_stub_compactor("summary-user", "summary-assistant"))
+        _wait_thread(chat)
+
+        assert chat.remove_user_message(users[0].id)
+
+        texts = [
+            part.text for item in chat.buffer for part in getattr(item, "content", []) if getattr(part, "text", None)
+        ]
+        assert "user-0" not in texts
+        assert "assistant-0" not in texts
+        assert "user-1" in texts
+        assert "assistant-1" in texts
 
     def test_nested_compaction_delete_reapplies_chat_bound_before_next_snapshot(self):
         chat = Chat(size=2)

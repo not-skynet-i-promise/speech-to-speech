@@ -1542,8 +1542,16 @@ class TestSendLoop:
             runtime_config=state.runtime_config,
             turn_id="turn_failed",
             turn_revision=0,
+            cancel_generation=cancel_scope.generation,
         )
-        text_output_queue.put(ResponseFailedEvent(message="provider failed", turn_id="turn_failed", turn_revision=0))
+        text_output_queue.put(
+            ResponseFailedEvent(
+                message="provider failed",
+                turn_id="turn_failed",
+                turn_revision=0,
+                cancel_generation=cancel_scope.generation,
+            )
+        )
         ws = _FakeWebSocket()
 
         asyncio.run(router_module._drain_pending_response_events(ws, unit, conn_id))
