@@ -2265,6 +2265,38 @@ class TestHandleConversationItemDelete:
         assert state.admitting_response_input_item_ids == set()
         service.unregister(conn_id)
 
+    def test_response_input_dependencies_reserve_one_new_turn_slot(self, monkeypatch):
+        import speech_to_speech.api.openai_realtime.service as service_module
+
+        monkeypatch.setattr(service_module, "MAX_TRACKED_PROTOCOL_ITEMS", 2)
+        service = RealtimeService(text_prompt_queue=Queue(), cancel_scope=CancelScope())
+        conn_id = service.register()
+
+        rejected = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": f"msg_input_{index}",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": str(index)}],
+                        }
+                        for index in range(2)
+                    ]
+                },
+            ),
+        )
+
+        state = service._state(conn_id)
+        assert isinstance(rejected, RealtimeErrorEvent)
+        assert rejected.error.type == "invalid_input_item"
+        assert state.runtime_config.chat.buffer == []
+        assert state.protocol_item_ids == []
+        service.unregister(conn_id)
+
     def test_protocol_retirement_prunes_completed_response_context(self, monkeypatch):
         import speech_to_speech.api.openai_realtime.service as service_module
 
@@ -2638,6 +2670,73 @@ class TestHandleConversationItemDelete:
         )
         assert deleted_again[0].type == "conversation.item.deleted"
         assert state.runtime_config.chat.user_message("msg_reused_audio") is None
+
+    def test_deferred_user_reusing_deleted_audio_id_can_be_deleted_before_flush(self):
+        service = RealtimeService(text_prompt_queue=Queue(), cancel_scope=CancelScope())
+        conn_id = service.register()
+        started = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_old_audio", turn_revision=0),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(
+                transcript="old audio transcript",
+                turn_id="turn_old_audio",
+                turn_revision=0,
+            ),
+        )
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=started.item_id),
+        )
+        state = service._state(conn_id)
+        assert started.item_id in state.audio_input_item_ids
+        assert started.item_id in state.deleted_input_item_ids
+
+        active = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": "msg_active_owner",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "active"}],
+                        }
+                    ]
+                },
+            ),
+        )
+        assert isinstance(active, ResponseCreatedEvent)
+        deferred = service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": started.item_id,
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "replacement"}],
+                },
+            ),
+        )
+        assert deferred == []
+        assert started.item_id not in state.audio_input_item_ids
+        assert [item.id for item in state.deferred_items] == [started.item_id]
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=started.item_id),
+        )
+
+        assert [event.type for event in deleted] == ["conversation.item.deleted"]
+        assert state.deferred_items == []
+        service.finish_response(conn_id)
+        assert state.runtime_config.chat.user_message(started.item_id) is None
+        service.unregister(conn_id)
 
     def test_untranscribed_audio_delete_never_removes_the_prior_turn(self, service, conn_id):
         st = service._state(conn_id)

@@ -62,6 +62,12 @@ class ConversationHandler(RealtimeBaseHandler):
                     "function_call_output": "fco",
                 }.get(event.item.type, "sys" if getattr(event.item, "role", None) == "system" else "msg")
                 event.item.id = _generate_id(prefix)
+            if event.item.id is not None:
+                # A deleted audio identity remains tombstoned for late STT
+                # events. Once a new deferred client item legally claims that
+                # protocol ID, deletion must address the new item rather than
+                # the stale audio placeholder even before deferred chat commit.
+                st.retire_reused_audio_item_id(event.item.id)
             st.deferred_items.append(event.item)
             if event.item.id is not None:
                 st.reserve_deferred_protocol_item(event.item.id)

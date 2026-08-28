@@ -222,19 +222,28 @@ async def _dispatch_speech_start_locked(
     was_in_response = state.in_response
     was_response_pending = state.response_pending
     events = unit.service.dispatch_pipeline_event(session_id, event)
+    interrupted = bool(
+        events
+        and (was_in_response or was_response_pending)
+        and event.interrupt_response
+        and state.runtime_config.interrupt_response_enabled
+    )
+    if interrupted:
+        # The service closes the old response synchronously above. Complete the
+        # matching cancellation boundary before the first await so a concurrent
+        # response.create cannot enter during outbound I/O and then be cancelled
+        # as though it belonged to the interrupted response.
+        unit.cancel_scope.cancel()
+        unit.service.response.clear_pending_requests(session_id)
+        _flush_queue(unit.output_queue, preserve=_keep_audio_sentinel)
+        _flush_queue(unit.text_output_queue, preserve=_keep_user_text_event)
+        unit.response_playing.clear()
     if ws is not None and events:
         await _send_events_unlocked(ws, events)
-    if not events or not (was_in_response or was_response_pending):
+    if not interrupted:
+        if events and (was_in_response or was_response_pending):
+            logger.info("Pipeline %d: speech during response: interrupt_response disabled, ignoring", unit.index)
         return False
-    if not event.interrupt_response or not state.runtime_config.interrupt_response_enabled:
-        logger.info("Pipeline %d: speech during response: interrupt_response disabled, ignoring", unit.index)
-        return False
-
-    unit.cancel_scope.cancel()
-    unit.service.response.clear_pending_requests(session_id)
-    _flush_queue(unit.output_queue, preserve=_keep_audio_sentinel)
-    _flush_queue(unit.text_output_queue, preserve=_keep_user_text_event)
-    unit.response_playing.clear()
     logger.info(
         "Pipeline %d: speech during %s: cancelled, queue flushed",
         unit.index,

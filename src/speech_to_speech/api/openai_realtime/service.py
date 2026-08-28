@@ -271,9 +271,9 @@ class ConnState(BaseModel):
 
     @staticmethod
     def response_dependency_count_is_bounded(count: int) -> bool:
-        """Whether one response can retain this many protocol dependencies."""
+        """Whether dependencies leave room to admit one new speech item."""
 
-        return count <= MAX_TRACKED_PROTOCOL_ITEMS
+        return count < MAX_TRACKED_PROTOCOL_ITEMS
 
     def remove_response_context_input(self, item_id: str) -> None:
         """Remove one retired dependency while preserving any surviving owner."""

@@ -15,7 +15,7 @@ from queue import Empty, Queue
 from threading import Event as ThreadingEvent
 
 import pytest
-from openai.types.realtime import ResponseDoneEvent
+from openai.types.realtime import ResponseCreateEvent, ResponseDoneEvent
 from openai.types.realtime.realtime_session_create_request import RealtimeSessionCreateRequest
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketState
@@ -1262,6 +1262,78 @@ class TestSendLoop:
                     AssistantTextEvent(text="new reply", turn_id="turn_interrupt", turn_revision=0),
                 )
                 assert st.active_response_turn_id == "turn_interrupt"
+
+    def test_barge_in_cancels_before_concurrent_response_create_during_send(self, setup, monkeypatch):
+        _, service, input_queue, output_queue, text_output_queue, should_listen, _, response_playing, cancel_scope = (
+            setup
+        )
+        unit = PipelineUnit(
+            index=0,
+            service=service,
+            cancel_scope=cancel_scope,
+            should_listen=should_listen,
+            response_playing=response_playing,
+            input_queue=input_queue,
+            output_queue=output_queue,
+            text_output_queue=text_output_queue,
+            text_prompt_queue=service.text_prompt_queue,
+            handlers=[],
+        )
+        conn_id = service.register()
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_old", turn_revision=0),
+        )
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="old", turn_id="turn_old", turn_revision=0),
+        )
+        assert service.text_prompt_queue is not None
+        service.text_prompt_queue.get_nowait()
+        service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(text="old reply", turn_id="turn_old", turn_revision=0),
+        )
+        old_generation = cancel_scope.generation
+        ws = _FakeWebSocket()
+        send_entered = asyncio.Event()
+        release_send = asyncio.Event()
+        original_send = router_module._send_events_unlocked
+
+        async def pause_outbound_send(websocket, events):
+            send_entered.set()
+            await release_send.wait()
+            await original_send(websocket, events)
+
+        monkeypatch.setattr(router_module, "_send_events_unlocked", pause_outbound_send)
+
+        async def exercise_race() -> tuple[object, GenerateResponseRequest, bool]:
+            task = asyncio.create_task(
+                router_module._dispatch_speech_start_locked(
+                    ws,
+                    unit,
+                    conn_id,
+                    SpeechStartedEvent(turn_id="turn_interrupt", turn_revision=0),
+                )
+            )
+            await asyncio.wait_for(send_entered.wait(), timeout=1.0)
+            generation_after_barge_in = cancel_scope.generation
+            created = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+            request = service.text_prompt_queue.get_nowait()
+            release_send.set()
+            interrupted = await asyncio.wait_for(task, timeout=1.0)
+            assert generation_after_barge_in == old_generation + 1
+            return created, request, interrupted
+
+        created, request, interrupted = asyncio.run(exercise_race())
+
+        assert created is not None and created.type == "response.created"
+        assert interrupted
+        assert request.cancel_generation == cancel_scope.generation
+        assert request.cancel_generation is not None
+        assert not cancel_scope.is_stale(request.cancel_generation)
+        assert service._state(conn_id).in_response
+        service.unregister(conn_id)
 
     def test_speech_started_does_not_cancel_pending_when_internal_non_interrupt(self, setup):
         app, service, _, _, text_output_queue, _, _, _, cancel_scope = setup
