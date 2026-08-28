@@ -248,6 +248,10 @@ class ConnState(BaseModel):
     response_context_turn_id: Optional[str] = None
     response_context_turn_revision: Optional[int] = None
     response_context_speech_stopped_at_s: Optional[float] = None
+    # Dependency IDs preflighted for a response.input batch. They protect the
+    # batch's earlier owners while later items are still entering the bounded
+    # protocol index; the response handler clears this transient set on exit.
+    admitting_response_input_item_ids: set[str] = Field(default_factory=set)
     # Client conversation.item.create items that arrived while a response was
     # generating. Applying them mid-generation races the LLM handler's chat
     # write-back (cross-thread), so they are buffered here and flushed in order
@@ -264,6 +268,55 @@ class ConnState(BaseModel):
     turn_input_item_ids: dict[str, str] = Field(default_factory=dict)
     deleted_input_item_ids: OrderedDict[str, None] = Field(default_factory=OrderedDict)
     speculative_turn_tracker: SpeculativeTurnTracker | None = Field(default=None, exclude=True)
+
+    @staticmethod
+    def response_dependency_count_is_bounded(count: int) -> bool:
+        """Whether one response can retain this many protocol dependencies."""
+
+        return count <= MAX_TRACKED_PROTOCOL_ITEMS
+
+    def remove_response_context_input(self, item_id: str) -> None:
+        """Remove one retired dependency while preserving any surviving owner."""
+
+        if item_id not in self.response_context_input_item_ids:
+            return
+        self.response_context_input_item_ids.discard(item_id)
+        self.response_context_turn_id = None
+        self.response_context_turn_revision = None
+        self.response_context_speech_stopped_at_s = None
+        if not self.response_context_input_item_ids:
+            self.response_context_input_item_id = None
+            return
+
+        dependency_chat_ids = {
+            self.input_item_chat_ids.get(input_id, input_id) for input_id in self.response_context_input_item_ids
+        }
+        primary_chat_id = self.runtime_config.chat.latest_user_message_id(dependency_chat_ids)
+        if primary_chat_id is not None:
+            protocol_candidates = [
+                input_id
+                for input_id in self.protocol_item_ids
+                if input_id in self.response_context_input_item_ids
+                and self.input_item_chat_ids.get(input_id, input_id) == primary_chat_id
+            ]
+            self.response_context_input_item_id = (
+                protocol_candidates[-1]
+                if protocol_candidates
+                else next(
+                    (
+                        input_id
+                        for input_id in self.response_context_input_item_ids
+                        if self.input_item_chat_ids.get(input_id, input_id) == primary_chat_id
+                    ),
+                    primary_chat_id,
+                )
+            )
+            return
+
+        self.response_context_input_item_id = max(
+            self.response_context_input_item_ids,
+            key=lambda input_id: self.protocol_item_sequences.get(input_id, 0),
+        )
 
     def retire_reused_audio_item_id(self, item_id: str) -> None:
         """Drop stale audio identity before a deleted protocol ID is reused.
@@ -303,6 +356,7 @@ class ConnState(BaseModel):
             self.protocol_item_ids.append(item_id)
         while len(self.protocol_item_ids) > MAX_TRACKED_PROTOCOL_ITEMS:
             response_owner_ids = set(self.active_response_input_item_ids)
+            response_owner_ids.update(self.admitting_response_input_item_ids)
             if self.active_response_input_item_id is not None:
                 response_owner_ids.add(self.active_response_input_item_id)
             owner_turn_ids = {
@@ -342,6 +396,7 @@ class ConnState(BaseModel):
             if retirement_index is None:
                 raise RuntimeError("Live response owners exhaust the protocol item index")
             retired_item_id = self.protocol_item_ids.pop(retirement_index)
+            self.remove_response_context_input(retired_item_id)
             self.protocol_item_sequences.pop(retired_item_id, None)
             self.audio_input_item_ids.discard(retired_item_id)
             retired_chat_id = self.input_item_chat_ids.pop(retired_item_id, retired_item_id)
@@ -383,6 +438,7 @@ class ConnState(BaseModel):
     def remove_protocol_item(self, item_id: str) -> None:
         """Remove one protocol item and expose only the surviving protocol tail."""
         self.protocol_item_ids = [existing for existing in self.protocol_item_ids if existing != item_id]
+        self.remove_response_context_input(item_id)
         self.protocol_item_sequences.pop(item_id, None)
         self.last_item_id = self.protocol_item_ids[-1] if self.protocol_item_ids else None
 

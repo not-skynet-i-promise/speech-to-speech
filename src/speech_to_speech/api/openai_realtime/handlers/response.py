@@ -338,6 +338,29 @@ class ResponseHandler(RealtimeBaseHandler):
                         "duplicate_item_id",
                     )
                 seen_ids.add(item_id)
+            prospective_dependency_input_ids: set[str] = set()
+            for item in input_items:
+                if isinstance(item, RealtimeConversationItemUserMessage):
+                    if item.id is None:
+                        item.id = _generate_id("msg")
+                    prospective_dependency_input_ids.add(item.id)
+                elif isinstance(item, RealtimeConversationItemFunctionCallOutput):
+                    dependency_ids = st.runtime_config.chat.response_dependencies_for_call(item.call_id)
+                    mapped_input_ids = {
+                        input_id
+                        for input_id in st.protocol_item_ids
+                        if st.input_item_chat_ids.get(input_id, input_id) in dependency_ids
+                    }
+                    prospective_dependency_input_ids.update(mapped_input_ids or dependency_ids)
+            if not st.response_dependency_count_is_bounded(len(prospective_dependency_input_ids)):
+                if st.runtime_config.home_assistant_guard_operational:
+                    return self._service.poison_home_assistant_guard(conn_id, "invalid_input_item")
+                return self.make_client_content_error(
+                    conn_id,
+                    "Response input has too many retained user dependencies.",
+                    "invalid_input_item",
+                )
+            st.admitting_response_input_item_ids = set(prospective_dependency_input_ids)
             accepted_dependency_input_ids: set[str] = set()
             accepted_primary_input_id: str | None = None
             accepted_item_ids: list[str] = []
@@ -409,6 +432,8 @@ class ResponseHandler(RealtimeBaseHandler):
                 if st.runtime_config.home_assistant_guard_operational:
                     return self._service.poison_home_assistant_guard(conn_id, "invalid_input_item")
                 return self.make_client_content_error(conn_id, str(exc), "invalid_input_item")
+            finally:
+                st.admitting_response_input_item_ids.clear()
             # response.input is newer context than any prior audio turn. Track
             # every accepted user dependency because deletion of any one
             # invalidates the response that serialized the batch. Tool outputs
@@ -588,6 +613,11 @@ class ResponseHandler(RealtimeBaseHandler):
                 )
         elif st.response_pending:
             self.clear_pending_requests(conn_id)
+        if deferred_requests:
+            # Keep every accepted successor visible to protocol-index retirement
+            # while client items deferred behind the closing response are flushed.
+            # The list is consumed in place by the promotion loop below.
+            st.deferred_response_requests = deferred_requests
         # Apply any client items that arrived mid-generation now that in_response
         # is cleared and the generation's own write-back has landed. Done outside
         # the in_response guard so a stray terminal call still drains the buffer.
@@ -602,7 +632,10 @@ class ResponseHandler(RealtimeBaseHandler):
             # serialized against its response lease, so do not wait here.
             if not cfg.private_protocol_failed:
                 events.extend(self._service.conversation.flush_deferred_items(conn_id))
-        if not cfg.private_protocol_failed:
+        if cfg.private_protocol_failed:
+            self._release_request_leases(conn_id, deferred_requests)
+            st.deferred_response_requests.clear()
+        else:
             tracker = self._service.speculative_turns
             while deferred_requests:
                 deferred_request = deferred_requests.pop(0)
@@ -610,6 +643,7 @@ class ResponseHandler(RealtimeBaseHandler):
                     deferred_request.turn_id,
                     deferred_request.turn_revision,
                 ):
+                    self._release_request_leases(conn_id, [deferred_request])
                     continue
                 st.deferred_response_requests = deferred_requests
                 self.resume_pending_request(conn_id, deferred_request, enqueue=enqueue_pending)

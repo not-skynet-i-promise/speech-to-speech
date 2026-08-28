@@ -241,13 +241,6 @@ class ConversationHandler(RealtimeBaseHandler):
             st.speculative_user_turn_revision = None
             st.speculative_user_speech_stopped_at_s = None
             st.speculative_audio_duration_s = 0.0
-        if event.item_id in st.response_context_input_item_ids:
-            st.response_context_input_item_id = None
-            st.response_context_input_item_ids.clear()
-            st.response_context_turn_id = None
-            st.response_context_turn_revision = None
-            st.response_context_speech_stopped_at_s = None
-
         pending_matches = turn_id is not None and st.pending_response_turn_id == turn_id
         if turn_id is not None:
             st.deferred_response_requests = [

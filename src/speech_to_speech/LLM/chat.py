@@ -972,6 +972,33 @@ class Chat:
         with self._lock:
             return set(self._response_item_dependencies.get(item_id, set()))
 
+    def response_dependencies_for_call(self, call_id: str) -> set[str]:
+        """Return canonical user dependencies for one unresolved tool call."""
+
+        with self._lock:
+            function_call = next(
+                (
+                    item
+                    for item in self.buffer
+                    if isinstance(item, RealtimeConversationItemFunctionCall) and item.call_id == call_id
+                ),
+                self._pending_tool_calls.get(call_id),
+            )
+            if function_call is None:
+                return set()
+            dependencies = (
+                set(self._response_item_dependencies.get(function_call.id, set()))
+                if function_call.id is not None
+                else set()
+            )
+            dependencies.update(self._pending_tool_call_dependencies.get(call_id, set()))
+            owner = (
+                self._response_item_owners.get(function_call.id) if function_call.id is not None else None
+            ) or self._pending_tool_call_anchors.get(call_id)
+            if owner is not None:
+                dependencies.add(owner)
+            return dependencies
+
     def latest_user_message_id(self, candidate_ids: set[str]) -> str | None:
         """Return the last canonical user among *candidate_ids*."""
 
