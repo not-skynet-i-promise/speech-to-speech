@@ -108,6 +108,7 @@ class _Turn(BaseModel):
     turn_id: str | None
     turn_revision: int | None
     response_user_item_id: str | None
+    response_user_item_ids: set[str]
     speech_stopped_at_s: float | None
     wants_audio: bool
 
@@ -442,9 +443,17 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 # all before the chunk leaves for the client.
                 chat = turn.runtime_config.chat
                 for pending_item in state.pending:
-                    chat.add_response_item(pending_item, after_user_id=turn.response_user_item_id)
+                    chat.add_response_item(
+                        pending_item,
+                        after_user_id=turn.response_user_item_id,
+                        owner_user_ids=turn.response_user_item_ids,
+                    )
                 state.pending.clear()
-                chat.add_response_item(fc_item, after_user_id=turn.response_user_item_id)
+                chat.add_response_item(
+                    fc_item,
+                    after_user_id=turn.response_user_item_id,
+                    owner_user_ids=turn.response_user_item_ids,
+                )
         yield self._chunk(turn, tools=[item])
 
     # ── consumption ─────────────────────────────────────────────────────────--
@@ -713,7 +722,11 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                         # Tool calls (and any assistant text preceding them) were already
                         # written eagerly in _record_tool_call; only trailing items remain.
                         for item in state.pending:
-                            original_chat.add_response_item(item, after_user_id=turn.response_user_item_id)
+                            original_chat.add_response_item(
+                                item,
+                                after_user_id=turn.response_user_item_id,
+                                owner_user_ids=turn.response_user_item_ids,
+                            )
                         original_chat.strip_images(consumed_image_ids)
                         original_chat.trim_if_needed(self.compactor)
             if state.input_tokens or state.output_tokens:
@@ -826,6 +839,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             turn_id=turn_id,
             turn_revision=turn_revision,
             response_user_item_id=request.response_user_item_id,
+            response_user_item_ids=set(request.response_user_item_ids),
             speech_stopped_at_s=speech_stopped_at_s,
             wants_audio=wants_audio,
         )

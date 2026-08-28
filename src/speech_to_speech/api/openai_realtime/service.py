@@ -959,6 +959,13 @@ class RealtimeService:
                 runtime_config=cfg,
                 chat_snapshot=cfg.chat.copy(),
                 response_user_item_id=st.speculative_user_item_id,
+                response_user_item_ids=(
+                    {st.speculative_user_item_id} if st.speculative_user_item_id is not None else set()
+                ),
+                admitted_protocol_item_ids={
+                    *st.protocol_item_ids,
+                    *(item.id for item in st.deferred_items if item.id is not None),
+                },
                 language_code=event.language_code,
                 turn_id=event.turn_id,
                 turn_revision=event.turn_revision,

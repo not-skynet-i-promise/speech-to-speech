@@ -23,6 +23,7 @@ from openai.types.realtime.conversation_item_input_audio_transcription_completed
 from speech_to_speech.api.openai_realtime.handlers.base import RealtimeBaseHandler
 from speech_to_speech.LLM.chat import ChatItemError, add_supported_item, add_supported_items_atomically
 from speech_to_speech.pipeline.events import PartialTranscriptionEvent, TranscriptionCompletedEvent
+from speech_to_speech.utils.utils import _generate_id
 
 if TYPE_CHECKING:
     from speech_to_speech.api.openai_realtime.service import ServerEvent
@@ -55,6 +56,12 @@ class ConversationHandler(RealtimeBaseHandler):
         if self._item_id_exists(st, event.item):
             return [self._duplicate_item_error(conn_id, event.event_id)]
         if st.in_response:
+            if event.item.id is None:
+                prefix = {
+                    "function_call": "fc",
+                    "function_call_output": "fco",
+                }.get(event.item.type, "sys" if getattr(event.item, "role", None) == "system" else "msg")
+                event.item.id = _generate_id(prefix)
             st.deferred_items.append(event.item)
             logger.debug("Deferred conversation item until the active response completes")
             return []
@@ -109,11 +116,19 @@ class ConversationHandler(RealtimeBaseHandler):
                 isinstance(item, RealtimeConversationItemFunctionCallOutput)
                 and (owner_id := st.runtime_config.chat.response_owner_for_item(item.id)) is not None
             ):
+                dependency_ids = st.runtime_config.chat.response_dependencies_for_item(item.id) or {owner_id}
                 mapped_input_ids = [
-                    input_id for input_id in st.protocol_item_ids if st.input_item_chat_ids.get(input_id) == owner_id
+                    input_id
+                    for input_id in st.protocol_item_ids
+                    if st.input_item_chat_ids.get(input_id, input_id) in dependency_ids
                 ]
-                st.response_context_input_item_id = mapped_input_ids[-1] if mapped_input_ids else owner_id
-                st.response_context_input_item_ids = set(mapped_input_ids) or {owner_id}
+                primary_input_ids = [
+                    input_id
+                    for input_id in mapped_input_ids
+                    if st.input_item_chat_ids.get(input_id, input_id) == owner_id
+                ]
+                st.response_context_input_item_id = primary_input_ids[-1] if primary_input_ids else owner_id
+                st.response_context_input_item_ids = set(mapped_input_ids) or dependency_ids
             else:
                 st.response_context_input_item_id = None
                 st.response_context_input_item_ids.clear()
@@ -219,10 +234,13 @@ class ConversationHandler(RealtimeBaseHandler):
             st.response_context_speech_stopped_at_s = None
 
         pending_matches = turn_id is not None and st.pending_response_turn_id == turn_id
+        if turn_id is not None:
+            st.deferred_response_requests = [
+                request for request in st.deferred_response_requests if request.turn_id != turn_id
+            ]
         active_matches = (turn_id is not None and st.active_response_turn_id == turn_id) or (
             event.item_id in st.active_response_input_item_ids
         )
-        promote_successor = pending_matches and not st.in_response
         if pending_matches:
             st.response_pending = False
             st.pending_response_turn_id = None
@@ -231,6 +249,14 @@ class ConversationHandler(RealtimeBaseHandler):
             st.pending_response_enqueued = False
         if (active_matches or (pending_matches and not st.in_response)) and self._service.cancel_scope is not None:
             self._service.cancel_scope.cancel()
+        if pending_matches:
+            successor_request = self._service.response.pop_next_deferred_request(conn_id)
+            if successor_request is not None:
+                self._service.response.resume_pending_request(
+                    conn_id,
+                    successor_request,
+                    enqueue=not st.in_response and not defer_successor_enqueue,
+                )
         # Retire the deleted item before closing its response.  Closing flushes
         # items deferred during generation, and their previous_item_id must
         # never point at the item this operation just removed.
@@ -243,14 +269,6 @@ class ConversationHandler(RealtimeBaseHandler):
                 reason="client_cancelled",
                 enqueue_pending=not defer_successor_enqueue,
             )
-        elif promote_successor:
-            successor_request = self._service.response.pop_next_deferred_request(conn_id)
-            if successor_request is not None:
-                self._service.response.resume_pending_request(
-                    conn_id,
-                    successor_request,
-                    enqueue=not defer_successor_enqueue,
-                )
         if active_matches or pending_matches:
             should_listen = self._should_listen(conn_id)
             if should_listen is not None:

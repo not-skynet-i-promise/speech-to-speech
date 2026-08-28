@@ -439,6 +439,65 @@ class TestAddItem:
         assert chat._pending_tool_call_anchors == {}
         assert chat._response_item_owners == {}
 
+    def test_deleting_any_serialized_user_removes_multi_input_response_output(self):
+        chat = Chat(size=5)
+        first = chat.add_item(_user("first input"))
+        second = chat.add_item(_user("second input"))
+        assert first.id is not None and second.id is not None
+        dependencies = {first.id, second.id}
+        chat.add_response_item(
+            _assistant("combined answer"),
+            after_user_id=second.id,
+            owner_user_ids=dependencies,
+        )
+        chat.add_response_item(
+            _fc("combined"),
+            after_user_id=second.id,
+            owner_user_ids=dependencies,
+        )
+        chat.add_item(_fco("combined", "combined result"))
+
+        assert chat.remove_user_message(first.id)
+
+        texts = [
+            part.text for item in chat.buffer for part in getattr(item, "content", []) if getattr(part, "text", None)
+        ]
+        assert texts == ["second input"]
+        assert chat._pending_tool_calls == {}
+        assert chat._pending_tool_call_anchors == {}
+        assert chat._pending_tool_call_dependencies == {}
+        assert chat._response_item_owners == {}
+        assert chat._response_item_dependencies == {}
+
+    def test_hard_eviction_preserves_a_restored_turn_through_its_tool_round_trip(self):
+        chat = Chat(size=1)
+        target = chat.add_item(_user("exact queued tool request"))
+        assert target.id is not None
+        chat.mark_user_message_deletable(target.id)
+        admission = chat.copy()
+        later_ids = set()
+        for text in ("later one", "later two"):
+            later = chat.add_item(_user(text))
+            assert later.id is not None
+            later_ids.add(later.id)
+        assert chat.user_message(target.id) is None
+
+        chat.snapshot_for_response_turn(
+            target.id,
+            later_ids,
+            fallback_user=admission.user_message(target.id),
+        )
+        chat.add_response_item(_fc("restored"), after_user_id=target.id)
+        chat.trim_if_needed()
+        chat.add_item(_fco("restored", "tool result"))
+
+        assert chat.user_message(target.id) is not None
+        assert [type(item) for item in chat.buffer] == [
+            RealtimeConversationItemUserMessage,
+            RealtimeConversationItemFunctionCall,
+            RealtimeConversationItemFunctionCallOutput,
+        ]
+
     # -- System message --
 
     def test_system_message_routed_to_init_chat(self):

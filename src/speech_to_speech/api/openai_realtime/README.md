@@ -72,7 +72,11 @@ should begin.
 Automatic responses use a bounded FIFO. A speculative revision that resolves
 to an empty transcript retires its pending or active slot, and a queued turn is
 restored from exact compaction provenance (or its admission snapshot after
-lossy eviction) before it reaches the model.
+lossy eviction) before it reaches the model. Promotion preserves FIFO order,
+incorporates completed output from earlier turns, and excludes client items
+that arrived after the promoted turn was admitted. For a `response.input`
+batch, derived assistant and tool history remains deletion-owned by every user
+item serialized into that response, including through tool-result follow-ups.
 
 ### Server -> Client
 

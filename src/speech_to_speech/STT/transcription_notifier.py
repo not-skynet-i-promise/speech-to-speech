@@ -191,6 +191,7 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
                     runtime_config=self.runtime_config,
                     chat_snapshot=self.runtime_config.chat.copy(),
                     response_user_item_id=user_item.id,
+                    response_user_item_ids={user_item.id} if user_item.id is not None else set(),
                     language_code=language_code,
                     turn_id=turn_id,
                     turn_revision=turn_revision,

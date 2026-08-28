@@ -201,6 +201,14 @@ class GenerateResponseRequest(PipelineMessage):
     # queued user turns.  Without this anchor, cross-thread write-back appends
     # assistant output after users that arrived while the provider was running.
     response_user_item_id: str | None = None
+    # Every canonical user item serialized by this response. The primary ID
+    # above controls insertion order; this complete set controls fail-closed
+    # cleanup if any serialized input is later deleted.
+    response_user_item_ids: set[str] = Field(default_factory=set)
+    # Protocol items visible when this request entered the FIFO. A promoted
+    # request may incorporate output from an earlier response, but must not see
+    # client items that arrived after its own admission.
+    admitted_protocol_item_ids: set[str] | None = None
     response: RealtimeResponseCreateParams | None = None
     language_code: Optional[str] = None
     turn_id: str | None = None

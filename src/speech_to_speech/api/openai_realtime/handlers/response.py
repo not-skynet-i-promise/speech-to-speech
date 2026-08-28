@@ -395,6 +395,18 @@ class ResponseHandler(RealtimeBaseHandler):
                         if not out_of_band and st.response_context_input_item_id is not None
                         else None
                     ),
+                    response_user_item_ids=(
+                        {
+                            st.input_item_chat_ids.get(input_id, input_id)
+                            for input_id in st.response_context_input_item_ids
+                        }
+                        if not out_of_band
+                        else set()
+                    ),
+                    admitted_protocol_item_ids={
+                        *st.protocol_item_ids,
+                        *(item.id for item in st.deferred_items if item.id is not None),
+                    },
                     response=event.response,
                     turn_id=None if out_of_band else st.response_context_turn_id,
                     turn_revision=None if out_of_band else st.response_context_turn_revision,
@@ -462,6 +474,14 @@ class ResponseHandler(RealtimeBaseHandler):
                 )
             )
         if st.in_response:
+            active_response_user_id = (
+                st.input_item_chat_ids.get(
+                    st.active_response_input_item_id,
+                    st.active_response_input_item_id,
+                )
+                if st.active_response_input_item_id is not None
+                else None
+            )
             resp_id, item_id = self._ensure_response(conn_id)
             if response_wants_audio(st.current_response_params) and st.audio_output_started:
                 events.append(
@@ -495,6 +515,10 @@ class ResponseHandler(RealtimeBaseHandler):
                 )
             )
             self._end_response(conn_id, status)
+            st.runtime_config.chat.release_response_turn(
+                active_response_user_id,
+                force=status != "completed",
+            )
         elif st.response_pending:
             self.clear_pending_requests(conn_id)
         # Apply any client items that arrived mid-generation now that in_response
@@ -547,6 +571,12 @@ class ResponseHandler(RealtimeBaseHandler):
             later_chat_id = st.input_item_chat_ids.get(later_input_id)
             if later_chat_id is not None:
                 later_chat_ids.add(later_chat_id)
+        future_protocol_ids = (
+            set(st.protocol_item_ids) - request.admitted_protocol_item_ids
+            if request.admitted_protocol_item_ids is not None
+            else set()
+        )
+        future_chat_ids = {st.input_item_chat_ids.get(item_id, item_id) for item_id in future_protocol_ids}
         refreshed_chat = (
             st.runtime_config.chat.snapshot_for_response_turn(
                 target_chat_id,
@@ -554,6 +584,10 @@ class ResponseHandler(RealtimeBaseHandler):
                 fallback_user=(
                     request.chat_snapshot.user_message(target_chat_id) if request.chat_snapshot is not None else None
                 ),
+                fallback_init_message=(
+                    request.chat_snapshot.init_chat_message if request.chat_snapshot is not None else None
+                ),
+                excluded_item_ids=future_chat_ids,
             )
             if target_chat_id is not None
             else request.chat_snapshot

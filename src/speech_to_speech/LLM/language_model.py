@@ -818,6 +818,7 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                         original_chat.add_response_item(
                             make_assistant_message(ctx.generated_text),
                             after_user_id=request.response_user_item_id,
+                            owner_user_ids=request.response_user_item_ids,
                         )
                         for t in ctx.tools:
                             original_chat.add_response_item(
@@ -830,6 +831,7 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                                     status=t.status,
                                 ),
                                 after_user_id=request.response_user_item_id,
+                                owner_user_ids=request.response_user_item_ids,
                             )
                         original_chat.strip_images(consumed_image_ids)
                         original_chat.trim_if_needed(self.compactor)
