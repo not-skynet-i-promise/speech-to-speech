@@ -108,7 +108,18 @@ class AudioHandler(RealtimeBaseHandler):
         ):
             logger.debug("Ignoring a reopened discarded speculative turn")
             return []
-        if st.in_response and event.interrupt_response and st.runtime_config.interrupt_response_enabled:
+        interrupting_response = bool(
+            (st.in_response or st.response_pending)
+            and event.interrupt_response
+            and st.runtime_config.interrupt_response_enabled
+        )
+        if interrupting_response and self._service.cancel_scope is not None:
+            # dispatch_pipeline_event holds the transcript-state guard here.
+            # Advance the generation before closing the response so a provider
+            # writer waiting on that same guard cannot commit unheard output in
+            # the gap between response closure and router-side queue cleanup.
+            self._service.cancel_scope.cancel()
+        if st.in_response and interrupting_response:
             events.extend(
                 response.finish_response(
                     conn_id,

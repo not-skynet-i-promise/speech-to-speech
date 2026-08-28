@@ -3974,8 +3974,9 @@ class TestDispatchPipelineEvent:
         assert evt.audio_start_ms == 0
         assert evt.item_id.startswith("item_")
 
-    def test_speech_started_cancels_active_response(self, service, conn_id):
+    def test_speech_started_cancels_active_response(self, service, conn_id, cancel_scope):
         service.encode_audio_chunk(conn_id, _pcm_bytes(256))
+        generation = cancel_scope.generation
         events = service.dispatch_pipeline_event(
             conn_id,
             SpeechStartedEvent(),
@@ -3987,6 +3988,49 @@ class TestDispatchPipelineEvent:
         assert done.response.status_details.reason == "turn_detected"
         speech = [e for e in events if isinstance(e, InputAudioBufferSpeechStartedEvent)]
         assert len(speech) == 1
+        assert cancel_scope.generation == generation + 1
+
+    def test_barge_in_generation_is_stale_before_waiting_history_writer_can_commit(
+        self,
+        service,
+        conn_id,
+        cancel_scope,
+        monkeypatch,
+    ):
+        service.encode_audio_chunk(conn_id, _pcm_bytes(256))
+        state = service._state(conn_id)
+        generation = cancel_scope.generation
+        writer_ready = Event()
+        committed = Event()
+        writer_threads: list[Thread] = []
+        original_finish = service.response.finish_response
+
+        def provider_writeback():
+            writer_ready.set()
+            with state.runtime_config.transcript_barrier_state_guard():
+                if not cancel_scope.is_stale(generation):
+                    state.runtime_config.chat.add_response_item(
+                        make_assistant_message("unheard response"),
+                        after_user_id=None,
+                    )
+                    committed.set()
+
+        def finish_while_provider_waits(*args, **kwargs):
+            writer = Thread(target=provider_writeback)
+            writer_threads.append(writer)
+            writer.start()
+            assert writer_ready.wait(timeout=1.0)
+            return original_finish(*args, **kwargs)
+
+        monkeypatch.setattr(service.response, "finish_response", finish_while_provider_waits)
+
+        service.dispatch_pipeline_event(conn_id, SpeechStartedEvent())
+
+        writer_threads[0].join(timeout=1.0)
+        assert not writer_threads[0].is_alive()
+        assert cancel_scope.is_stale(generation)
+        assert not committed.is_set()
+        assert state.runtime_config.chat.buffer == []
 
     def test_speech_started_no_response_emits_only_started(self, service, conn_id):
         """speech_started without active response emits only the started event."""

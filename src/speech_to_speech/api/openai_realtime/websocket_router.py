@@ -229,11 +229,10 @@ async def _dispatch_speech_start_locked(
         and state.runtime_config.interrupt_response_enabled
     )
     if interrupted:
-        # The service closes the old response synchronously above. Complete the
-        # matching cancellation boundary before the first await so a concurrent
-        # response.create cannot enter during outbound I/O and then be cancelled
-        # as though it belonged to the interrupted response.
-        unit.cancel_scope.cancel()
+        # The service advances cancellation and closes the response together
+        # under its transcript-state guard. Complete router-owned queue cleanup
+        # before the first await so a concurrent response.create cannot enter
+        # during outbound I/O and lose successor state or output.
         unit.service.response.clear_pending_requests(session_id)
         _flush_queue(unit.output_queue, preserve=_keep_audio_sentinel)
         _flush_queue(unit.text_output_queue, preserve=_keep_user_text_event)
