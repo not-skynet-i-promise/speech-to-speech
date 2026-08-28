@@ -15,6 +15,8 @@ import pytest
 from openai.types.realtime import (
     ConversationItemCreatedEvent,
     ConversationItemCreateEvent,
+    ConversationItemDeletedEvent,
+    ConversationItemDeleteEvent,
     ConversationItemInputAudioTranscriptionCompletedEvent,
     ConversationItemInputAudioTranscriptionDeltaEvent,
     ConversationItemInputAudioTranscriptionFailedEvent,
@@ -196,6 +198,11 @@ class TestParseClientEvent:
         }
         evt = service.parse_client_event(raw)
         assert isinstance(evt, ConversationItemCreateEvent)
+
+    def test_parse_valid_conversation_item_delete(self, service):
+        raw = {"type": "conversation.item.delete", "item_id": "fc_private"}
+        evt = service.parse_client_event(raw)
+        assert isinstance(evt, ConversationItemDeleteEvent)
 
     def test_parse_valid_response_create(self, service):
         raw = {"type": "response.create"}
@@ -438,6 +445,67 @@ class TestHandleConversationItemCreate:
         assert last.content[0].text == "What is this?"
         assert last.content[1].type == "input_image"
         assert last.content[1].image_url == "data:image/png;base64,abc123"
+
+
+class TestHandleConversationItemDelete:
+    def test_delete_and_replace_function_call_without_retaining_arguments(self, service, conn_id):
+        chat = service._state(conn_id).runtime_config.chat
+        chat.add_ordered_function_call(
+            RealtimeConversationItemFunctionCall(
+                id="fc_private",
+                type="function_call",
+                call_id="call_private",
+                name="public_information",
+                arguments='{"query":"PRIVATE_ARGUMENT_SENTINEL"}',
+            )
+        )
+        service._state(conn_id).last_item_id = "fc_private"
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="fc_private"),
+        )
+        assert len(deleted) == 1
+        assert isinstance(deleted[0], ConversationItemDeletedEvent)
+        assert deleted[0].item_id == "fc_private"
+        assert service._state(conn_id).last_item_id is None
+
+        service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "type": "function_call",
+                    "call_id": "call_private",
+                    "name": "public_information",
+                    "arguments": "{}",
+                },
+            ),
+        )
+        service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "type": "function_call_output",
+                    "call_id": "call_private",
+                    "output": '{"status":"handled_out_of_band"}',
+                },
+            ),
+        )
+
+        history = "\n".join(item.model_dump_json() for item in chat.buffer)
+        assert "PRIVATE_ARGUMENT_SENTINEL" not in history
+        assert '"arguments":"{}"' in history
+        assert "handled_out_of_band" in history
+
+    def test_unknown_item_returns_error(self, service, conn_id):
+        events = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="fc_missing"),
+        )
+        assert len(events) == 1
+        assert isinstance(events[0], RealtimeErrorEvent)
 
 
 class TestDeferConversationItemsDuringResponse:

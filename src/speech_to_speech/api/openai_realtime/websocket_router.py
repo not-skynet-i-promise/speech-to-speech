@@ -11,6 +11,7 @@ import numpy as np
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from openai.types.realtime import (
     ConversationItemCreateEvent,
+    ConversationItemDeleteEvent,
     ConversationItemTruncateEvent,
     InputAudioBufferAppendEvent,
     InputAudioBufferCommitEvent,
@@ -460,6 +461,9 @@ async def _dispatch_client_event(
         events = service.handle_conversation_item_create(session_id, event)
         if events:
             await send_correlated(events)
+
+    elif isinstance(event, ConversationItemDeleteEvent):
+        await send_correlated(service.handle_conversation_item_delete(session_id, event))
 
     elif isinstance(event, ConversationItemTruncateEvent):
         # The stock Agents SDK sends this after an audible WebSocket

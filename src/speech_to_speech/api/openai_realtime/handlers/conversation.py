@@ -8,6 +8,8 @@ from openai.types.realtime import (
     ConversationItem,
     ConversationItemCreatedEvent,
     ConversationItemCreateEvent,
+    ConversationItemDeletedEvent,
+    ConversationItemDeleteEvent,
     ConversationItemInputAudioTranscriptionCompletedEvent,
     ConversationItemInputAudioTranscriptionDeltaEvent,
     ConversationItemInputAudioTranscriptionFailedEvent,
@@ -142,6 +144,25 @@ class ConversationHandler(RealtimeBaseHandler):
             logger.debug("Deferred conversation item until the active response completes")
             return []
         return self._apply_item(conn_id, event.item)
+
+    def handle_conversation_item_delete(
+        self,
+        conn_id: str,
+        event: ConversationItemDeleteEvent,
+    ) -> list[ServerEvent]:
+        """Delete one applied conversation item by its protocol ID."""
+        st = self._state(conn_id)
+        if not st.runtime_config.chat.remove_item(event.item_id):
+            return [self.make_error(f"Conversation item '{event.item_id}' was not found", "item_not_found")]
+        if st.last_item_id == event.item_id:
+            st.last_item_id = st.runtime_config.chat.buffer[-1].id if st.runtime_config.chat.buffer else None
+        return [
+            ConversationItemDeletedEvent(
+                type="conversation.item.deleted",
+                event_id=self._next_event_id(),
+                item_id=event.item_id,
+            )
+        ]
 
     def _apply_item(
         self,

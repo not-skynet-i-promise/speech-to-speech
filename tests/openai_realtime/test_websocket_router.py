@@ -261,6 +261,17 @@ class TestClientEventDispatch:
                 assert msg["type"] == "conversation.item.created"
                 assert msg["item"]["content"][0]["text"] == "ping"
 
+                ws.send_json(
+                    {
+                        "type": "conversation.item.delete",
+                        "event_id": "client_delete_1",
+                        "item_id": msg["item"]["id"],
+                    }
+                )
+                deleted = ws.receive_json()
+                assert deleted["type"] == "conversation.item.deleted"
+                assert deleted["item_id"] == msg["item"]["id"]
+
     def test_response_create_error_when_active(self, setup):
         app, service, *_ = setup
         with TestClient(app) as client:

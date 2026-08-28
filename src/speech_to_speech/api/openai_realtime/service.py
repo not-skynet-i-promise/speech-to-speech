@@ -8,6 +8,8 @@ from openai.types.realtime import (
     ConversationItem,
     ConversationItemCreatedEvent,
     ConversationItemCreateEvent,
+    ConversationItemDeletedEvent,
+    ConversationItemDeleteEvent,
     ConversationItemInputAudioTranscriptionCompletedEvent,
     ConversationItemInputAudioTranscriptionDeltaEvent,
     ConversationItemInputAudioTranscriptionFailedEvent,
@@ -90,6 +92,7 @@ _EVENT_TYPE_TO_MODEL: dict[str, type[BaseModel]] = {
     "output_audio_buffer.clear": OutputAudioBufferClearEvent,
     "session.update": SessionUpdateEvent,
     "conversation.item.create": ConversationItemCreateEvent,
+    "conversation.item.delete": ConversationItemDeleteEvent,
     "conversation.item.truncate": ConversationItemTruncateEvent,
     "response.create": ResponseCreateEvent,
     "response.cancel": ResponseCancelEvent,
@@ -101,6 +104,7 @@ ClientEvent = Union[
     OutputAudioBufferClearEvent,
     SessionUpdateEvent,
     ConversationItemCreateEvent,
+    ConversationItemDeleteEvent,
     ConversationItemTruncateEvent,
     ResponseCreateEvent,
     ResponseCancelEvent,
@@ -113,6 +117,7 @@ ServerEvent = Union[
     InputAudioBufferSpeechStartedEvent,
     InputAudioBufferSpeechStoppedEvent,
     ConversationItemCreatedEvent,
+    ConversationItemDeletedEvent,
     ConversationItemInputAudioTranscriptionDeltaEvent,
     ConversationItemInputAudioTranscriptionCompletedEvent,
     ConversationItemInputAudioTranscriptionFailedEvent,
@@ -496,6 +501,11 @@ class RealtimeService:
         events = self.conversation.handle_conversation_item_create(conn_id, event)
         self.response.maybe_start_tool_followup_prefetch(conn_id)
         return events
+
+    def handle_conversation_item_delete(self, conn_id: str, event: ConversationItemDeleteEvent) -> list[ServerEvent]:
+        if self._state(conn_id).tool_followup_prefetch_request is not None:
+            self.response.discard_tool_followup_prefetch(conn_id)
+        return self.conversation.handle_conversation_item_delete(conn_id, event)
 
     def dispatch_pipeline_event(self, conn_id: str, event: PipelineEvent) -> list[ServerEvent]:
         """Route an internal pipeline event to the appropriate handler."""

@@ -417,6 +417,31 @@ class Chat:
                 return True
         return False
 
+    def remove_item(self, item_id: str) -> bool:
+        """Remove one item and its pending-call bookkeeping by protocol ID."""
+        with self._lock:
+            if self.init_chat_message is not None and self.init_chat_message.id == item_id:
+                self.init_chat_message = None
+                return True
+
+            for index, item in enumerate(self.buffer):
+                if item.id != item_id:
+                    continue
+                del self.buffer[index]
+                if isinstance(item, RealtimeConversationItemUserMessage):
+                    self._user_turn_count -= 1
+                if isinstance(item, RealtimeConversationItemFunctionCall) and item.call_id is not None:
+                    self._pending_tool_calls.pop(item.call_id, None)
+                    self._ordered_pending_call_ids.discard(item.call_id)
+                return True
+
+            for call_id, item in tuple(self._pending_tool_calls.items()):
+                if item.id == item_id:
+                    del self._pending_tool_calls[call_id]
+                    self._ordered_pending_call_ids.discard(call_id)
+                    return True
+        return False
+
     def rollback_generation(
         self,
         user_message_id: str | None,
