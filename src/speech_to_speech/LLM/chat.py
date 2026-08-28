@@ -422,6 +422,7 @@ class Chat:
         with self._lock:
             if self.init_chat_message is not None and self.init_chat_message.id == item_id:
                 self.init_chat_message = None
+                self._forget_provisional_item_locked(item_id)
                 return True
 
             for index, item in enumerate(self.buffer):
@@ -433,14 +434,50 @@ class Chat:
                 if isinstance(item, RealtimeConversationItemFunctionCall) and item.call_id is not None:
                     self._pending_tool_calls.pop(item.call_id, None)
                     self._ordered_pending_call_ids.discard(item.call_id)
+                    self._forget_provisional_item_locked(item_id, item.call_id)
+                elif isinstance(item, RealtimeConversationItemFunctionCallOutput):
+                    call = next(
+                        (
+                            entry
+                            for entry in self.buffer
+                            if isinstance(entry, RealtimeConversationItemFunctionCall) and entry.call_id == item.call_id
+                        ),
+                        None,
+                    )
+                    if call is not None and call.call_id is not None:
+                        call.status = "in_progress"
+                        self._pending_tool_calls[call.call_id] = call
+                        self._ordered_pending_call_ids.add(call.call_id)
+                    self._forget_provisional_item_locked(item_id)
+                else:
+                    self._forget_provisional_item_locked(item_id)
                 return True
 
             for call_id, item in tuple(self._pending_tool_calls.items()):
                 if item.id == item_id:
                     del self._pending_tool_calls[call_id]
                     self._ordered_pending_call_ids.discard(call_id)
+                    self._forget_provisional_item_locked(item_id, call_id)
                     return True
         return False
+
+    def _forget_provisional_item_locked(self, item_id: str, call_id: str | None = None) -> None:
+        """Keep later rollback from deleting an item recreated after protocol deletion."""
+        for tracked_item_ids, tracked_call_ids in self._provisional_generations.values():
+            tracked_item_ids.discard(item_id)
+            if call_id is not None:
+                tracked_call_ids.discard(call_id)
+
+    def provisional_items(self, response_key: str | None) -> list[SupportedItem]:
+        """Return response-owned history items in canonical buffer order."""
+        if response_key is None:
+            return []
+        with self._lock:
+            tracked = self._provisional_generations.get(response_key)
+            if tracked is None:
+                return []
+            item_ids, _ = tracked
+            return [item for item in self.buffer if item.id in item_ids]
 
     def rollback_generation(
         self,

@@ -207,6 +207,10 @@ class ConnState(BaseModel):
     # to their originating protocol item and keep append-only state per item.
     input_item_by_turn_revision: dict[tuple[str, int | None], str] = Field(default_factory=dict)
     input_items: dict[str, InputItemState] = Field(default_factory=dict)
+    # Protocol-visible conversation order is distinct from the model Chat's
+    # storage IDs (notably for generated messages and transcribed audio).
+    conversation_item_order: list[str] = Field(default_factory=list)
+    conversation_item_chat_ids: dict[str, str] = Field(default_factory=dict)
     input_audio_duration_s: float = 0.0
     last_item_id: Optional[str] = None
     current_response_params: RealtimeResponseCreateParams | None = None
@@ -261,6 +265,20 @@ class ConnState(BaseModel):
     # frame has finished sending. Pipeline output is held behind this key so a
     # fast or already-buffered generation cannot overtake that lifecycle event.
     response_created_pending_key: str | None = None
+
+    def record_conversation_item(self, item_id: str, chat_item_id: str | None = None) -> None:
+        """Record one wire-visible item once and optionally bind its Chat ID."""
+        if item_id not in self.conversation_item_order:
+            self.conversation_item_order.append(item_id)
+        if chat_item_id is not None:
+            self.conversation_item_chat_ids[item_id] = chat_item_id
+        self.last_item_id = self.conversation_item_order[-1]
+
+    def forget_conversation_item(self, item_id: str) -> None:
+        """Remove one wire-visible item and restore the surviving tail."""
+        self.conversation_item_order = [known_id for known_id in self.conversation_item_order if known_id != item_id]
+        self.conversation_item_chat_ids.pop(item_id, None)
+        self.last_item_id = self.conversation_item_order[-1] if self.conversation_item_order else None
 
     def mark_response_pending(self, response_key: str) -> None:
         """Track an implicit response from queueing until its first output."""
@@ -672,6 +690,9 @@ class RealtimeService:
         elif event.turn_id is not None and event.turn_id != st.speculative_user_turn_id:
             st.speculative_user_item_id = None
 
+        if transcript and st.speculative_user_item_id is not None:
+            st.record_conversation_item(completed_events[0].item_id, st.speculative_user_item_id)
+
         if event.turn_id is not None:
             st.speculative_user_turn_id = event.turn_id
             st.speculative_user_turn_revision = event.turn_revision
@@ -826,12 +847,16 @@ class RealtimeService:
 
     # ── Error ───────────────────────────────────
 
-    def make_error(self, message: str, _type: str) -> RealtimeErrorEvent:
+    def make_error(self, message: str, _type: str, client_event_id: str | None = None) -> RealtimeErrorEvent:
         self.total_usage.record_error(_type)
-        return build_error_event(message, _type)
+        return build_error_event(message, _type, client_event_id)
 
 
-def build_error_event(message: str, error_type: str) -> RealtimeErrorEvent:
+def build_error_event(
+    message: str,
+    error_type: str,
+    client_event_id: str | None = None,
+) -> RealtimeErrorEvent:
     """Construct a RealtimeErrorEvent without touching any service-instance state.
 
     Used by the websocket route handler on pool rejection, where no unit's
@@ -839,6 +864,6 @@ def build_error_event(message: str, error_type: str) -> RealtimeErrorEvent:
     """
     return RealtimeErrorEvent(
         type="error",
-        error=RealtimeError(message=message, type=error_type),
+        error=RealtimeError(message=message, type=error_type, event_id=client_event_id),
         event_id=_generate_id("event"),
     )

@@ -502,10 +502,211 @@ class TestHandleConversationItemDelete:
     def test_unknown_item_returns_error(self, service, conn_id):
         events = service.handle_conversation_item_delete(
             conn_id,
-            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="fc_missing"),
+            ConversationItemDeleteEvent(
+                type="conversation.item.delete",
+                event_id="event_delete_missing",
+                item_id="fc_missing",
+            ),
         )
         assert len(events) == 1
         assert isinstance(events[0], RealtimeErrorEvent)
+        assert events[0].error.event_id == "event_delete_missing"
+
+    def test_generated_message_deletes_by_wire_visible_id(self, service, conn_id):
+        st = service._state(conn_id)
+        recorded = st.runtime_config.chat.add_provisional_generation_items(
+            "response_generated",
+            [
+                RealtimeConversationItemAssistantMessage(
+                    type="message",
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "hello"}],
+                )
+            ],
+        )
+        assert recorded is not None
+        st.mark_response_pending("response_generated")
+        events = service.dispatch_pipeline_event(
+            conn_id,
+            AssistantOutputEvent(text="hello", response_key="response_generated"),
+        )
+        wire_item_id = next(event.item_id for event in events if isinstance(event, ResponseAudioTranscriptDeltaEvent))
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=wire_item_id),
+        )
+
+        assert isinstance(deleted[0], ConversationItemDeletedEvent)
+        assert st.runtime_config.chat.buffer == []
+
+    def test_transcribed_audio_deletes_by_wire_visible_id(self, service, conn_id):
+        started = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_delete", turn_revision=0),
+        )
+        wire_item_id = next(event.item_id for event in started if isinstance(event, InputAudioBufferSpeechStartedEvent))
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(
+                transcript="remove this turn",
+                turn_id="turn_delete",
+                turn_revision=0,
+            ),
+        )
+        assert service._state(conn_id).runtime_config.chat.buffer
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=wire_item_id),
+        )
+
+        assert isinstance(deleted[0], ConversationItemDeletedEvent)
+        assert service._state(conn_id).runtime_config.chat.buffer == []
+
+    def test_tail_delete_preserves_protocol_order_for_pending_calls(self, service, conn_id):
+        def create(item_id: str, call_id: str) -> ConversationItemCreatedEvent:
+            events = service.handle_conversation_item_create(
+                conn_id,
+                ConversationItemCreateEvent(
+                    type="conversation.item.create",
+                    item={
+                        "id": item_id,
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": "lookup",
+                        "arguments": "{}",
+                    },
+                ),
+            )
+            assert isinstance(events[0], ConversationItemCreatedEvent)
+            return events[0]
+
+        first = create("fc_1", "call_1")
+        second = create("fc_2", "call_2")
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="fc_2"),
+        )
+        third = create("fc_3", "call_3")
+
+        assert first.previous_item_id is None
+        assert second.previous_item_id == "fc_1"
+        assert third.previous_item_id == "fc_1"
+
+    def test_delete_removes_deferred_created_ack(self, service, conn_id):
+        st = service._state(conn_id)
+        st.runtime_config.chat.add_provisional_generation_items(
+            "response_origin",
+            [
+                RealtimeConversationItemFunctionCall(
+                    id="fc_origin",
+                    type="function_call",
+                    call_id="call_origin",
+                    name="lookup",
+                    arguments="{}",
+                )
+            ],
+        )
+        st.in_response = True
+        st.current_response_key = "response_origin"
+        service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "fco_pending",
+                    "type": "function_call_output",
+                    "call_id": "call_origin",
+                    "output": "result",
+                },
+            ),
+        )
+        service.conversation.flush_deferred_items(
+            conn_id,
+            tool_followup_inputs_only=True,
+            defer_acknowledgements=True,
+        )
+        assert [item.id for item in st.pending_item_acks] == ["fco_pending"]
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="fco_pending"),
+        )
+
+        assert isinstance(deleted[0], ConversationItemDeletedEvent)
+        assert service.conversation.flush_pending_item_acks(conn_id) == []
+
+    def test_delete_function_output_restores_pending_call_guard(self, service, conn_id):
+        st = service._state(conn_id)
+        chat = st.runtime_config.chat
+        chat.add_ordered_function_call(
+            RealtimeConversationItemFunctionCall(
+                id="fc_call",
+                type="function_call",
+                call_id="call_call",
+                name="lookup",
+                arguments="{}",
+            )
+        )
+        chat.add_item(
+            RealtimeConversationItemFunctionCallOutput(
+                id="fco_call",
+                type="function_call_output",
+                call_id="call_call",
+                output="old",
+            )
+        )
+
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="fco_call"),
+        )
+
+        assert chat.has_pending_tool_calls()
+        blocked = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        assert isinstance(blocked, RealtimeErrorEvent)
+        assert blocked.error.type == "function_call_output_pending"
+
+    def test_delete_removes_old_provisional_rollback_ownership(self, service, conn_id):
+        chat = service._state(conn_id).runtime_config.chat
+        chat.add_provisional_generation_items(
+            "response_origin",
+            [
+                RealtimeConversationItemFunctionCall(
+                    id="fc_old",
+                    type="function_call",
+                    call_id="call_same",
+                    name="lookup",
+                    arguments='{"private":true}',
+                )
+            ],
+        )
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="fc_old"),
+        )
+        chat.add_item(
+            RealtimeConversationItemFunctionCall(
+                id="fc_new",
+                type="function_call",
+                call_id="call_same",
+                name="lookup",
+                arguments="{}",
+            )
+        )
+        chat.add_item(
+            RealtimeConversationItemFunctionCallOutput(
+                id="fco_new",
+                type="function_call_output",
+                call_id="call_same",
+                output="marker",
+            )
+        )
+
+        chat.rollback_provisional_generation("response_origin")
+
+        assert [item.id for item in chat.buffer] == ["fc_new", "fco_new"]
 
 
 class TestDeferConversationItemsDuringResponse:

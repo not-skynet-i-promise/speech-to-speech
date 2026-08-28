@@ -150,12 +150,72 @@ class ConversationHandler(RealtimeBaseHandler):
         conn_id: str,
         event: ConversationItemDeleteEvent,
     ) -> list[ServerEvent]:
-        """Delete one applied conversation item by its protocol ID."""
+        """Delete one conversation item by its wire-visible protocol ID."""
         st = self._state(conn_id)
-        if not st.runtime_config.chat.remove_item(event.item_id):
-            return [self.make_error(f"Conversation item '{event.item_id}' was not found", "item_not_found")]
-        if st.last_item_id == event.item_id:
-            st.last_item_id = st.runtime_config.chat.buffer[-1].id if st.runtime_config.chat.buffer else None
+        found = event.item_id in st.conversation_item_order
+        chat_item_id = st.conversation_item_chat_ids.get(event.item_id, event.item_id)
+        if st.runtime_config.chat.remove_item(chat_item_id):
+            found = True
+
+        deferred_before = len(st.deferred_items)
+        removed_deferred = [item for item in st.deferred_items if item.id == event.item_id]
+        st.deferred_items = [item for item in st.deferred_items if item.id != event.item_id]
+        if len(st.deferred_items) != deferred_before:
+            found = True
+            for item in removed_deferred:
+                if isinstance(item, RealtimeConversationItemFunctionCallOutput):
+                    st.deferred_function_output_previous_item_ids.pop(item.call_id, None)
+
+        pending_ack_before = len(st.pending_item_acks)
+        st.pending_item_acks = [item for item in st.pending_item_acks if item.id != event.item_id]
+        if len(st.pending_item_acks) != pending_ack_before:
+            found = True
+
+        pending_text_before = len(st.pending_text_outputs)
+        st.pending_text_outputs = [
+            pending for pending in st.pending_text_outputs if pending["item_id"] != event.item_id
+        ]
+        if len(st.pending_text_outputs) != pending_text_before:
+            found = True
+
+        removed_call_ids: set[str] = set()
+        for output_index, call in tuple(st.pending_function_calls.items()):
+            if call.id != event.item_id:
+                continue
+            if call.call_id is not None:
+                removed_call_ids.add(call.call_id)
+            del st.pending_function_calls[output_index]
+            st.finished_function_call_indices.discard(output_index)
+            found = True
+        for call_ids in st.generation_done_tool_calls.values():
+            call_ids.difference_update(removed_call_ids)
+
+        if event.item_id in st.input_items:
+            st.input_items.pop(event.item_id, None)
+            st.input_item_by_turn_revision = {
+                turn: item_id for turn, item_id in st.input_item_by_turn_revision.items() if item_id != event.item_id
+            }
+            if st.current_input_item_id == event.item_id:
+                st.current_input_item_id = None
+            found = True
+
+        if not found:
+            return [
+                self.make_error(
+                    f"Conversation item '{event.item_id}' was not found",
+                    "item_not_found",
+                    event.event_id,
+                )
+            ]
+        if st.pending_assistant_item_id == event.item_id:
+            st.pending_assistant_item_id = None
+            st.pending_assistant_output_index = None
+            st.audio_output_started = False
+        if st.current_item_id == event.item_id:
+            st.current_item_id = None
+            st.current_output_index = None
+            st.current_output_kind = None
+        st.forget_conversation_item(event.item_id)
         return [
             ConversationItemDeletedEvent(
                 type="conversation.item.deleted",
@@ -197,7 +257,8 @@ class ConversationHandler(RealtimeBaseHandler):
             previous_item_id=st.last_item_id,
             item=item,
         )
-        st.last_item_id = item.id
+        if item.id is not None:
+            st.record_conversation_item(item.id, item.id)
         return event
 
     def flush_deferred_items(

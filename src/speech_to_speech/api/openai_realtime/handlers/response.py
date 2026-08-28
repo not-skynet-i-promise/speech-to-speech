@@ -371,8 +371,7 @@ class ResponseHandler(RealtimeBaseHandler):
         st.pending_text_outputs.append({"item_id": item_id, "output_index": output_index, "parts": []})
         st.pending_assistant_item_id = item_id
         st.pending_assistant_output_index = output_index
-        if st.last_item_id is None:
-            st.last_item_id = item_id
+        st.record_conversation_item(item_id)
         return item_id, output_index
 
     def _next_content_index(self, conn_id: str) -> int:
@@ -514,6 +513,27 @@ class ResponseHandler(RealtimeBaseHandler):
         if wants_audio:
             return " ".join(str(part).strip() for part in parts if str(part).strip())
         return "".join(str(part) for part in parts)
+
+    def _bind_response_history_items(self, conn_id: str) -> None:
+        """Bind response wire IDs to the corresponding model-history IDs."""
+        st = self._state(conn_id)
+        history_items = [
+            item
+            for item in st.runtime_config.chat.provisional_items(st.current_response_key)
+            if isinstance(item, (RealtimeConversationItemAssistantMessage, RealtimeConversationItemFunctionCall))
+        ]
+        protocol_items: list[tuple[int, str, type[object]]] = [
+            (int(pending["output_index"]), str(pending["item_id"]), RealtimeConversationItemAssistantMessage)
+            for pending in st.pending_text_outputs
+        ]
+        protocol_items.extend(
+            (output_index, str(call.id), RealtimeConversationItemFunctionCall)
+            for output_index, call in st.pending_function_calls.items()
+            if call.id is not None
+        )
+        for (_, protocol_id, expected_type), history_item in zip(sorted(protocol_items), history_items):
+            if isinstance(history_item, expected_type) and history_item.id is not None:
+                st.record_conversation_item(protocol_id, history_item.id)
 
     # ── Public handlers ───────────────────────────
 
@@ -721,6 +741,7 @@ class ResponseHandler(RealtimeBaseHandler):
                         )
                     )
             terminal_response = self._build_response(conn_id, status, reason)
+            self._bind_response_history_items(conn_id)
             function_outputs = {
                 getattr(item, "call_id", None): item
                 for item in (terminal_response.output or [])
@@ -877,7 +898,7 @@ class ResponseHandler(RealtimeBaseHandler):
                             delta=text,
                         )
                     )
-                st.last_item_id = item_id
+                st.record_conversation_item(item_id)
             elif isinstance(part, AssistantToolCallPart):
                 if not _early_tool_call:
                     events.extend(self.finish_audio_output(conn_id, event.response_key))
@@ -935,7 +956,8 @@ class ResponseHandler(RealtimeBaseHandler):
                 # Explicitly in-progress calls receive output_item.done at
                 # response close, once the outcome is known.
                 st.pending_function_calls[output_idx] = pending_call
-                st.last_item_id = function_item_id
+                st.record_conversation_item(function_item_id, function_item_id)
+        self._bind_response_history_items(conn_id)
         if output_sequence is not None:
             st.pending_early_tool_calls.pop(output_sequence, None)
             st.next_assistant_output_sequence = max(st.next_assistant_output_sequence, output_sequence + 1)

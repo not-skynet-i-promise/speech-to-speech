@@ -54,5 +54,5 @@ class RealtimeBaseHandler:
     def _next_event_id() -> str:
         return _generate_id("event")
 
-    def make_error(self, message: str, _type: str) -> RealtimeErrorEvent:
-        return self._service.make_error(message, _type)
+    def make_error(self, message: str, _type: str, event_id: str | None = None) -> RealtimeErrorEvent:
+        return self._service.make_error(message, _type, event_id)

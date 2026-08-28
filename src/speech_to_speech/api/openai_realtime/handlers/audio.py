@@ -202,7 +202,7 @@ class AudioHandler(RealtimeBaseHandler):
             st.response_usage.turns += 1
         st.speculative_turn_id = event.turn_id
         st.speculative_turn_revision = event.turn_revision
-        st.last_item_id = input_item_id
+        st.record_conversation_item(input_item_id)
         events.append(
             InputAudioBufferSpeechStartedEvent(
                 type="input_audio_buffer.speech_started",
