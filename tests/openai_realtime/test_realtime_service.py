@@ -562,7 +562,7 @@ class TestHandleConversationItemDelete:
                 RealtimeConversationItemAssistantMessage(
                     type="message",
                     role="assistant",
-                    content=[{"type": "output_text", "text": "PRIVATE_DELAYED_TEXT"}],
+                    content=[{"type": "output_text", "text": "PRIVATE_DELAYED_TEXT trailing writeback"}],
                 )
             ],
         )

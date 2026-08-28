@@ -554,13 +554,21 @@ class ResponseHandler(RealtimeBaseHandler):
                         isinstance(candidate, RealtimeConversationItemFunctionCall) and candidate.call_id == identity
                     )
                 else:
-                    compatible = isinstance(candidate, RealtimeConversationItemAssistantMessage) and (
+                    candidate_text = (
                         self._history_assistant_text(
                             candidate,
                             response_wants_audio(st.current_response_params),
                         )
-                        == identity
+                        if isinstance(candidate, RealtimeConversationItemAssistantMessage)
+                        else None
                     )
+                    compatible = candidate_text == identity
+                    if protocol_id in st.deleted_conversation_item_ids and isinstance(candidate_text, str):
+                        # A client may delete a streamed item before the LM's
+                        # final write-back adds its trailing chunks. In that case
+                        # remove the complete history message rather than letting
+                        # the acknowledged prefix reappear in later context.
+                        compatible = compatible or not identity or candidate_text.startswith(str(identity))
                 if compatible:
                     match = candidate
                     history_cursor = index + 1
