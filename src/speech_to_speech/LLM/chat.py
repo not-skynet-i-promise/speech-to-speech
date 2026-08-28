@@ -438,6 +438,14 @@ class Chat:
                 self._user_turn_count = sum(
                     1 for item in self.buffer if isinstance(item, RealtimeConversationItemUserMessage)
                 )
+                # Restoring nested provenance can expose many historical turns
+                # at once. Enforce the normal soft bound synchronously before
+                # another provider snapshot can serialize that expanded branch.
+                # Lossily evicted protocol items remain deletable through
+                # ``_deletable_user_ids`` until their bounded index retires.
+                if self.size > 0:
+                    while self._user_turn_count > self.size:
+                        self._evict_oldest_turn()
                 self._gen_counter += 1
                 self._compact_in_flight = False
                 if self._private_content_logging:

@@ -45,6 +45,11 @@ class ResponseHandler(RealtimeBaseHandler):
             st.in_response = True
             st.active_response_turn_id = st.pending_response_turn_id
             st.active_response_turn_revision = st.pending_response_turn_revision
+            st.active_response_input_item_id = (
+                st.turn_input_item_ids.get(st.active_response_turn_id)
+                if st.active_response_turn_id is not None
+                else None
+            )
             if successor is None:
                 st.response_pending = False
                 st.pending_response_turn_id = None
@@ -110,6 +115,7 @@ class ResponseHandler(RealtimeBaseHandler):
         st.deferred_response_requests.clear()
         st.active_response_turn_id = None
         st.active_response_turn_revision = None
+        st.active_response_input_item_id = None
         st.current_response_params = None
         st.next_output_index = 0
         st.current_output_index = None
@@ -262,6 +268,12 @@ class ResponseHandler(RealtimeBaseHandler):
                 if st.runtime_config.home_assistant_guard_operational:
                     return self._service.poison_home_assistant_guard(conn_id, "invalid_input_item")
                 return self.make_client_content_error(conn_id, str(exc), "invalid_input_item")
+            # response.input is newer context than any prior audio turn but is
+            # not represented by a protocol-visible input-audio item.
+            st.response_context_input_item_id = None
+            st.response_context_turn_id = None
+            st.response_context_turn_revision = None
+            st.response_context_speech_stopped_at_s = None
 
         st.in_response = True
         st.response_pending = False
@@ -270,8 +282,9 @@ class ResponseHandler(RealtimeBaseHandler):
         st.pending_response_request = None
         st.pending_response_enqueued = False
         st.deferred_response_requests.clear()
-        st.active_response_turn_id = None if out_of_band else st.speculative_user_turn_id
-        st.active_response_turn_revision = None if out_of_band else st.speculative_user_turn_revision
+        st.active_response_turn_id = None if out_of_band else st.response_context_turn_id
+        st.active_response_turn_revision = None if out_of_band else st.response_context_turn_revision
+        st.active_response_input_item_id = None if out_of_band else st.response_context_input_item_id
 
         st.current_response_params = event.response
         st.current_response_id = _generate_id("resp")
@@ -287,9 +300,9 @@ class ResponseHandler(RealtimeBaseHandler):
                 GenerateResponseRequest(
                     runtime_config=cfg,
                     response=event.response,
-                    turn_id=None if out_of_band else st.speculative_user_turn_id,
-                    turn_revision=None if out_of_band else st.speculative_user_turn_revision,
-                    speech_stopped_at_s=None if out_of_band else st.speculative_user_speech_stopped_at_s,
+                    turn_id=None if out_of_band else st.response_context_turn_id,
+                    turn_revision=None if out_of_band else st.response_context_turn_revision,
+                    speech_stopped_at_s=None if out_of_band else st.response_context_speech_stopped_at_s,
                     cancel_generation=(self._service.cancel_scope.generation if self._service.cancel_scope else None),
                 )
             )

@@ -1339,6 +1339,126 @@ class TestHandleConversationItemDelete:
         assert events[0].error.type == "item_not_found"
         assert events[0].error.event_id == "event_delete"
 
+    def test_guarded_missing_item_delete_poison_is_correlated_and_sticky(self, service, conn_id):
+        _activate_home_assistant_guard(service, conn_id)
+
+        events = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(
+                type="conversation.item.delete",
+                event_id="guarded_delete_missing",
+                item_id="msg_missing",
+            ),
+        )
+
+        assert isinstance(events[0], RealtimeErrorEvent)
+        assert events[0].error.type == "invalid_conversation_item"
+        assert events[0].error.event_id == "guarded_delete_missing"
+        assert service._state(conn_id).runtime_config.home_assistant_guard_failed
+
+    def test_client_item_rebinds_explicit_response_away_from_an_old_audio_turn(self):
+        tracker = SpeculativeTurnTracker()
+        cancel_scope = CancelScope()
+        prompt_queue = Queue()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            speculative_turns=tracker,
+            cancel_scope=cancel_scope,
+        )
+        conn_id = service.register()
+        old_audio = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_old", turn_revision=0),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="old", turn_id="turn_old", turn_revision=0),
+        )
+        prompt_queue.get_nowait()
+        service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(text="old reply", turn_id="turn_old", turn_revision=0),
+        )
+        service.finish_response(conn_id)
+        service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "msg_new",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "new request"}],
+                },
+            ),
+        )
+        service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        prompt_queue.get_nowait()
+        st = service._state(conn_id)
+        generation_before_delete = cancel_scope.generation
+
+        old_deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=old_audio.item_id),
+        )
+
+        assert [event.type for event in old_deleted] == ["conversation.item.deleted"]
+        assert st.in_response
+        assert st.active_response_turn_id is None
+        assert st.active_response_input_item_id == "msg_new"
+        assert cancel_scope.generation == generation_before_delete
+
+        exact_deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="msg_new"),
+        )
+        assert [event.type for event in exact_deleted] == ["conversation.item.deleted", "response.done"]
+        assert st.in_response is False
+        service.unregister(conn_id)
+
+    def test_response_input_clears_obsolete_audio_turn_ownership(self):
+        cancel_scope = CancelScope()
+        prompt_queue = Queue()
+        service = RealtimeService(text_prompt_queue=prompt_queue, cancel_scope=cancel_scope)
+        conn_id = service.register()
+        old_audio = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_old", turn_revision=0),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="old", turn_id="turn_old", turn_revision=0),
+        )
+        prompt_queue.get_nowait()
+        service.finish_response(conn_id)
+        service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "new request"}],
+                        }
+                    ]
+                },
+            ),
+        )
+        prompt_queue.get_nowait()
+        generation_before_delete = cancel_scope.generation
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=old_audio.item_id),
+        )
+
+        assert [event.type for event in deleted] == ["conversation.item.deleted"]
+        assert service._state(conn_id).in_response
+        assert cancel_scope.generation == generation_before_delete
+        service.unregister(conn_id)
+
     def test_untranscribed_audio_delete_never_removes_the_prior_turn(self, service, conn_id):
         st = service._state(conn_id)
         first = service.dispatch_pipeline_event(

@@ -100,6 +100,12 @@ class ConversationHandler(RealtimeBaseHandler):
             st.record_protocol_item(item.id)
             if isinstance(item, RealtimeConversationItemUserMessage):
                 st.runtime_config.chat.mark_user_message_deletable(item.id)
+                st.response_context_input_item_id = item.id
+            else:
+                st.response_context_input_item_id = None
+            st.response_context_turn_id = None
+            st.response_context_turn_revision = None
+            st.response_context_speech_stopped_at_s = None
         return event
 
     def flush_deferred_items(self, conn_id: str) -> list[ServerEvent]:
@@ -166,7 +172,10 @@ class ConversationHandler(RealtimeBaseHandler):
                     removed = True
                     break
         if not removed:
-            error = self.make_client_content_error(conn_id, "Conversation item was not found.", "item_not_found")
+            if st.runtime_config.home_assistant_guard_operational:
+                error = self._service.poison_home_assistant_guard(conn_id, "invalid_conversation_item")
+            else:
+                error = self.make_client_content_error(conn_id, "Conversation item was not found.", "item_not_found")
             error.error.event_id = event.event_id
             return [error]
 
@@ -188,9 +197,16 @@ class ConversationHandler(RealtimeBaseHandler):
             st.speculative_user_turn_revision = None
             st.speculative_user_speech_stopped_at_s = None
             st.speculative_audio_duration_s = 0.0
+        if st.response_context_input_item_id == event.item_id:
+            st.response_context_input_item_id = None
+            st.response_context_turn_id = None
+            st.response_context_turn_revision = None
+            st.response_context_speech_stopped_at_s = None
 
         pending_matches = turn_id is not None and st.pending_response_turn_id == turn_id
-        active_matches = turn_id is not None and st.active_response_turn_id == turn_id
+        active_matches = (turn_id is not None and st.active_response_turn_id == turn_id) or (
+            st.active_response_input_item_id == event.item_id
+        )
         promote_successor = pending_matches and not st.in_response
         if pending_matches:
             st.response_pending = False

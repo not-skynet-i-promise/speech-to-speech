@@ -1273,6 +1273,30 @@ class TestCompaction:
         assert "user-2" in texts
         assert "summary-user" not in texts
 
+    def test_nested_compaction_delete_reapplies_chat_bound_before_next_snapshot(self):
+        chat = Chat(size=2)
+        user_ids = []
+        for index in range(20):
+            user = chat.add_item(make_user_message(f"user-{index}"))
+            assert user.id is not None
+            user_ids.append(user.id)
+            chat.mark_user_message_deletable(user.id)
+            chat.add_item(make_assistant_message(f"assistant-{index}"))
+            chat.trim_if_needed(_make_stub_compactor())
+            _wait_thread(chat)
+
+        assert chat._user_turn_count <= chat.size
+        assert chat.remove_user_message(user_ids[0])
+
+        assert chat._user_turn_count <= chat.size
+        assert sum(isinstance(item, RealtimeConversationItemUserMessage) for item in chat.buffer) <= chat.size
+        assert not any(
+            getattr(part, "text", None) == "user-0" for item in chat.buffer for part in getattr(item, "content", [])
+        )
+        # A sibling evicted while reapplying the bound remains exactly
+        # deletable through the retained protocol marker.
+        assert chat.remove_user_message(user_ids[1])
+
     def test_failed_atomic_batch_restores_compaction_provenance_after_hard_eviction(self):
         chat = Chat(size=2)
         users = []

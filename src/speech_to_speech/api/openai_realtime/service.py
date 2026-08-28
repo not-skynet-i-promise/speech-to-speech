@@ -231,6 +231,14 @@ class ConnState(BaseModel):
     deferred_response_requests: list[GenerateResponseRequest] = Field(default_factory=list)
     active_response_turn_id: Optional[str] = None
     active_response_turn_revision: Optional[int] = None
+    active_response_input_item_id: Optional[str] = None
+    # Exact default-conversation tail that an explicit in-band
+    # ``response.create`` may own. Client-created/input items clear the audio
+    # turn fields so an old audio deletion cannot cancel an unrelated response.
+    response_context_input_item_id: Optional[str] = None
+    response_context_turn_id: Optional[str] = None
+    response_context_turn_revision: Optional[int] = None
+    response_context_speech_stopped_at_s: Optional[float] = None
     # Client conversation.item.create items that arrived while a response was
     # generating. Applying them mid-generation races the LLM handler's chat
     # write-back (cross-thread), so they are buffered here and flushed in order
@@ -921,6 +929,11 @@ class RealtimeService:
             st.speculative_user_turn_id = event.turn_id
             st.speculative_user_turn_revision = event.turn_revision
             st.speculative_user_speech_stopped_at_s = event.speech_stopped_at_s
+        if transcript:
+            st.response_context_input_item_id = input_item_id
+            st.response_context_turn_id = event.turn_id
+            st.response_context_turn_revision = event.turn_revision
+            st.response_context_speech_stopped_at_s = event.speech_stopped_at_s
 
         queue = self.text_prompt_queue
         if queue and transcript and cfg.create_response_enabled:
