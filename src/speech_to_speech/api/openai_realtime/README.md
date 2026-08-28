@@ -76,7 +76,11 @@ lossy eviction) before it reaches the model. Promotion preserves FIFO order,
 incorporates completed output from earlier turns, and excludes client items
 that arrived after the promoted turn was admitted. For a `response.input`
 batch, derived assistant and tool history remains deletion-owned by every user
-item serialized into that response, including through tool-result follow-ups.
+item serialized into that response, including when the tool result itself is
+supplied inline through `response.input`. Restored turns with outstanding tool
+results are retained only up to the configured chat size; admitting another
+restored turn retires the oldest outstanding tool ownership before it can crowd
+the newly accepted user out of the hard-bounded history.
 
 ### Server -> Client
 
@@ -288,7 +292,7 @@ Barge-in (user speaks while the assistant is playing audio) is handled cooperati
 - **Generation counter** (`cancel_scope.generation`): each response request is stamped when it enters the LLM queue, and pipeline threads carry that generation through LLM and TTS while checking `cancel_scope.is_stale(gen)` on every streaming token. When `cancel()` is called, the generation increments, so both already-running work and a prior request dequeued only afterward are stale before provider execution -- no timing games required.
 - **Discard flag** (`cancel_scope.discarding`): set by `cancel()`, checked by the async `_send_loop` to drop output from superseded generations that arrives between `cancel()` and `response_done()`. Cleared by `response_done(generation)` (only when the sentinel's generation matches the discarded or current one -- sentinels from unrelated older generations are ignored), by `new_response()` on an explicit `response.create`, or by `reset()` on session claim/release.
 
-Pipeline output is **generation-tagged**: `AudioOutput` chunks, `AssistantTextEvent`s, and response failures carry a `cancel_generation` field stamped by the handler that produced them. The send loop drops stale audio/assistant output, and the service rejects a failure that does not own the active generation. Output from the *current* generation always passes through, so a fresh response is never swallowed or failed by a superseded turn (e.g. a speculative turn whose TTS never emitted a `__RESPONSE_DONE__` sentinel).
+Pipeline output is **generation-tagged**: `AudioOutput` chunks, `AssistantTextEvent`s, token-usage reports, and response failures carry a `cancel_generation` field stamped by the handler that produced them. The send loop drops stale audio/assistant output, and the service rejects usage or a failure that does not own the active generation. Output from the *current* generation always passes through, so a fresh response is never swallowed, charged, or failed by a superseded turn (e.g. a speculative turn whose TTS never emitted a `__RESPONSE_DONE__` sentinel).
 
 ```mermaid
 sequenceDiagram

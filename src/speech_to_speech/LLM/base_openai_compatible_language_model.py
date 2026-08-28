@@ -735,6 +735,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     output_tokens=state.output_tokens,
                     turn_id=turn.turn_id,
                     turn_revision=turn.turn_revision,
+                    cancel_generation=turn.gen,
                 )
         with private_content_redaction(turn.runtime_config) as private_content:
             if private_content and error_message is not None:

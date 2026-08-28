@@ -498,6 +498,36 @@ class TestAddItem:
             RealtimeConversationItemFunctionCallOutput,
         ]
 
+    def test_outstanding_promoted_tool_turns_are_bounded_before_new_admission(self):
+        chat = Chat(size=1)
+        first = chat.add_item(_user("first promoted tool turn"))
+        assert first.id is not None
+        chat.snapshot_for_response_turn(first.id, set())
+        chat.add_response_item(_fc("first"), after_user_id=first.id)
+        chat.release_response_turn(first.id)
+        assert "call_first" in chat._pending_tool_calls
+
+        second = chat.add_item(_user("second promoted tool turn"))
+        assert second.id is not None
+        chat.snapshot_for_response_turn(second.id, set())
+        chat.add_response_item(_fc("second"), after_user_id=second.id)
+        chat.release_response_turn(second.id)
+
+        # Protecting the second target retires the oldest unresolved tool
+        # ownership. The next admission therefore evicts the old turn, never
+        # the user that was just accepted at the hard-cap boundary.
+        newest = chat.add_item(_user("newly admitted user"))
+        assert newest.id is not None
+        assert chat.user_message(newest.id) is not None
+        assert chat.user_message(second.id) is not None
+        assert chat.user_message(first.id) is None
+        assert "call_first" not in chat._pending_tool_calls
+        assert "call_second" in chat._pending_tool_calls
+        assert "fc_call_first" not in chat._response_item_owners
+        assert "fc_call_first" not in chat._response_item_dependencies
+        with pytest.raises(ChatItemError, match="call_first"):
+            chat.add_item(_fco("first", "late result"))
+
     # -- System message --
 
     def test_system_message_routed_to_init_chat(self):

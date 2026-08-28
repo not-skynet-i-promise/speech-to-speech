@@ -1994,6 +1994,91 @@ class TestHandleConversationItemDelete:
         assert all(item.id != response_item.id for item in chat.buffer)
         service.unregister(conn_id)
 
+    def test_inline_tool_output_inherits_every_original_response_input_dependency(self):
+        from openai.types.realtime.realtime_conversation_item_function_call import (
+            RealtimeConversationItemFunctionCall,
+        )
+
+        prompt_queue = Queue()
+        cancel_scope = CancelScope()
+        service = RealtimeService(text_prompt_queue=prompt_queue, cancel_scope=cancel_scope)
+        conn_id = service.register()
+        service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": "msg_inline_one",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "one"}],
+                        },
+                        {
+                            "id": "msg_inline_two",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "two"}],
+                        },
+                    ]
+                },
+            ),
+        )
+        first_request = prompt_queue.get_nowait()
+        chat = service._state(conn_id).runtime_config.chat
+        chat.add_response_item(
+            RealtimeConversationItemFunctionCall(
+                type="function_call",
+                call_id="call_inline",
+                name="lookup",
+                arguments="{}",
+            ),
+            after_user_id=first_request.response_user_item_id,
+            owner_user_ids=first_request.response_user_item_ids,
+        )
+        service.finish_response(conn_id)
+
+        created = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": "fco_inline",
+                            "type": "function_call_output",
+                            "call_id": "call_inline",
+                            "output": "result",
+                        }
+                    ]
+                },
+            ),
+        )
+
+        assert isinstance(created, ResponseCreatedEvent)
+        follow_up = prompt_queue.get_nowait()
+        assert follow_up.response_user_item_id == "msg_inline_two"
+        assert follow_up.response_user_item_ids == {"msg_inline_one", "msg_inline_two"}
+        state = service._state(conn_id)
+        assert state.active_response_input_item_ids == {"msg_inline_one", "msg_inline_two"}
+        response_item = chat.add_response_item(
+            make_assistant_message("inline follow-up"),
+            after_user_id=follow_up.response_user_item_id,
+            owner_user_ids=follow_up.response_user_item_ids,
+        )
+        assert response_item is not None and response_item.id is not None
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="msg_inline_one"),
+        )
+
+        assert [event.type for event in deleted] == ["conversation.item.deleted", "response.done"]
+        assert cancel_scope.generation == 1
+        assert all(item.id != response_item.id for item in chat.buffer)
+        service.unregister(conn_id)
+
     def test_untranscribed_audio_delete_never_removes_the_prior_turn(self, service, conn_id):
         st = service._state(conn_id)
         first = service.dispatch_pipeline_event(
@@ -4817,6 +4902,34 @@ class TestUsageMetricsTracking:
         usage = service._state(conn_id).response_usage
         assert usage.input_tokens == 8
         assert usage.output_tokens == 17
+
+    def test_late_cancelled_generation_usage_cannot_charge_successor(self):
+        cancel_scope = CancelScope()
+        service = RealtimeService(text_prompt_queue=Queue(), cancel_scope=cancel_scope)
+        conn_id = service.register()
+        service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        assert service._state(conn_id).active_response_cancel_generation == 0
+
+        cancel_scope.cancel()
+        service.handle_response_cancel(conn_id)
+        service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        assert service._state(conn_id).active_response_cancel_generation == 1
+
+        service.dispatch_pipeline_event(
+            conn_id,
+            TokenUsageEvent(input_tokens=100, output_tokens=50, cancel_generation=0),
+        )
+        usage = service._state(conn_id).response_usage
+        assert usage.input_tokens == 0
+        assert usage.output_tokens == 0
+
+        service.dispatch_pipeline_event(
+            conn_id,
+            TokenUsageEvent(input_tokens=7, output_tokens=3, cancel_generation=1),
+        )
+        assert usage.input_tokens == 7
+        assert usage.output_tokens == 3
+        service.unregister(conn_id)
 
     def test_token_usage_emits_no_events(self, service, conn_id):
         events = service.dispatch_pipeline_event(

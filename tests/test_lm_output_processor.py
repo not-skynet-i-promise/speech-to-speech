@@ -7,12 +7,13 @@ from openai.types.responses import ResponseFunctionToolCall
 
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.LLM.lm_output_processor import LMOutputProcessor
-from speech_to_speech.pipeline.events import ResponseFailedEvent
+from speech_to_speech.pipeline.events import ResponseFailedEvent, TokenUsageEvent
 from speech_to_speech.pipeline.messages import (
     AssistantTextPart,
     AssistantToolCallPart,
     EndOfResponse,
     LLMResponseChunk,
+    TokenUsage,
     TTSInput,
 )
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
@@ -86,6 +87,29 @@ def test_cancel_generation_is_forwarded_to_tts():
 
     assert len(outputs) == 1
     assert outputs[0].cancel_generation == 7
+
+
+def test_token_usage_preserves_cancel_generation_on_side_channel():
+    tracker = SpeculativeTurnTracker()
+    tracker.observe("turn_1", 0)
+    processor = _processor(tracker)
+
+    outputs = list(
+        processor.process(
+            TokenUsage(
+                input_tokens=10,
+                output_tokens=5,
+                turn_id="turn_1",
+                turn_revision=0,
+                cancel_generation=7,
+            )
+        )
+    )
+
+    assert outputs == []
+    event = processor.text_output_queue.get_nowait()
+    assert isinstance(event, TokenUsageEvent)
+    assert event.cancel_generation == 7
 
 
 def test_text_only_chunk_is_not_forwarded_to_tts():

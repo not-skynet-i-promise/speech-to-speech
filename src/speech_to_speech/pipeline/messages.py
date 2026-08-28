@@ -134,6 +134,7 @@ class TokenUsage(PipelineMessage):
     output_tokens: int
     turn_id: str | None = None
     turn_revision: int | None = None
+    cancel_generation: int | None = None
 
 
 class EndOfResponse(PipelineMessage):

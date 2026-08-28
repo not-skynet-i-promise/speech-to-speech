@@ -15,7 +15,10 @@ from openai.types.realtime import (
     ResponseTextDeltaEvent,
     ResponseTextDoneEvent,
 )
-from openai.types.realtime.conversation_item import RealtimeConversationItemUserMessage
+from openai.types.realtime.conversation_item import (
+    RealtimeConversationItemFunctionCallOutput,
+    RealtimeConversationItemUserMessage,
+)
 from openai.types.realtime.realtime_response import Audio, AudioOutput
 from openai.types.realtime.realtime_response_status import RealtimeResponseStatus
 from openai.types.realtime.realtime_response_usage import RealtimeResponseUsage
@@ -316,17 +319,37 @@ class ResponseHandler(RealtimeBaseHandler):
                         "duplicate_item_id",
                     )
                 seen_ids.add(item_id)
-            accepted_user_ids: list[str] = []
+            accepted_dependency_input_ids: set[str] = set()
+            accepted_primary_input_id: str | None = None
             accepted_item_ids: list[str] = []
 
             def record_accepted_item(item: ConversationItem) -> None:
+                nonlocal accepted_primary_input_id
                 if item.id is None:
                     return
                 st.record_protocol_item(item.id)
                 accepted_item_ids.append(item.id)
                 if isinstance(item, RealtimeConversationItemUserMessage):
                     st.runtime_config.chat.mark_user_message_deletable(item.id)
-                    accepted_user_ids.append(item.id)
+                    accepted_dependency_input_ids.add(item.id)
+                    accepted_primary_input_id = item.id
+                elif isinstance(item, RealtimeConversationItemFunctionCallOutput):
+                    owner_id = st.runtime_config.chat.response_owner_for_item(item.id)
+                    if owner_id is None:
+                        return
+                    dependency_ids = st.runtime_config.chat.response_dependencies_for_item(item.id) or {owner_id}
+                    mapped_input_ids = {
+                        input_id
+                        for input_id in st.protocol_item_ids
+                        if st.input_item_chat_ids.get(input_id, input_id) in dependency_ids
+                    }
+                    accepted_dependency_input_ids.update(mapped_input_ids or dependency_ids)
+                    primary_input_ids = [
+                        input_id
+                        for input_id in st.protocol_item_ids
+                        if st.input_item_chat_ids.get(input_id, input_id) == owner_id
+                    ]
+                    accepted_primary_input_id = primary_input_ids[-1] if primary_input_ids else owner_id
 
             try:
                 if st.runtime_config.sensitive_content:
@@ -342,8 +365,8 @@ class ResponseHandler(RealtimeBaseHandler):
                         record_accepted_item(item)
             except ChatItemError as exc:
                 if accepted_item_ids:
-                    st.response_context_input_item_id = accepted_user_ids[-1] if accepted_user_ids else None
-                    st.response_context_input_item_ids = set(accepted_user_ids)
+                    st.response_context_input_item_id = accepted_primary_input_id
+                    st.response_context_input_item_ids = set(accepted_dependency_input_ids)
                     st.response_context_turn_id = None
                     st.response_context_turn_revision = None
                     st.response_context_speech_stopped_at_s = None
@@ -351,10 +374,11 @@ class ResponseHandler(RealtimeBaseHandler):
                     return self._service.poison_home_assistant_guard(conn_id, "invalid_input_item")
                 return self.make_client_content_error(conn_id, str(exc), "invalid_input_item")
             # response.input is newer context than any prior audio turn. Track
-            # every accepted user item because deletion of any one invalidates
-            # the response that serialized the batch.
-            st.response_context_input_item_id = accepted_user_ids[-1] if accepted_user_ids else None
-            st.response_context_input_item_ids = set(accepted_user_ids)
+            # every accepted user dependency because deletion of any one
+            # invalidates the response that serialized the batch. Tool outputs
+            # inherit the complete dependency set of their originating call.
+            st.response_context_input_item_id = accepted_primary_input_id
+            st.response_context_input_item_ids = set(accepted_dependency_input_ids)
             st.response_context_turn_id = None
             st.response_context_turn_revision = None
             st.response_context_speech_stopped_at_s = None

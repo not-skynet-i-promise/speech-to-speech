@@ -1127,6 +1127,23 @@ class RealtimeService:
             logger.debug("Dropping stale token usage for turn=%s rev=%s", event.turn_id, event.turn_revision)
             return []
         st = self._state(conn_id)
+        if event.cancel_generation is not None:
+            expected_generation = (
+                st.active_response_cancel_generation
+                if st.in_response
+                else (
+                    st.pending_response_request.cancel_generation
+                    if st.response_pending and st.pending_response_request is not None
+                    else None
+                )
+            )
+            if expected_generation != event.cancel_generation:
+                logger.debug(
+                    "Dropping token usage for stale cancellation generation=%s (active=%s)",
+                    event.cancel_generation,
+                    expected_generation,
+                )
+                return []
         st.response_usage.input_tokens += event.input_tokens
         st.response_usage.output_tokens += event.output_tokens
         logger.info(

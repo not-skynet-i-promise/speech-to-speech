@@ -170,12 +170,59 @@ class Chat:
         removed = self.buffer[start:end]
         del self.buffer[start:end]
         self._user_turn_count -= 1
+        removed_user_id = removed[0].id
         for item in removed:
             if item.id is not None:
                 self._compaction_nodes.pop(item.id, None)
                 self._response_item_owners.pop(item.id, None)
                 self._response_item_dependencies.pop(item.id, None)
+        if removed_user_id is not None:
+            # Hard eviction retires any still-pending tool round-trip anchored
+            # to the lossy turn. Keeping it would permit a later tool result to
+            # revive output whose causal user context is no longer available.
+            self._remove_response_items_for_user_locked(removed_user_id)
         return True
+
+    def _bound_protected_tool_turns_locked(self, target_user_id: str) -> None:
+        """Bound restored tool-turn retention before protecting a new target.
+
+        A promoted response with an outstanding function call stays protected
+        so its result can be placed beside the original user. If enough such
+        results never arrive, protection must not consume the whole hard cap:
+        retire the oldest outstanding tool ownership and make that turn
+        normally evictable. A late result then fails explicitly as unknown.
+        """
+
+        if self.size <= 0 or target_user_id in self._protected_response_user_ids:
+            return
+        protected_limit = max(1, self.size)
+        while len(self._protected_response_user_ids) >= protected_limit:
+            oldest_protected_id = next(
+                (
+                    item.id
+                    for item in self.buffer
+                    if isinstance(item, RealtimeConversationItemUserMessage)
+                    and item.id in self._protected_response_user_ids
+                    and item.id != target_user_id
+                ),
+                None,
+            )
+            if oldest_protected_id is None:
+                break
+            for call_id in list(self._pending_tool_calls):
+                if self._pending_tool_call_anchors.get(
+                    call_id
+                ) == oldest_protected_id or oldest_protected_id in self._pending_tool_call_dependencies.get(
+                    call_id, set()
+                ):
+                    retired_call = self._pending_tool_calls.pop(call_id, None)
+                    self._pending_tool_call_anchors.pop(call_id, None)
+                    self._pending_tool_call_dependencies.pop(call_id, None)
+                    if retired_call is not None and retired_call.id is not None:
+                        self._response_item_owners.pop(retired_call.id, None)
+                        self._response_item_dependencies.pop(retired_call.id, None)
+            self._protected_response_user_ids.discard(oldest_protected_id)
+            logger.info("Retired oldest outstanding tool turn to preserve bounded conversation admission")
 
     def _has_call_id_in_buffer(self, call_id: str) -> bool:
         for entry in self.buffer:
@@ -347,6 +394,8 @@ class Chat:
             response_dependencies_before = {
                 item_id: set(dependencies) for item_id, dependencies in self._response_item_dependencies.items()
             }
+            protected_response_users_before = set(self._protected_response_user_ids)
+            deletable_users_before = set(self._deletable_user_ids)
             compaction_nodes_before = dict(self._compaction_nodes)
             turns_before = self._user_turn_count
             init_before = self.init_chat_message
@@ -366,6 +415,8 @@ class Chat:
                 self._pending_tool_call_dependencies = pending_dependencies_before
                 self._response_item_owners = response_owners_before
                 self._response_item_dependencies = response_dependencies_before
+                self._protected_response_user_ids = protected_response_users_before
+                self._deletable_user_ids = deletable_users_before
                 self._compaction_nodes = compaction_nodes_before
                 self._user_turn_count = turns_before
                 self.init_chat_message = init_before
@@ -934,6 +985,7 @@ class Chat:
                 self._deletable_user_ids.add(target_user_id)
                 target_present = True
             if target_present:
+                self._bound_protected_tool_turns_locked(target_user_id)
                 self._protected_response_user_ids.add(target_user_id)
             self._user_turn_count = sum(
                 1 for item in self.buffer if isinstance(item, RealtimeConversationItemUserMessage)

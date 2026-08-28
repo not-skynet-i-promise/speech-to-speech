@@ -862,6 +862,7 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     output_tokens=output_tokens,
                     turn_id=ctx.turn_id,
                     turn_revision=ctx.turn_revision,
+                    cancel_generation=ctx.cancel_generation,
                 )
         except GeneratorExit:
             raise
