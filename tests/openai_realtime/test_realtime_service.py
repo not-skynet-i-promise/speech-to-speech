@@ -626,6 +626,48 @@ class TestHandleConversationItemDelete:
 
         assert "PRIVATE_DELAYED_TEXT" not in "\n".join(item.model_dump_json() for item in st.runtime_config.chat.buffer)
 
+    def test_active_output_delete_preserves_response_indices_and_surviving_history(self, service, conn_id):
+        st = service._state(conn_id)
+        response_key = "response_delete_then_continue"
+        st.mark_response_pending(response_key)
+        first_events = service.dispatch_pipeline_event(
+            conn_id,
+            AssistantOutputEvent(text="PRIVATE_BEFORE", response_key=response_key),
+        )
+        first = next(event for event in first_events if isinstance(event, ResponseAudioTranscriptDeltaEvent))
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=first.item_id),
+        )
+        second_events = service.dispatch_pipeline_event(
+            conn_id,
+            AssistantOutputEvent(text="PUBLIC_AFTER", response_key=response_key),
+        )
+        second = next(event for event in second_events if isinstance(event, ResponseAudioTranscriptDeltaEvent))
+        st.runtime_config.chat.add_provisional_generation_items(
+            response_key,
+            [
+                RealtimeConversationItemAssistantMessage(
+                    type="message",
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "PRIVATE_BEFORE PUBLIC_AFTER"}],
+                )
+            ],
+        )
+
+        terminal = service.finish_response(conn_id, response_key=response_key)
+        done = next(event for event in terminal if isinstance(event, ResponseDoneEvent))
+        history = "\n".join(item.model_dump_json() for item in st.runtime_config.chat.buffer)
+
+        assert isinstance(deleted[-1], ConversationItemDeletedEvent)
+        assert second.output_index == 1
+        assert done.response.output[second.output_index].id == second.item_id
+        assert done.response.output[0].id == first.item_id
+        assert "PRIVATE_BEFORE" not in done.response.output[0].model_dump_json()
+        assert "PRIVATE_BEFORE" not in history
+        assert "PUBLIC_AFTER" in history
+
     def test_deleted_function_descriptor_survives_unrelated_output_until_writeback(self, service, conn_id):
         st = service._state(conn_id)
         st.mark_response_pending("response_delayed_call")
@@ -2104,6 +2146,7 @@ class TestHandleResponseCreate:
 
         assert st.tool_followup_prefetch_request is None
         assert st.tool_followup_prefetch_origin_response_key is None
+        assert prefetch.is_cancelled
         assert prefetch.response_key in st.closed_response_keys
         assert prefetch.response_key not in st.pending_response_keys
 

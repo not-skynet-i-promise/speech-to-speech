@@ -133,6 +133,7 @@ class ResponseHandler(RealtimeBaseHandler):
         st.pending_function_calls = {}
         st.deleted_response_text_outputs = {}
         st.deleted_response_function_calls = {}
+        st.deleted_response_outputs = {}
         st.finished_function_call_indices = set()
         st.next_assistant_output_sequence = 0
         st.pending_early_tool_calls = {}
@@ -227,6 +228,11 @@ class ResponseHandler(RealtimeBaseHandler):
                     pass
                 else:
                     queue.not_full.notify()
+        # The request cancellation token and provider-boundary claim share one
+        # lock. Win that race before acknowledging any context deletion; merely
+        # discarding the transaction suppresses output but does not prevent a
+        # worker from sending the deleted context to its provider.
+        request.cancel()
         if request.prefetch_transaction is not None:
             request.prefetch_transaction.discard()
         st.runtime_config.chat.rollback_provisional_generation(request.response_key)
@@ -483,6 +489,30 @@ class ResponseHandler(RealtimeBaseHandler):
         st = self._state(conn_id)
         assistant_status: Literal["completed", "incomplete"] = "completed" if status == "completed" else "incomplete"
         output_by_index: dict[int, ConversationItem] = {}
+        for output_index, deleted in st.deleted_response_outputs.items():
+            if deleted["kind"] == "function_call":
+                output_by_index[output_index] = RealtimeConversationItemFunctionCall(
+                    type="function_call",
+                    id=str(deleted["item_id"]),
+                    call_id=str(deleted["call_id"]),
+                    name=str(deleted["name"]),
+                    arguments="{}",
+                    object="realtime.item",
+                    status=assistant_status,
+                )
+            else:
+                if response_wants_audio(st.current_response_params):
+                    content = Content(type="output_audio", transcript="")
+                else:
+                    content = Content(type="output_text", text="")
+                output_by_index[output_index] = RealtimeConversationItemAssistantMessage(
+                    type="message",
+                    role="assistant",
+                    id=str(deleted["item_id"]),
+                    object="realtime.item",
+                    status=assistant_status,
+                    content=[content],
+                )
         for pending in st.pending_text_outputs:
             output_index = int(pending["output_index"])
             text = self._assistant_text(pending, response_wants_audio(st.current_response_params))
@@ -585,14 +615,26 @@ class ResponseHandler(RealtimeBaseHandler):
             for item_id, (output_index, call_id) in st.deleted_response_function_calls.items()
         )
         ordered_protocol_items = sorted(protocol_items)
-        structure_matches = len(ordered_protocol_items) == len(history_items) and all(
-            (kind == "assistant" and isinstance(candidate, RealtimeConversationItemAssistantMessage))
+        # Deleting a text item can split one streamed assistant message into a
+        # deleted prefix and a surviving suffix even though the LM committed
+        # both as one Chat item. Treat consecutive assistant descriptors as one
+        # structural group so the private prefix can be removed without losing
+        # the surviving suffix from future conversational context.
+        protocol_groups: list[list[tuple[int, str, str, object | None]]] = []
+        for protocol_item in ordered_protocol_items:
+            if protocol_item[2] == "assistant" and protocol_groups and protocol_groups[-1][-1][2] == "assistant":
+                protocol_groups[-1].append(protocol_item)
+            else:
+                protocol_groups.append([protocol_item])
+        structure_matches = len(protocol_groups) == len(history_items) and all(
+            (group[0][2] == "assistant" and isinstance(candidate, RealtimeConversationItemAssistantMessage))
             or (
-                kind == "function_call"
+                len(group) == 1
+                and group[0][2] == "function_call"
                 and isinstance(candidate, RealtimeConversationItemFunctionCall)
-                and candidate.call_id == identity
+                and candidate.call_id == group[0][3]
             )
-            for (_, _, kind, identity), candidate in zip(ordered_protocol_items, history_items)
+            for group, candidate in zip(protocol_groups, history_items)
         )
         if not structure_matches:
             # Partial output/history arrival is normal. Preserve descriptors so
@@ -625,15 +667,38 @@ class ResponseHandler(RealtimeBaseHandler):
                     st.record_conversation_item(call.id, matched_call.id)
             return
 
-        for (_, protocol_id, _, _), matched_history in zip(ordered_protocol_items, history_items):
+        for group, matched_history in zip(protocol_groups, history_items):
             if matched_history.id is None:
                 continue
-            if protocol_id in st.deleted_conversation_item_ids:
-                st.runtime_config.chat.remove_item(matched_history.id)
+            if group[0][2] == "assistant":
+                survivors = [item for item in group if item[1] not in st.deleted_conversation_item_ids]
+                if not survivors:
+                    st.runtime_config.chat.remove_item(matched_history.id)
+                elif len(survivors) == 1:
+                    protocol_id = survivors[0][1]
+                    if len(group) > 1:
+                        pending = next(output for output in st.pending_text_outputs if output["item_id"] == protocol_id)
+                        visible_text = self._assistant_text(pending, wants_audio)
+                        if not st.runtime_config.chat.replace_assistant_message_text(matched_history.id, visible_text):
+                            st.runtime_config.chat.remove_item(matched_history.id)
+                        else:
+                            st.record_conversation_item(protocol_id, matched_history.id)
+                    else:
+                        st.record_conversation_item(protocol_id, matched_history.id)
+                else:
+                    # Multiple surviving wire items cannot be bound to one Chat
+                    # identity without ambiguity. Fail closed instead of
+                    # allowing a deleted segment to remain in model history.
+                    st.runtime_config.chat.remove_item(matched_history.id)
+                for _, protocol_id, _, _ in group:
+                    st.deleted_response_text_outputs.pop(protocol_id, None)
             else:
-                st.record_conversation_item(protocol_id, matched_history.id)
-            st.deleted_response_text_outputs.pop(protocol_id, None)
-            st.deleted_response_function_calls.pop(protocol_id, None)
+                protocol_id = group[0][1]
+                if protocol_id in st.deleted_conversation_item_ids:
+                    st.runtime_config.chat.remove_item(matched_history.id)
+                else:
+                    st.record_conversation_item(protocol_id, matched_history.id)
+                st.deleted_response_function_calls.pop(protocol_id, None)
 
     @staticmethod
     def _history_assistant_is_visible(item: RealtimeConversationItemAssistantMessage, wants_audio: bool) -> bool:

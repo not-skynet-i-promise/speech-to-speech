@@ -404,6 +404,22 @@ class Chat:
                 return True
         return False
 
+    def replace_assistant_message_text(self, item_id: str, text: str) -> bool:
+        """Replace a response-owned assistant item with its surviving text.
+
+        Realtime deletion can remove one wire segment from an LM message that
+        was committed as a single history item. Updating the existing item in
+        place preserves its turn position and provisional-generation identity.
+        """
+
+        with self._lock:
+            for item in self.buffer:
+                if not isinstance(item, RealtimeConversationItemAssistantMessage) or item.id != item_id:
+                    continue
+                item.content = [AssistantContent(type="output_text", text=text)] if text else []
+                return bool(item.content)
+        return False
+
     def remove_user_message(self, item_id: str) -> bool:
         """Remove an existing user message from the bounded chat buffer."""
 

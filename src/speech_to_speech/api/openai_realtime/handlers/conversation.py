@@ -176,8 +176,12 @@ class ConversationHandler(RealtimeBaseHandler):
                 pending for pending in st.pending_text_outputs if pending["item_id"] != event.item_id
             ]
             if removed_text_outputs:
+                removed = removed_text_outputs[0]
+                st.deleted_response_outputs[int(removed["output_index"])] = {
+                    "kind": "text",
+                    "item_id": str(removed["item_id"]),
+                }
                 if not history_was_bound:
-                    removed = removed_text_outputs[0]
                     st.deleted_response_text_outputs[event.item_id] = {
                         "item_id": removed["item_id"],
                         "output_index": removed["output_index"],
@@ -190,6 +194,12 @@ class ConversationHandler(RealtimeBaseHandler):
                     removed_call_ids.add(call.call_id)
                 del st.pending_function_calls[output_index]
                 st.finished_function_call_indices.discard(output_index)
+                st.deleted_response_outputs[output_index] = {
+                    "kind": "function_call",
+                    "item_id": str(call.id),
+                    "call_id": call.call_id,
+                    "name": call.name,
+                }
                 if not history_was_bound:
                     st.deleted_response_function_calls[event.item_id] = (output_index, call.call_id)
         for call_ids in st.generation_done_tool_calls.values():

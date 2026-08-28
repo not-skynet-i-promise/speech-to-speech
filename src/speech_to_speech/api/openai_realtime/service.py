@@ -228,6 +228,11 @@ class ConnState(BaseModel):
     deleted_conversation_item_ids: dict[str, None] = Field(default_factory=dict)
     deleted_response_text_outputs: dict[str, dict[str, Any]] = Field(default_factory=dict)
     deleted_response_function_calls: dict[str, tuple[int, str | None]] = Field(default_factory=dict)
+    # A response's streamed output_index values remain positions in its final
+    # output array even when the client removes an item from conversation
+    # history before response.done. Keep only the non-sensitive identity needed
+    # to emit a content-free placeholder at that original position.
+    deleted_response_outputs: dict[int, dict[str, Any]] = Field(default_factory=dict)
     input_audio_duration_s: float = 0.0
     last_item_id: Optional[str] = None
     current_response_params: RealtimeResponseCreateParams | None = None
