@@ -271,9 +271,13 @@ class ConnState(BaseModel):
 
     @staticmethod
     def response_dependency_count_is_bounded(count: int) -> bool:
-        """Whether dependencies leave room to admit one new speech item."""
+        """Whether dependencies leave room for the supported speech FIFO.
 
-        return count < MAX_TRACKED_PROTOCOL_ITEMS
+        Keep slots for one pending turn, every supported deferred turn, and
+        one provisional turn whose transcription may report a full queue.
+        """
+
+        return count + MAX_DEFERRED_RESPONSE_REQUESTS + 2 <= MAX_TRACKED_PROTOCOL_ITEMS
 
     def remove_response_context_input(self, item_id: str) -> None:
         """Remove one retired dependency while preserving any surviving owner."""

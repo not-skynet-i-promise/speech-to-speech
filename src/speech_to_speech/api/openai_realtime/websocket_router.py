@@ -258,9 +258,15 @@ async def _drain_pending_response_events(
     session_id: str | None,
     *,
     lock_held: bool = False,
-) -> None:
+) -> bool:
+    """Drain events owned by the closing response.
+
+    Returns whether an interrupting speech event closed that response.  The
+    caller must not apply the original terminal sentinel to a successor that
+    may have been admitted while the interrupt acknowledgement was in flight.
+    """
     if session_id is None:
-        return
+        return False
 
     state = unit.service._state(session_id)
     closing_turn_id = state.active_response_turn_id if state.in_response else state.pending_response_turn_id
@@ -308,6 +314,7 @@ async def _drain_pending_response_events(
     drained_assistant = 0
     drained_usage = 0
     drain_assistant_events = True
+    interrupted = False
     try:
         while True:
             try:
@@ -342,6 +349,7 @@ async def _drain_pending_response_events(
                 and (state.in_response or state.response_pending)
             ):
                 if await _dispatch_speech_start_locked(ws, unit, session_id, item):
+                    interrupted = True
                     break
             else:
                 preserved.append(item)
@@ -360,6 +368,7 @@ async def _drain_pending_response_events(
             drained_assistant,
             drained_usage,
         )
+    return interrupted
 
 
 async def _forward_audio_item_locked(
@@ -377,7 +386,9 @@ async def _forward_audio_item_locked(
     owns the transport boundary after this task has already dequeued old output.
     """
     if _is_pipeline_end(audio_chunk):
-        await _drain_pending_response_events(ws, unit, session_id, lock_held=True)
+        interrupted = await _drain_pending_response_events(ws, unit, session_id, lock_held=True)
+        if interrupted:
+            return True
         if await _close_failed_private_session(ws, unit, session_id, lock_held=True):
             return True
         if ws is not None:
@@ -391,7 +402,17 @@ async def _forward_audio_item_locked(
             unit.should_listen.set()
             logger.info(f"Pipeline {unit.index}: stale response complete, listening re-enabled")
             return False
-        await _drain_pending_response_events(ws, unit, session_id, lock_held=True)
+        interrupted = await _drain_pending_response_events(ws, unit, session_id, lock_held=True)
+        if interrupted:
+            state = unit.service._state(session_id)
+            if not state.in_response and not state.response_pending:
+                unit.response_playing.clear()
+                unit.cancel_scope.response_done(audio_generation)
+                unit.should_listen.set()
+                logger.info(f"Pipeline {unit.index}: interrupted response complete, listening re-enabled")
+            else:
+                logger.info(f"Pipeline {unit.index}: stale terminal skipped; successor response preserved")
+            return False
         if await _close_failed_private_session(ws, unit, session_id, lock_held=True):
             return False
         if ws is not None:

@@ -22,7 +22,7 @@ from starlette.websockets import WebSocketState
 
 import speech_to_speech.api.openai_realtime.websocket_router as router_module
 from speech_to_speech.api.openai_realtime.home_assistant_guard import session_contract
-from speech_to_speech.api.openai_realtime.pipeline_unit import PipelineUnit
+from speech_to_speech.api.openai_realtime.pipeline_unit import PipelineUnit, SessionState
 from speech_to_speech.api.openai_realtime.service import CHUNK_SIZE_BYTES, RealtimeService
 from speech_to_speech.api.openai_realtime.websocket_router import create_app
 from speech_to_speech.pipeline.cancel_scope import CancelScope
@@ -1333,6 +1333,88 @@ class TestSendLoop:
         assert request.cancel_generation is not None
         assert not cancel_scope.is_stale(request.cancel_generation)
         assert service._state(conn_id).in_response
+        service.unregister(conn_id)
+
+    def test_audio_done_does_not_close_response_created_during_interrupt_send(self, setup, monkeypatch):
+        _, service, input_queue, output_queue, text_output_queue, should_listen, _, response_playing, cancel_scope = (
+            setup
+        )
+        unit = PipelineUnit(
+            index=0,
+            service=service,
+            cancel_scope=cancel_scope,
+            should_listen=should_listen,
+            response_playing=response_playing,
+            input_queue=input_queue,
+            output_queue=output_queue,
+            text_output_queue=text_output_queue,
+            text_prompt_queue=service.text_prompt_queue,
+            handlers=[],
+        )
+        conn_id = service.register()
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_old", turn_revision=0),
+        )
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="old", turn_id="turn_old", turn_revision=0),
+        )
+        assert service.text_prompt_queue is not None
+        service.text_prompt_queue.get_nowait()
+        service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(text="old reply", turn_id="turn_old", turn_revision=0),
+        )
+        old_generation = cancel_scope.generation
+        text_output_queue.put(SpeechStartedEvent(turn_id="turn_interrupt", turn_revision=0))
+        ws = _FakeWebSocket()
+        session = SessionState(websocket=ws, session_id=conn_id)
+        send_entered = asyncio.Event()
+        release_send = asyncio.Event()
+        original_send = router_module._send_events_unlocked
+
+        async def pause_outbound_send(websocket, events):
+            send_entered.set()
+            await release_send.wait()
+            await original_send(websocket, events)
+
+        monkeypatch.setattr(router_module, "_send_events_unlocked", pause_outbound_send)
+
+        async def exercise_race() -> tuple[object, GenerateResponseRequest, bool]:
+            task = asyncio.create_task(
+                router_module._forward_audio_item_locked(
+                    unit,
+                    session,
+                    ws,
+                    conn_id,
+                    AudioOutput(audio=AUDIO_RESPONSE_DONE, cancel_generation=old_generation),
+                    old_generation,
+                )
+            )
+            await asyncio.wait_for(send_entered.wait(), timeout=1.0)
+            created = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+            cancel_scope.new_response()
+            request = service.text_prompt_queue.get_nowait()
+            response_playing.set()
+            release_send.set()
+            should_stop = await asyncio.wait_for(task, timeout=1.0)
+            return created, request, should_stop
+
+        created, request, should_stop = asyncio.run(exercise_race())
+
+        assert created is not None and created.type == "response.created"
+        assert not should_stop
+        assert service._state(conn_id).in_response
+        assert service._state(conn_id).current_response_id == created.response.id
+        assert request.cancel_generation == cancel_scope.generation
+        assert not cancel_scope.is_stale(request.cancel_generation)
+        assert response_playing.is_set()
+        assert all(
+            payload.get("response", {}).get("id") != created.response.id
+            for payload in ws.sent
+            if payload["type"] == "response.done"
+        )
         service.unregister(conn_id)
 
     def test_speech_started_does_not_cancel_pending_when_internal_non_interrupt(self, setup):

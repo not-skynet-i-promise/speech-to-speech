@@ -2265,42 +2265,64 @@ class TestHandleConversationItemDelete:
         assert state.admitting_response_input_item_ids == set()
         service.unregister(conn_id)
 
-    def test_response_input_dependencies_reserve_one_new_turn_slot(self, monkeypatch):
+    def test_response_input_dependencies_reserve_supported_turn_fifo(self, monkeypatch):
         import speech_to_speech.api.openai_realtime.service as service_module
 
-        monkeypatch.setattr(service_module, "MAX_TRACKED_PROTOCOL_ITEMS", 2)
-        service = RealtimeService(text_prompt_queue=Queue(), cancel_scope=CancelScope())
+        monkeypatch.setattr(service_module, "MAX_TRACKED_PROTOCOL_ITEMS", 4)
+        monkeypatch.setattr(service_module, "MAX_DEFERRED_RESPONSE_REQUESTS", 1)
+        tracker = SpeculativeTurnTracker()
+        prompt_queue = Queue()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            speculative_turns=tracker,
+            cancel_scope=CancelScope(),
+        )
         conn_id = service.register()
 
-        rejected = service.handle_response_create(
+        created = service.handle_response_create(
             conn_id,
             ResponseCreateEvent(
                 type="response.create",
                 response={
                     "input": [
                         {
-                            "id": f"msg_input_{index}",
+                            "id": "msg_input_active",
                             "type": "message",
                             "role": "user",
-                            "content": [{"type": "input_text", "text": str(index)}],
+                            "content": [{"type": "input_text", "text": "active"}],
                         }
-                        for index in range(2)
                     ]
                 },
             ),
         )
+        assert created is not None and created.type == "response.created"
+        prompt_queue.get_nowait()
+
+        turn_items = {}
+        for turn_id in ("turn_pending", "turn_deferred"):
+            turn_items[turn_id] = service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id=turn_id, turn_revision=0, interrupt_response=False),
+            )[0].item_id
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(transcript=turn_id, turn_id=turn_id, turn_revision=0),
+            )
 
         state = service._state(conn_id)
-        assert isinstance(rejected, RealtimeErrorEvent)
-        assert rejected.error.type == "invalid_input_item"
-        assert state.runtime_config.chat.buffer == []
-        assert state.protocol_item_ids == []
+        assert state.pending_response_turn_id == "turn_pending"
+        assert [request.turn_id for request in state.deferred_response_requests] == ["turn_deferred"]
+        for turn_id, item_id in turn_items.items():
+            assert item_id in state.protocol_item_ids
+            assert state.turn_input_item_ids[turn_id] == item_id
+            assert tracker.is_latest(turn_id, 0)
         service.unregister(conn_id)
 
     def test_protocol_retirement_prunes_completed_response_context(self, monkeypatch):
         import speech_to_speech.api.openai_realtime.service as service_module
 
-        monkeypatch.setattr(service_module, "MAX_TRACKED_PROTOCOL_ITEMS", 2)
+        monkeypatch.setattr(service_module, "MAX_TRACKED_PROTOCOL_ITEMS", 5)
+        monkeypatch.setattr(service_module, "MAX_DEFERRED_RESPONSE_REQUESTS", 1)
         service = RealtimeService(text_prompt_queue=Queue(), cancel_scope=CancelScope())
         conn_id = service.register()
         service.handle_response_create(
@@ -2323,10 +2345,10 @@ class TestHandleConversationItemDelete:
         service.finish_response(conn_id)
         state = service._state(conn_id)
 
-        for index in range(2):
+        for index in range(5):
             state.record_protocol_item(f"item_later_{index}")
 
-        assert len(state.protocol_item_ids) == 2
+        assert len(state.protocol_item_ids) == 5
         assert state.response_context_input_item_id is None
         assert state.response_context_input_item_ids == set()
         service.unregister(conn_id)
