@@ -195,6 +195,10 @@ class ConversationHandler(RealtimeBaseHandler):
             st.pending_response_turn_revision = None
         if (active_matches or (pending_matches and not st.in_response)) and self._service.cancel_scope is not None:
             self._service.cancel_scope.cancel()
+        # Retire the deleted item before closing its response.  Closing flushes
+        # items deferred during generation, and their previous_item_id must
+        # never point at the item this operation just removed.
+        st.remove_protocol_item(event.item_id)
         response_events: list[ServerEvent] = []
         if active_matches:
             response_events = self._service.response.finish_response(
@@ -206,7 +210,6 @@ class ConversationHandler(RealtimeBaseHandler):
             should_listen = self._should_listen(conn_id)
             if should_listen is not None:
                 should_listen.set()
-        st.remove_protocol_item(event.item_id)
         return [
             ConversationItemDeletedEvent(
                 type="conversation.item.deleted",

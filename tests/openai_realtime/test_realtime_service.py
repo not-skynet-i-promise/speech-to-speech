@@ -1019,6 +1019,52 @@ class TestHandleConversationItemDelete:
         assert cancel_scope.generation == 1
         service.unregister(conn_id)
 
+    def test_active_delete_flushes_deferred_item_after_deleted_protocol_tail(self):
+        tracker = SpeculativeTurnTracker()
+        service = RealtimeService(
+            text_prompt_queue=Queue(),
+            should_listen=Event(),
+            speculative_turns=tracker,
+            cancel_scope=CancelScope(),
+        )
+        conn_id = service.register()
+        started = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_active", turn_revision=0),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="assistant echo", turn_id="turn_active", turn_revision=0),
+        )
+        service.encode_audio_chunk(conn_id, _pcm_bytes(256))
+        assert (
+            service.handle_conversation_item_create(
+                conn_id,
+                ConversationItemCreateEvent(
+                    type="conversation.item.create",
+                    item={
+                        "id": "msg_deferred",
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "next turn"}],
+                    },
+                ),
+            )
+            == []
+        )
+
+        events = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=started.item_id),
+        )
+
+        created = next(event for event in events if isinstance(event, ConversationItemCreatedEvent))
+        assert created.item.id == "msg_deferred"
+        assert created.previous_item_id is None
+        assert service._state(conn_id).protocol_item_ids == ["msg_deferred"]
+        assert service._state(conn_id).last_item_id == "msg_deferred"
+        service.unregister(conn_id)
+
     def test_delete_restores_compacted_history_and_removes_only_exact_user(self, service, conn_id):
         from speech_to_speech.LLM.chat import Chat, CompactionResult, make_assistant_message
 
