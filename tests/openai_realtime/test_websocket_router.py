@@ -350,6 +350,62 @@ class TestClientEventDispatch:
                 assert successor.turn_id == "turn_next"
                 assert successor.cancel_generation == service.cancel_scope.generation
 
+    def test_delete_ack_cannot_be_overtaken_by_already_dequeued_assistant_output(self, setup, monkeypatch):
+        app, service, _, _, text_output_queue, *_ = setup
+        delete_send_entered = ThreadingEvent()
+        release_delete_send = ThreadingEvent()
+        original_send_events = router_module._send_events_unlocked
+
+        async def pause_before_delete_ack(ws, events):
+            if any(event.type == "conversation.item.deleted" for event in events):
+                delete_send_entered.set()
+                released = await asyncio.to_thread(release_delete_send.wait, 1.0)
+                assert released
+            await original_send_events(ws, events)
+
+        monkeypatch.setattr(router_module, "_send_events_unlocked", pause_before_delete_ack)
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                conn_id = next(iter(service._conns))
+                stale_generation = service.cancel_scope.generation
+                active = service.dispatch_pipeline_event(
+                    conn_id,
+                    SpeechStartedEvent(turn_id="turn_active", turn_revision=0),
+                )[0]
+                service.dispatch_pipeline_event(
+                    conn_id,
+                    TranscriptionCompletedEvent(
+                        transcript="first",
+                        turn_id="turn_active",
+                        turn_revision=0,
+                    ),
+                )
+                service.text_prompt_queue.get_nowait()
+                service.dispatch_pipeline_event(
+                    conn_id,
+                    AssistantTextEvent(text="initial", turn_id="turn_active", turn_revision=0),
+                )
+
+                ws.send_json({"type": "conversation.item.delete", "item_id": active.item_id})
+                assert delete_send_entered.wait(1.0)
+                text_output_queue.put(
+                    AssistantTextEvent(
+                        text="must not follow delete",
+                        cancel_generation=stale_generation,
+                    )
+                )
+                deadline = time.monotonic() + 1.0
+                while not text_output_queue.empty() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert text_output_queue.empty()
+                release_delete_send.set()
+
+                assert ws.receive_json()["type"] == "conversation.item.deleted"
+                assert ws.receive_json()["type"] == "response.done"
+                time.sleep(0.1)
+                assert service._state(conn_id).pending_text_outputs == []
+
     def test_audio_append_forwarded_to_input_queue(self, setup):
         app, _, input_queue, *_ = setup
         audio_b64 = base64.b64encode(_pcm_bytes(512)).decode("ascii")
@@ -1108,6 +1164,56 @@ class TestSendLoop:
                 time.sleep(0.15)
                 assert not cancel_scope.discarding
 
+    def test_pending_barge_in_clears_deferred_turns_before_admitting_new_turn(self, setup):
+        app, service, _, _, text_output_queue, *_ = setup
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                conn_id = next(iter(service._conns))
+                for turn_id in ("turn_pending", "turn_deferred"):
+                    service.dispatch_pipeline_event(
+                        conn_id,
+                        SpeechStartedEvent(turn_id=turn_id, turn_revision=0, interrupt_response=False),
+                    )
+                    service.dispatch_pipeline_event(
+                        conn_id,
+                        TranscriptionCompletedEvent(
+                            transcript=turn_id,
+                            turn_id=turn_id,
+                            turn_revision=0,
+                        ),
+                    )
+                assert service.text_prompt_queue.get_nowait().turn_id == "turn_pending"
+                assert [request.turn_id for request in service._state(conn_id).deferred_response_requests] == [
+                    "turn_deferred"
+                ]
+
+                text_output_queue.put(SpeechStartedEvent(turn_id="turn_interrupt", turn_revision=0))
+                assert ws.receive_json()["type"] == "input_audio_buffer.speech_started"
+                deadline = time.monotonic() + 1.0
+                while service._state(conn_id).response_pending and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                st = service._state(conn_id)
+                assert st.response_pending is False
+                assert st.pending_response_request is None
+                assert st.deferred_response_requests == []
+
+                service.dispatch_pipeline_event(
+                    conn_id,
+                    TranscriptionCompletedEvent(
+                        transcript="new turn",
+                        turn_id="turn_interrupt",
+                        turn_revision=0,
+                    ),
+                )
+                admitted = service.text_prompt_queue.get_nowait()
+                assert admitted.turn_id == "turn_interrupt"
+                service.dispatch_pipeline_event(
+                    conn_id,
+                    AssistantTextEvent(text="new reply", turn_id="turn_interrupt", turn_revision=0),
+                )
+                assert st.active_response_turn_id == "turn_interrupt"
+
     def test_speech_started_does_not_cancel_pending_when_internal_non_interrupt(self, setup):
         app, service, _, _, text_output_queue, _, _, _, cancel_scope = setup
         with TestClient(app) as client:
@@ -1194,6 +1300,60 @@ class TestSendLoop:
                 state = service._state(conn_id)
                 assert state.in_response
                 assert state.current_response_id == current_response_id
+
+    def test_response_done_keeps_the_promoted_successor_pending(self, setup):
+        app, service, _, output_queue, _, *_rest, cancel_scope = setup
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                conn_id = next(iter(service._conns))
+                service.dispatch_pipeline_event(
+                    conn_id,
+                    SpeechStartedEvent(turn_id="turn_active", turn_revision=0),
+                )
+                service.dispatch_pipeline_event(
+                    conn_id,
+                    TranscriptionCompletedEvent(
+                        transcript="first",
+                        turn_id="turn_active",
+                        turn_revision=0,
+                    ),
+                )
+                assert service.text_prompt_queue.get_nowait().turn_id == "turn_active"
+                service.dispatch_pipeline_event(
+                    conn_id,
+                    AssistantTextEvent(text="reply", turn_id="turn_active", turn_revision=0),
+                )
+                service.dispatch_pipeline_event(
+                    conn_id,
+                    SpeechStartedEvent(turn_id="turn_next", turn_revision=0, interrupt_response=False),
+                )
+                service.dispatch_pipeline_event(
+                    conn_id,
+                    TranscriptionCompletedEvent(
+                        transcript="second",
+                        turn_id="turn_next",
+                        turn_revision=0,
+                    ),
+                )
+
+                output_queue.put(
+                    AudioOutput(
+                        audio=AUDIO_RESPONSE_DONE,
+                        cancel_generation=cancel_scope.generation,
+                    )
+                )
+                for _ in range(5):
+                    if ws.receive_json()["type"] == "response.done":
+                        break
+                else:
+                    raise AssertionError("response.done was not emitted")
+
+                successor = service.text_prompt_queue.get_nowait()
+                state = service._state(conn_id)
+                assert successor.turn_id == "turn_next"
+                assert state.response_pending
+                assert state.pending_response_turn_id == "turn_next"
 
     def test_response_done_drains_pending_token_usage_before_finish(self, setup):
         app, service, _, output_queue, text_output_queue, *_ = setup

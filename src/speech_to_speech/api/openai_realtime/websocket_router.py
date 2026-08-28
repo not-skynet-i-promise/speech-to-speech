@@ -51,6 +51,7 @@ MAX_AUDIO_BATCH_BYTES = 6400
 SESSION_END_DRAIN_TIMEOUT_S = 10.0
 QItem = TypeVar("QItem")
 _PRIVATE_WEBSOCKET_SCOPE_KEY = "reachy_private_content"
+_OUTBOUND_LOCK_SCOPE_KEY = "reachy_outbound_lock"
 
 
 def _requests_private_transcript_barrier(raw: object) -> bool:
@@ -81,7 +82,7 @@ def _websocket_is_private(ws: WebSocket | None) -> bool:
     return bool(ws is not None and ws.scope.get(_PRIVATE_WEBSOCKET_SCOPE_KEY) is True)
 
 
-async def _send_event(ws: WebSocket, event: ServerEvent) -> None:
+async def _send_event_unlocked(ws: WebSocket, event: ServerEvent) -> None:
     # Skip cleanly when the ws is already closing/closed — happens during Ctrl-C
     # shutdown, where the lifespan starts closing sockets while the route handler
     # or send loop is still in flight pushing events.
@@ -110,15 +111,35 @@ async def _send_event(ws: WebSocket, event: ServerEvent) -> None:
             logger.error(f"Failed to send event to client: {e}")
 
 
-async def _send_events(ws: WebSocket, events: list[ServerEvent]) -> None:
+async def _send_event(ws: WebSocket, event: ServerEvent) -> None:
+    lock = ws.scope.get(_OUTBOUND_LOCK_SCOPE_KEY)
+    if isinstance(lock, asyncio.Lock):
+        async with lock:
+            await _send_event_unlocked(ws, event)
+    else:
+        await _send_event_unlocked(ws, event)
+
+
+async def _send_events_unlocked(ws: WebSocket, events: list[ServerEvent]) -> None:
     for event in events:
-        await _send_event(ws, event)
+        await _send_event_unlocked(ws, event)
+
+
+async def _send_events(ws: WebSocket, events: list[ServerEvent]) -> None:
+    lock = ws.scope.get(_OUTBOUND_LOCK_SCOPE_KEY)
+    if isinstance(lock, asyncio.Lock):
+        async with lock:
+            await _send_events_unlocked(ws, events)
+    else:
+        await _send_events_unlocked(ws, events)
 
 
 async def _close_failed_private_session(
     ws: WebSocket | None,
     unit: PipelineUnit,
     session_id: str | None,
+    *,
+    lock_held: bool = False,
 ) -> bool:
     if (
         session_id is None
@@ -127,7 +148,8 @@ async def _close_failed_private_session(
         or ws.application_state != WebSocketState.CONNECTED
     ):
         return False
-    await _send_event(
+    send = _send_event_unlocked if lock_held else _send_event
+    await send(
         ws,
         unit.service.make_error(
             "Private Home Assistant selector failed.",
@@ -190,6 +212,8 @@ async def _drain_pending_response_events(
     ws: WebSocket | None,
     unit: PipelineUnit,
     session_id: str | None,
+    *,
+    lock_held: bool = False,
 ) -> None:
     if session_id is None:
         return
@@ -216,7 +240,8 @@ async def _drain_pending_response_events(
                     continue
                 events = unit.service.dispatch_pipeline_event(session_id, item)
                 if ws is not None and events:
-                    await _send_events(ws, events)
+                    send = _send_events_unlocked if lock_held else _send_events
+                    await send(ws, events)
             else:
                 preserved.append(item)
                 drain_assistant_events = False
@@ -234,6 +259,91 @@ async def _drain_pending_response_events(
             drained_assistant,
             drained_usage,
         )
+
+
+async def _forward_audio_item_locked(
+    unit: PipelineUnit,
+    session: SessionState,
+    ws: WebSocket | None,
+    session_id: str,
+    audio_chunk: Any,
+    dequeued_generation: int,
+) -> bool:
+    """Process one dequeued audio item while ``session.outbound_lock`` is held.
+
+    Returns ``True`` when the pipeline-end sentinel asks the send loop to stop.
+    Rechecking cancellation after lock acquisition closes the gap where delete
+    owns the transport boundary after this task has already dequeued old output.
+    """
+    if _is_pipeline_end(audio_chunk):
+        await _drain_pending_response_events(ws, unit, session_id, lock_held=True)
+        if await _close_failed_private_session(ws, unit, session_id, lock_held=True):
+            return True
+        if ws is not None:
+            await _send_events_unlocked(ws, unit.service.finish_response(session_id))
+        return True
+
+    if _is_audio_done(audio_chunk):
+        audio_generation = _audio_generation(audio_chunk)
+        if audio_generation is not None and unit.cancel_scope.is_stale(audio_generation):
+            unit.cancel_scope.response_done(audio_generation)
+            unit.should_listen.set()
+            logger.info(f"Pipeline {unit.index}: stale response complete, listening re-enabled")
+            return False
+        await _drain_pending_response_events(ws, unit, session_id, lock_held=True)
+        if await _close_failed_private_session(ws, unit, session_id, lock_held=True):
+            return False
+        if ws is not None:
+            await _send_events_unlocked(ws, unit.service.finish_response(session_id))
+        unit.response_playing.clear()
+        unit.cancel_scope.response_done(audio_generation)
+        unit.should_listen.set()
+        logger.info(f"Pipeline {unit.index}: response complete, listening re-enabled")
+        return False
+
+    # SESSION_END travels from input_queue through every handler to output_queue.
+    if is_control_message(audio_chunk, SESSION_END.kind):
+        session.drained.set()
+        logger.debug(f"Pipeline {unit.index}: SESSION_END drained")
+        return False
+    if is_control_message(audio_chunk):
+        return False
+    if unit.service.private_protocol_failed(session_id):
+        return False
+
+    if _should_discard_audio(unit, audio_chunk) or (
+        _audio_generation(audio_chunk) is None and unit.cancel_scope.generation != dequeued_generation
+    ):
+        return False
+
+    audio_batch = bytearray(_to_audio_bytes(audio_chunk))
+    while len(audio_batch) < MAX_AUDIO_BATCH_BYTES:
+        try:
+            next_chunk = unit.output_queue.get_nowait()
+        except Empty:
+            break
+
+        if (
+            _is_pipeline_end(next_chunk)
+            or _is_audio_done(next_chunk)
+            or is_control_message(next_chunk, SESSION_END.kind)
+        ):
+            session.pending_output_item = next_chunk
+            break
+        if _should_discard_audio(unit, next_chunk):
+            continue
+        next_audio = _to_audio_bytes(next_chunk)
+        if len(audio_batch) + len(next_audio) > MAX_AUDIO_BATCH_BYTES:
+            session.pending_output_item = next_chunk
+            break
+        audio_batch.extend(next_audio)
+
+    if not unit.response_playing.is_set():
+        unit.response_playing.set()
+        unit.should_listen.set()
+    if ws is not None:
+        await _send_events_unlocked(ws, unit.service.encode_audio_chunk(session_id, bytes(audio_batch)))
+    return False
 
 
 def _clean_unit(unit: PipelineUnit, preserve: Callable[[Any], bool] | None = None) -> None:
@@ -387,6 +497,7 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
         # _claim_unit guarantees unit.session is not None for the returned unit.
         assert unit.session is not None
         unit.session.session_id = session_id
+        ws.scope[_OUTBOUND_LOCK_SCOPE_KEY] = unit.session.outbound_lock
         logger.info(f"Client connected to pipeline {unit.index} (session {session_id})")
 
         if unit.service.home_assistant_guard_required:
@@ -542,24 +653,26 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                         return
 
                 elif isinstance(event, ConversationItemDeleteEvent):
-                    generation_before_delete = unit.cancel_scope.generation
-                    events = unit.service.handle_conversation_item_delete(
-                        session_id,
-                        event,
-                        defer_successor_enqueue=True,
-                    )
-                    cancelled_generation = unit.cancel_scope.generation != generation_before_delete
-                    if cancelled_generation:
-                        _flush_queue(unit.output_queue, preserve=_keep_audio_sentinel)
-                        _flush_queue(unit.text_output_queue, preserve=_keep_user_text_event)
-                        unit.response_playing.clear()
-                        unit.should_listen.set()
-                    if events:
-                        await _send_events(ws, events)
-                    if cancelled_generation:
-                        # Release the successor only after cancelled output is
-                        # gone and the deletion acknowledgement is on the wire.
-                        unit.service.enqueue_pending_response(session_id)
+                    assert unit.session is not None
+                    async with unit.session.outbound_lock:
+                        generation_before_delete = unit.cancel_scope.generation
+                        events = unit.service.handle_conversation_item_delete(
+                            session_id,
+                            event,
+                            defer_successor_enqueue=True,
+                        )
+                        cancelled_generation = unit.cancel_scope.generation != generation_before_delete
+                        if cancelled_generation:
+                            _flush_queue(unit.output_queue, preserve=_keep_audio_sentinel)
+                            _flush_queue(unit.text_output_queue, preserve=_keep_user_text_event)
+                            unit.response_playing.clear()
+                            unit.should_listen.set()
+                        if events:
+                            await _send_events_unlocked(ws, events)
+                        if cancelled_generation:
+                            # Release the successor only after cancelled output is
+                            # gone and the deletion acknowledgement is on the wire.
+                            unit.service.enqueue_pending_response(session_id)
                     if unit.service.private_protocol_failed(session_id):
                         await ws.close(code=1008, reason="Private session failed")
                         return
@@ -583,16 +696,18 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                         return
 
                 elif isinstance(event, ResponseCancelEvent):
-                    state = unit.service._state(session_id)
-                    was_active = state.in_response or state.response_pending
-                    if was_active:
-                        unit.cancel_scope.cancel()
-                    _flush_queue(unit.output_queue, preserve=_keep_audio_sentinel)
-                    _flush_queue(unit.text_output_queue, preserve=_keep_user_text_event)
-                    events = unit.service.handle_response_cancel(session_id)
-                    if events:
-                        await _send_events(ws, events)
-                    unit.response_playing.clear()
+                    assert unit.session is not None
+                    async with unit.session.outbound_lock:
+                        state = unit.service._state(session_id)
+                        was_active = state.in_response or state.response_pending
+                        if was_active:
+                            unit.cancel_scope.cancel()
+                        _flush_queue(unit.output_queue, preserve=_keep_audio_sentinel)
+                        _flush_queue(unit.text_output_queue, preserve=_keep_user_text_event)
+                        events = unit.service.handle_response_cancel(session_id)
+                        if events:
+                            await _send_events_unlocked(ws, events)
+                        unit.response_playing.clear()
 
                 if unit.service.private_protocol_failed(session_id):
                     await _close_failed_private_session(ws, unit, session_id)
@@ -697,47 +812,49 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                 # Text events first (speech_started cancels active response).
                 try:
                     text_msg = unit.text_output_queue.get_nowait()
-                    is_speech_start = isinstance(text_msg, SpeechStartedEvent)
+                    dequeued_generation = unit.cancel_scope.generation
+                    if session is not None and ws is not None and session_id:
+                        async with session.outbound_lock:
+                            is_speech_start = isinstance(text_msg, SpeechStartedEvent)
+                            st = unit.service._state(session_id)
+                            was_in_response = is_speech_start and st.in_response
+                            was_response_pending = is_speech_start and st.response_pending
 
-                    was_in_response = False
-                    was_response_pending = False
-                    if is_speech_start and session_id:
-                        st = unit.service._state(session_id)
-                        was_in_response = st.in_response
-                        was_response_pending = st.response_pending
-
-                    if isinstance(text_msg, AssistantTextEvent) and _generation_is_discardable(
-                        unit, text_msg.cancel_generation
-                    ):
-                        pass
-                    elif ws is not None and isinstance(text_msg, PipelineEvent) and session_id:
-                        events = unit.service.dispatch_pipeline_event(session_id, text_msg)
-                        if events:
-                            await _send_events(ws, events)
-                        if unit.service.private_protocol_failed(session_id):
-                            await ws.close(code=1008, reason="Private session failed")
-
-                    if is_speech_start and (was_in_response or was_response_pending):
-                        active_cfg = unit.service._state(session_id).runtime_config if session_id else None
-                        if text_msg.interrupt_response and (
-                            active_cfg is None or active_cfg.interrupt_response_enabled
-                        ):
-                            unit.cancel_scope.cancel()
-                            if session_id:
-                                unit.service._state(session_id).response_pending = False
-                            _flush_queue(unit.output_queue, preserve=_keep_audio_sentinel)
-                            _flush_queue(unit.text_output_queue, preserve=_keep_user_text_event)
-                            if unit.response_playing.is_set():
-                                unit.response_playing.clear()
-                            logger.info(
-                                "Pipeline %d: speech during %s: cancelled, queue flushed",
-                                unit.index,
-                                "response" if was_in_response else "pending response",
+                            stale_untagged_assistant = (
+                                isinstance(text_msg, AssistantTextEvent)
+                                and text_msg.cancel_generation is None
+                                and unit.cancel_scope.generation != dequeued_generation
                             )
-                        else:
-                            logger.info(
-                                f"Pipeline {unit.index}: speech during response: interrupt_response disabled, ignoring"
-                            )
+                            if isinstance(text_msg, AssistantTextEvent) and (
+                                stale_untagged_assistant or _generation_is_discardable(unit, text_msg.cancel_generation)
+                            ):
+                                pass
+                            elif isinstance(text_msg, PipelineEvent):
+                                events = unit.service.dispatch_pipeline_event(session_id, text_msg)
+                                if events:
+                                    await _send_events_unlocked(ws, events)
+                                if unit.service.private_protocol_failed(session_id):
+                                    await ws.close(code=1008, reason="Private session failed")
+
+                            if is_speech_start and (was_in_response or was_response_pending):
+                                active_cfg = st.runtime_config
+                                if text_msg.interrupt_response and active_cfg.interrupt_response_enabled:
+                                    unit.cancel_scope.cancel()
+                                    unit.service.response.clear_pending_requests(session_id)
+                                    _flush_queue(unit.output_queue, preserve=_keep_audio_sentinel)
+                                    _flush_queue(unit.text_output_queue, preserve=_keep_user_text_event)
+                                    if unit.response_playing.is_set():
+                                        unit.response_playing.clear()
+                                    logger.info(
+                                        "Pipeline %d: speech during %s: cancelled, queue flushed",
+                                        unit.index,
+                                        "response" if was_in_response else "pending response",
+                                    )
+                                else:
+                                    logger.info(
+                                        "Pipeline %d: speech during response: interrupt_response disabled, ignoring",
+                                        unit.index,
+                                    )
                 except Empty:
                     pass
 
@@ -747,90 +864,20 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                         session.pending_output_item = None
                     else:
                         audio_chunk = unit.output_queue.get_nowait()
-
-                    if _is_pipeline_end(audio_chunk):
-                        await _drain_pending_response_events(ws, unit, session_id)
-                        if await _close_failed_private_session(ws, unit, session_id):
-                            break
-                        if ws is not None and session_id:
-                            await _send_events(ws, unit.service.finish_response(session_id))
+                    dequeued_generation = unit.cancel_scope.generation
+                    if session is None or not session_id:
+                        continue
+                    async with session.outbound_lock:
+                        should_stop = await _forward_audio_item_locked(
+                            unit,
+                            session,
+                            ws,
+                            session_id,
+                            audio_chunk,
+                            dequeued_generation,
+                        )
+                    if should_stop:
                         break
-
-                    if _is_audio_done(audio_chunk):
-                        audio_generation = _audio_generation(audio_chunk)
-                        if audio_generation is not None and unit.cancel_scope.is_stale(audio_generation):
-                            if session_id:
-                                unit.service._state(session_id).response_pending = False
-                            unit.cancel_scope.response_done(audio_generation)
-                            unit.should_listen.set()
-                            logger.info(f"Pipeline {unit.index}: stale response complete, listening re-enabled")
-                            continue
-                        await _drain_pending_response_events(ws, unit, session_id)
-                        if await _close_failed_private_session(ws, unit, session_id):
-                            continue
-                        if ws is not None and session_id:
-                            await _send_events(ws, unit.service.finish_response(session_id))
-                        if session_id:
-                            unit.service._state(session_id).response_pending = False
-                        unit.response_playing.clear()
-                        unit.cancel_scope.response_done(audio_generation)
-                        unit.should_listen.set()
-                        logger.info(f"Pipeline {unit.index}: response complete, listening re-enabled")
-                        continue
-
-                    # SESSION_END travels from input_queue through every handler to
-                    # output_queue. Observing it here means the chain has fully reset;
-                    # signal the release path so it can clear unit.session.
-                    if is_control_message(audio_chunk, SESSION_END.kind):
-                        if session is not None:
-                            session.drained.set()
-                            logger.debug(f"Pipeline {unit.index}: SESSION_END drained")
-                        continue
-
-                    if is_control_message(audio_chunk):
-                        continue
-
-                    if session_id and unit.service.private_protocol_failed(session_id):
-                        continue
-
-                    if _should_discard_audio(unit, audio_chunk):
-                        continue
-
-                    audio_chunk = _to_audio_bytes(audio_chunk)
-
-                    audio_batch = bytearray(audio_chunk)
-                    while len(audio_batch) < MAX_AUDIO_BATCH_BYTES:
-                        try:
-                            next_chunk = unit.output_queue.get_nowait()
-                        except Empty:
-                            break
-
-                        if (
-                            _is_pipeline_end(next_chunk)
-                            or _is_audio_done(next_chunk)
-                            or is_control_message(next_chunk, SESSION_END.kind)
-                        ):
-                            # Only stash if we still have a session; otherwise drop it.
-                            if session is not None:
-                                session.pending_output_item = next_chunk
-                            break
-
-                        if _should_discard_audio(unit, next_chunk):
-                            continue
-
-                        next_audio = _to_audio_bytes(next_chunk)
-                        if len(audio_batch) + len(next_audio) > MAX_AUDIO_BATCH_BYTES:
-                            if session is not None:
-                                session.pending_output_item = next_chunk
-                            break
-                        audio_batch.extend(next_audio)
-
-                    if not unit.response_playing.is_set():
-                        unit.response_playing.set()
-                        unit.should_listen.set()
-
-                    if ws is not None and session_id:
-                        await _send_events(ws, unit.service.encode_audio_chunk(session_id, bytes(audio_batch)))
                 except Empty:
                     pass
 

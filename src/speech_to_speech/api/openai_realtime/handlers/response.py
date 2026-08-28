@@ -39,13 +39,12 @@ class ResponseHandler(RealtimeBaseHandler):
         """Ensure a response and output item exist, creating them if needed."""
         st = self._state(conn_id)
         if st.current_response_id is None:
-            successor = st.deferred_response_request
+            successor = self.pop_next_deferred_request(conn_id)
             st.current_response_id = _generate_id("resp")
             self._start_item(conn_id)
             st.in_response = True
             st.active_response_turn_id = st.pending_response_turn_id
             st.active_response_turn_revision = st.pending_response_turn_revision
-            st.deferred_response_request = None
             if successor is None:
                 st.response_pending = False
                 st.pending_response_turn_id = None
@@ -59,6 +58,26 @@ class ResponseHandler(RealtimeBaseHandler):
                 st.pending_response_request = successor
                 st.pending_response_enqueued = False
         return st.current_response_id, self._current_item_id(conn_id)
+
+    def pop_next_deferred_request(self, conn_id: str) -> GenerateResponseRequest | None:
+        """Pop the next still-current distinct turn from the response FIFO."""
+        st = self._state(conn_id)
+        tracker = self._service.speculative_turns
+        while st.deferred_response_requests:
+            request = st.deferred_response_requests.pop(0)
+            if tracker is None or tracker.is_latest(request.turn_id, request.turn_revision):
+                return request
+        return None
+
+    def clear_pending_requests(self, conn_id: str) -> None:
+        """Forget every queued response admission after cancellation/barge-in."""
+        st = self._state(conn_id)
+        st.response_pending = False
+        st.pending_response_turn_id = None
+        st.pending_response_turn_revision = None
+        st.pending_response_request = None
+        st.pending_response_enqueued = False
+        st.deferred_response_requests.clear()
 
     def _end_response(self, conn_id: str, status: _ResponseStatus = "completed") -> None:
         st = self._state(conn_id)
@@ -88,7 +107,7 @@ class ResponseHandler(RealtimeBaseHandler):
         st.pending_response_turn_revision = None
         st.pending_response_request = None
         st.pending_response_enqueued = False
-        st.deferred_response_request = None
+        st.deferred_response_requests.clear()
         st.active_response_turn_id = None
         st.active_response_turn_revision = None
         st.current_response_params = None
@@ -250,7 +269,7 @@ class ResponseHandler(RealtimeBaseHandler):
         st.pending_response_turn_revision = None
         st.pending_response_request = None
         st.pending_response_enqueued = False
-        st.deferred_response_request = None
+        st.deferred_response_requests.clear()
         st.active_response_turn_id = None if out_of_band else st.speculative_user_turn_id
         st.active_response_turn_revision = None if out_of_band else st.speculative_user_turn_revision
 
@@ -313,12 +332,14 @@ class ResponseHandler(RealtimeBaseHandler):
         with ``response.done``.
         """
         st = self._state(conn_id)
-        deferred_request = None
+        deferred_requests: list[GenerateResponseRequest] = []
         if preserve_pending:
             if st.in_response:
-                deferred_request = st.pending_response_request
+                if st.pending_response_request is not None:
+                    deferred_requests.append(st.pending_response_request)
+                deferred_requests.extend(st.deferred_response_requests)
             elif st.response_pending:
-                deferred_request = st.deferred_response_request
+                deferred_requests.extend(st.deferred_response_requests)
         events: list[ServerEvent] = []
         if st.in_response:
             resp_id, item_id = self._ensure_response(conn_id)
@@ -355,12 +376,7 @@ class ResponseHandler(RealtimeBaseHandler):
             )
             self._end_response(conn_id, status)
         elif st.response_pending:
-            st.response_pending = False
-            st.pending_response_turn_id = None
-            st.pending_response_turn_revision = None
-            st.pending_response_request = None
-            st.pending_response_enqueued = False
-            st.deferred_response_request = None
+            self.clear_pending_requests(conn_id)
         # Apply any client items that arrived mid-generation now that in_response
         # is cleared and the generation's own write-back has landed. Done outside
         # the in_response guard so a stray terminal call still drains the buffer.
@@ -375,10 +391,18 @@ class ResponseHandler(RealtimeBaseHandler):
             # serialized against its response lease, so do not wait here.
             if not cfg.private_protocol_failed:
                 events.extend(self._service.conversation.flush_deferred_items(conn_id))
-        if deferred_request is not None and not cfg.private_protocol_failed:
+        if not cfg.private_protocol_failed:
             tracker = self._service.speculative_turns
-            if tracker is None or tracker.is_latest(deferred_request.turn_id, deferred_request.turn_revision):
+            while deferred_requests:
+                deferred_request = deferred_requests.pop(0)
+                if tracker is not None and not tracker.is_latest(
+                    deferred_request.turn_id,
+                    deferred_request.turn_revision,
+                ):
+                    continue
+                st.deferred_response_requests = deferred_requests
                 self.resume_pending_request(conn_id, deferred_request, enqueue=enqueue_pending)
+                break
         return events
 
     def resume_pending_request(
@@ -397,7 +421,6 @@ class ResponseHandler(RealtimeBaseHandler):
         st.pending_response_turn_revision = request.turn_revision
         st.pending_response_request = request
         st.pending_response_enqueued = False
-        st.deferred_response_request = None
         if enqueue:
             self.enqueue_pending_request(conn_id)
 

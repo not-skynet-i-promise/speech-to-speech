@@ -1123,6 +1123,87 @@ class TestHandleConversationItemDelete:
         assert st.pending_response_request is None
         service.unregister(conn_id)
 
+    def test_three_distinct_turns_are_preserved_in_fifo_order(self):
+        tracker = SpeculativeTurnTracker()
+        prompt_queue = Queue()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            speculative_turns=tracker,
+            cancel_scope=CancelScope(),
+        )
+        conn_id = service.register()
+
+        for index in range(3):
+            turn_id = f"turn_{index}"
+            service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id=turn_id, turn_revision=0, interrupt_response=False),
+            )
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(
+                    transcript=f"question {index}",
+                    turn_id=turn_id,
+                    turn_revision=0,
+                ),
+            )
+            if index == 0:
+                assert prompt_queue.get_nowait().turn_id == "turn_0"
+                service.dispatch_pipeline_event(
+                    conn_id,
+                    AssistantTextEvent(text="reply 0", turn_id="turn_0", turn_revision=0),
+                )
+
+        st = service._state(conn_id)
+        assert st.active_response_turn_id == "turn_0"
+        assert st.pending_response_turn_id == "turn_1"
+        assert [request.turn_id for request in st.deferred_response_requests] == ["turn_2"]
+        assert prompt_queue.empty()
+
+        service.finish_response(conn_id)
+        assert prompt_queue.get_nowait().turn_id == "turn_1"
+        service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(text="reply 1", turn_id="turn_1", turn_revision=0),
+        )
+        assert st.active_response_turn_id == "turn_1"
+        assert st.pending_response_turn_id == "turn_2"
+        assert st.deferred_response_requests == []
+
+        service.finish_response(conn_id)
+        assert prompt_queue.get_nowait().turn_id == "turn_2"
+        service.unregister(conn_id)
+
+    def test_response_fifo_overflow_is_reported_without_replacing_accepted_turns(self):
+        prompt_queue = Queue()
+        service = RealtimeService(text_prompt_queue=prompt_queue)
+        conn_id = service.register()
+        overflow_events = []
+
+        for index in range(10):
+            turn_id = f"turn_{index}"
+            service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id=turn_id, turn_revision=0, interrupt_response=False),
+            )
+            overflow_events = service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(
+                    transcript=f"question {index}",
+                    turn_id=turn_id,
+                    turn_revision=0,
+                ),
+            )
+
+        st = service._state(conn_id)
+        assert st.pending_response_turn_id == "turn_0"
+        assert [request.turn_id for request in st.deferred_response_requests] == [
+            f"turn_{index}" for index in range(1, 9)
+        ]
+        assert overflow_events[-1].type == "error"
+        assert overflow_events[-1].error.type == "response_queue_full"
+        service.unregister(conn_id)
+
     def test_queued_delete_promotes_a_held_successor_turn(self):
         tracker = SpeculativeTurnTracker()
         cancel_scope = CancelScope()
@@ -1152,8 +1233,8 @@ class TestHandleConversationItemDelete:
         )
         st = service._state(conn_id)
         assert st.pending_response_turn_id == "turn_queued"
-        assert st.deferred_response_request is not None
-        assert st.deferred_response_request.turn_id == "turn_successor"
+        assert len(st.deferred_response_requests) == 1
+        assert st.deferred_response_requests[0].turn_id == "turn_successor"
         assert prompt_queue.empty()
 
         service.handle_conversation_item_delete(
@@ -1165,7 +1246,7 @@ class TestHandleConversationItemDelete:
         assert successor.turn_id == "turn_successor"
         assert successor.cancel_generation == cancel_scope.generation == 1
         assert st.pending_response_turn_id == "turn_successor"
-        assert st.deferred_response_request is None
+        assert st.deferred_response_requests == []
         service.unregister(conn_id)
 
     def test_delete_restores_compacted_history_and_removes_only_exact_user(self, service, conn_id):

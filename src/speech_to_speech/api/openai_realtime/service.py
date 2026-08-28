@@ -82,6 +82,7 @@ CHUNK_SAMPLES = 512
 BYTES_PER_SAMPLE = 2
 CHUNK_SIZE_BYTES = CHUNK_SAMPLES * BYTES_PER_SAMPLE
 MAX_TRACKED_PROTOCOL_ITEMS = 2048
+MAX_DEFERRED_RESPONSE_REQUESTS = 8
 
 _ResponseStatus = Literal["completed", "cancelled", "failed", "incomplete", "in_progress"]
 _StatusReason = Literal["turn_detected", "client_cancelled", "max_output_tokens", "content_filter"]
@@ -223,7 +224,11 @@ class ConnState(BaseModel):
     pending_response_turn_revision: Optional[int] = None
     pending_response_request: GenerateResponseRequest | None = None
     pending_response_enqueued: bool = False
-    deferred_response_request: GenerateResponseRequest | None = None
+    # Later distinct turns wait here in arrival order while the current/pending
+    # response owns the model lane.  The bound prevents an unattended client
+    # from growing per-connection memory indefinitely; overflow is reported to
+    # the client instead of silently replacing an accepted turn.
+    deferred_response_requests: list[GenerateResponseRequest] = Field(default_factory=list)
     active_response_turn_id: Optional[str] = None
     active_response_turn_revision: Optional[int] = None
     # Client conversation.item.create items that arrived while a response was
@@ -944,21 +949,42 @@ class RealtimeService:
                 st.pending_response_request = request
                 queue.put(request)
                 st.pending_response_enqueued = True
-            elif st.in_response:
-                st.response_pending = True
-                st.pending_response_turn_id = event.turn_id
-                st.pending_response_turn_revision = event.turn_revision
-                st.pending_response_request = request
-                st.pending_response_enqueued = False
-            elif st.response_pending:
-                st.deferred_response_request = request
             else:
-                st.response_pending = True
-                st.pending_response_turn_id = event.turn_id
-                st.pending_response_turn_revision = event.turn_revision
-                st.pending_response_request = request
-                queue.put(request)
-                st.pending_response_enqueued = True
+                deferred_index = next(
+                    (
+                        index
+                        for index, candidate in enumerate(st.deferred_response_requests)
+                        if candidate.turn_id == event.turn_id
+                    ),
+                    None,
+                )
+                if deferred_index is not None:
+                    # Coalesce a speculative revision without changing the
+                    # distinct turn's place in the FIFO.
+                    st.deferred_response_requests[deferred_index] = request
+                elif st.in_response and not st.response_pending:
+                    st.response_pending = True
+                    st.pending_response_turn_id = event.turn_id
+                    st.pending_response_turn_revision = event.turn_revision
+                    st.pending_response_request = request
+                    st.pending_response_enqueued = False
+                elif st.response_pending:
+                    if len(st.deferred_response_requests) >= MAX_DEFERRED_RESPONSE_REQUESTS:
+                        events.append(
+                            self.make_error(
+                                "Too many responses are waiting to run.",
+                                "response_queue_full",
+                            )
+                        )
+                    else:
+                        st.deferred_response_requests.append(request)
+                else:
+                    st.response_pending = True
+                    st.pending_response_turn_id = event.turn_id
+                    st.pending_response_turn_revision = event.turn_revision
+                    st.pending_response_request = request
+                    queue.put(request)
+                    st.pending_response_enqueued = True
 
         return events
 
