@@ -167,6 +167,11 @@ class AudioHandler(RealtimeBaseHandler):
         response = self._service.response
         events: list[ServerEvent] = []
         st = self._state(conn_id)
+        # A new speech lifecycle owns any subsequent metadata-free terminal,
+        # and reusing an explicit turn identity starts a fresh revision rather
+        # than inheriting an older item's deletion tombstone.
+        st.deleted_input_turn_revisions.pop((None, None), None)
+        st.deleted_input_turn_revisions.pop((event.turn_id, event.turn_revision), None)
         interrupt_enabled = event.interrupt_response and st.runtime_config.interrupt_response_enabled
         if st.in_response and interrupt_enabled:
             events.extend(response.finish_response(conn_id, status="cancelled", reason="turn_detected"))

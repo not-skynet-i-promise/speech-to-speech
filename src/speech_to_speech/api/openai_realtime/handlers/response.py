@@ -28,6 +28,7 @@ from openai.types.realtime.realtime_response_usage import RealtimeResponseUsage
 
 from speech_to_speech.api.openai_realtime.handlers.base import RealtimeBaseHandler
 from speech_to_speech.LLM.chat import ChatItemError, add_supported_item
+from speech_to_speech.LLM.utils import remove_markdown, remove_unspeechable
 from speech_to_speech.pipeline.events import (
     AssistantOutputEvent,
     AssistantResponseDoneEvent,
@@ -373,7 +374,8 @@ class ResponseHandler(RealtimeBaseHandler):
         st.pending_text_outputs.append({"item_id": item_id, "output_index": output_index, "parts": []})
         st.pending_assistant_item_id = item_id
         st.pending_assistant_output_index = output_index
-        st.record_conversation_item(item_id)
+        if not is_out_of_band(st.current_response_params):
+            st.record_conversation_item(item_id)
         return item_id, output_index
 
     def _next_content_index(self, conn_id: str) -> int:
@@ -517,63 +519,73 @@ class ResponseHandler(RealtimeBaseHandler):
         return "".join(str(part) for part in parts)
 
     def _bind_response_history_items(self, conn_id: str) -> None:
-        """Bind response wire IDs to the corresponding model-history IDs."""
+        """Bind wire IDs to response-owned history by output structure.
+
+        The language model keeps its original text in ``Chat`` while the
+        realtime audio stream removes Markdown and TTS-unfriendly characters.
+        Text equality therefore is not a stable identity. Provisional history
+        is already scoped to this response, so ordered output kind (plus the
+        stable tool call ID) is the structural identity shared by both sides.
+        """
         st = self._state(conn_id)
         if is_out_of_band(st.current_response_params):
             return
+        wants_audio = response_wants_audio(st.current_response_params)
         history_items = [
             item
             for item in st.runtime_config.chat.provisional_items(st.current_response_key)
-            if isinstance(item, (RealtimeConversationItemAssistantMessage, RealtimeConversationItemFunctionCall))
+            if (
+                isinstance(item, RealtimeConversationItemFunctionCall)
+                or (
+                    isinstance(item, RealtimeConversationItemAssistantMessage)
+                    and self._history_assistant_is_visible(item, wants_audio)
+                )
+            )
         ]
         text_outputs = [*st.pending_text_outputs, *st.deleted_response_text_outputs.values()]
-        protocol_items: list[tuple[int, str, str, object]] = [
+        protocol_items: list[tuple[int, str, str, object | None]] = [
             (
                 int(pending["output_index"]),
                 str(pending["item_id"]),
                 "assistant",
-                self._assistant_text(pending, response_wants_audio(st.current_response_params)),
+                None,
             )
             for pending in text_outputs
         ]
         protocol_items.extend(
             (output_index, str(call.id), "function_call", call.call_id)
-            for output_index, call in (
-                *st.pending_function_calls.items(),
-                *st.deleted_response_function_calls.values(),
-            )
+            for output_index, call in st.pending_function_calls.items()
             if call.id is not None
         )
-        history_cursor = 0
-        for _, protocol_id, kind, identity in sorted(protocol_items):
-            match = None
-            for index in range(history_cursor, len(history_items)):
-                candidate = history_items[index]
-                if kind == "function_call":
-                    compatible = (
-                        isinstance(candidate, RealtimeConversationItemFunctionCall) and candidate.call_id == identity
-                    )
-                else:
-                    candidate_text = (
-                        self._history_assistant_text(
-                            candidate,
-                            response_wants_audio(st.current_response_params),
-                        )
-                        if isinstance(candidate, RealtimeConversationItemAssistantMessage)
-                        else None
-                    )
-                    compatible = candidate_text == identity
-                    if protocol_id in st.deleted_conversation_item_ids and isinstance(candidate_text, str):
-                        # A client may delete a streamed item before the LM's
-                        # final write-back adds its trailing chunks. In that case
-                        # remove the complete history message rather than letting
-                        # the acknowledged prefix reappear in later context.
-                        compatible = compatible or not identity or candidate_text.startswith(str(identity))
-                if compatible:
-                    match = candidate
-                    history_cursor = index + 1
-                    break
-            if match is None or match.id is None:
+        protocol_items.extend(
+            (output_index, item_id, "function_call", call_id)
+            for item_id, (output_index, call_id) in st.deleted_response_function_calls.items()
+        )
+        ordered_protocol_items = sorted(protocol_items)
+        structure_matches = len(ordered_protocol_items) == len(history_items) and all(
+            (kind == "assistant" and isinstance(candidate, RealtimeConversationItemAssistantMessage))
+            or (
+                kind == "function_call"
+                and isinstance(candidate, RealtimeConversationItemFunctionCall)
+                and candidate.call_id == identity
+            )
+            for (_, _, kind, identity), candidate in zip(ordered_protocol_items, history_items)
+        )
+        if not structure_matches:
+            # An acknowledged deletion is a privacy boundary. If response-owned
+            # history and wire structure ever diverge, remove the entire
+            # provisional generation rather than risk retaining deleted text.
+            if any(protocol_id in st.deleted_conversation_item_ids for _, protocol_id, _, _ in ordered_protocol_items):
+                for item in history_items:
+                    if item.id is not None:
+                        st.runtime_config.chat.remove_item(item.id)
+                for _, protocol_id, _, _ in ordered_protocol_items:
+                    st.deleted_response_text_outputs.pop(protocol_id, None)
+                    st.deleted_response_function_calls.pop(protocol_id, None)
+            return
+
+        for (_, protocol_id, _, _), match in zip(ordered_protocol_items, history_items):
+            if match.id is None:
                 continue
             if protocol_id in st.deleted_conversation_item_ids:
                 st.runtime_config.chat.remove_item(match.id)
@@ -583,15 +595,16 @@ class ResponseHandler(RealtimeBaseHandler):
             st.deleted_response_function_calls.pop(protocol_id, None)
 
     @staticmethod
-    def _history_assistant_text(item: RealtimeConversationItemAssistantMessage, wants_audio: bool) -> str:
-        """Return the response-visible text identity of one history message."""
+    def _history_assistant_is_visible(item: RealtimeConversationItemAssistantMessage, wants_audio: bool) -> bool:
+        """Return whether one history message can produce a wire text item."""
         parts = [
             str(getattr(content, "transcript", None) or getattr(content, "text", None) or "")
             for content in item.content
         ]
         if wants_audio:
-            return " ".join(part.strip() for part in parts if part.strip())
-        return "".join(parts)
+            rendered = remove_markdown(remove_unspeechable("".join(parts)))
+            return bool(rendered.strip())
+        return bool("".join(parts))
 
     # ── Public handlers ───────────────────────────
 

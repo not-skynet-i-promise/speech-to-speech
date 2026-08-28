@@ -207,6 +207,12 @@ class ConnState(BaseModel):
     # to their originating protocol item and keep append-only state per item.
     input_item_by_turn_revision: dict[tuple[str, int | None], str] = Field(default_factory=dict)
     input_items: dict[str, InputItemState] = Field(default_factory=dict)
+    # A client can delete an input item before either the transcription or
+    # direct-audio terminal reaches the realtime service. Keep the originating
+    # turn identity tombstoned so neither terminal can recreate or queue the
+    # acknowledged-deleted input. ``(None, None)`` covers metadata-free
+    # pipelines and is cleared when the next speech lifecycle starts.
+    deleted_input_turn_revisions: dict[tuple[str | None, int | None], None] = Field(default_factory=dict)
     # Protocol-visible conversation order is distinct from the model Chat's
     # storage IDs (notably for generated messages and transcribed audio).
     conversation_item_order: list[str] = Field(default_factory=list)
@@ -216,9 +222,7 @@ class ConnState(BaseModel):
     # needed to remove a late write-back after an acknowledged deletion.
     deleted_conversation_item_ids: dict[str, None] = Field(default_factory=dict)
     deleted_response_text_outputs: dict[str, dict[str, Any]] = Field(default_factory=dict)
-    deleted_response_function_calls: dict[str, tuple[int, RealtimeConversationItemFunctionCall]] = Field(
-        default_factory=dict
-    )
+    deleted_response_function_calls: dict[str, tuple[int, str | None]] = Field(default_factory=dict)
     input_audio_duration_s: float = 0.0
     last_item_id: Optional[str] = None
     current_response_params: RealtimeResponseCreateParams | None = None
@@ -293,6 +297,16 @@ class ConnState(BaseModel):
         self.deleted_conversation_item_ids[item_id] = None
         while len(self.deleted_conversation_item_ids) > 256:
             self.deleted_conversation_item_ids.pop(next(iter(self.deleted_conversation_item_ids)))
+
+    def tombstone_input_terminal(self, turn_id: str | None, turn_revision: int | None) -> None:
+        """Suppress late terminals for one acknowledged-deleted input turn."""
+        self.deleted_input_turn_revisions[(turn_id, turn_revision)] = None
+        while len(self.deleted_input_turn_revisions) > 256:
+            self.deleted_input_turn_revisions.pop(next(iter(self.deleted_input_turn_revisions)))
+
+    def input_terminal_was_deleted(self, turn_id: str | None, turn_revision: int | None) -> bool:
+        """Return whether a pipeline terminal belongs to a deleted input."""
+        return (turn_id, turn_revision) in self.deleted_input_turn_revisions
 
     def mark_response_pending(self, response_key: str) -> None:
         """Track an implicit response from queueing until its first output."""
@@ -739,6 +753,13 @@ class RealtimeService:
     def _on_audio_input_completed(self, conn_id: str, event: AudioInputCompletedEvent) -> list[ServerEvent]:
         """Record final input audio and queue its realtime LM request."""
         st = self._state(conn_id)
+        if st.input_terminal_was_deleted(event.turn_id, event.turn_revision):
+            logger.debug(
+                "Ignoring direct-audio completion for deleted turn=%s rev=%s",
+                event.turn_id,
+                event.turn_revision,
+            )
+            return []
         self.audio.release_input_item_state(conn_id, event.turn_id, event.turn_revision)
         self.response.discard_tool_followup_prefetch(conn_id)
         st.generation_done_tool_calls.clear()

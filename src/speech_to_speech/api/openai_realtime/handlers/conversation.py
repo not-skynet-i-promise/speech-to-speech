@@ -184,11 +184,22 @@ class ConversationHandler(RealtimeBaseHandler):
                     removed_call_ids.add(call.call_id)
                 del st.pending_function_calls[output_index]
                 st.finished_function_call_indices.discard(output_index)
-                st.deleted_response_function_calls[event.item_id] = (output_index, call.model_copy(deep=True))
+                st.deleted_response_function_calls[event.item_id] = (output_index, call.call_id)
         for call_ids in st.generation_done_tool_calls.values():
             call_ids.difference_update(removed_call_ids)
 
         if event.item_id in st.input_items:
+            deleted_turns = [
+                turn
+                for turn, tracked_item_id in st.input_item_by_turn_revision.items()
+                if tracked_item_id == event.item_id
+            ]
+            for turn_id, turn_revision in deleted_turns:
+                st.tombstone_input_terminal(turn_id, turn_revision)
+            if st.current_input_item_id == event.item_id:
+                # Metadata-free transcription/direct-audio terminals resolve
+                # through the active item rather than a turn routing key.
+                st.tombstone_input_terminal(None, None)
             st.input_items.pop(event.item_id, None)
             # Keep the turn route until its terminal arrives. The missing item
             # then suppresses that terminal instead of falling back to a newly
@@ -430,6 +441,13 @@ class ConversationHandler(RealtimeBaseHandler):
     ) -> list[ConversationItemInputAudioTranscriptionCompletedEvent]:
         """Terminalize one transcript item and emit its authoritative final event."""
         st = self._state(conn_id)
+        if st.input_terminal_was_deleted(event.turn_id, event.turn_revision):
+            logger.debug(
+                "Ignoring transcription completion for deleted turn=%s rev=%s",
+                event.turn_id,
+                event.turn_revision,
+            )
+            return []
         item_id = self._completion_input_item_id(conn_id, event.turn_id, event.turn_revision)
         if item_id is None:
             # Preserve the pre-routing fallback for protocol-neutral pipelines
@@ -464,6 +482,13 @@ class ConversationHandler(RealtimeBaseHandler):
     ) -> list[ConversationItemInputAudioTranscriptionFailedEvent]:
         """Terminalize one transcript item and emit its item-scoped failure."""
         st = self._state(conn_id)
+        if st.input_terminal_was_deleted(event.turn_id, event.turn_revision):
+            logger.debug(
+                "Ignoring transcription failure for deleted turn=%s rev=%s",
+                event.turn_id,
+                event.turn_revision,
+            )
+            return []
         if event.turn_id is not None:
             item_id = st.input_item_by_turn_revision.get((event.turn_id, event.turn_revision))
         else:

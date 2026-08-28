@@ -500,6 +500,38 @@ class TestHandleConversationItemDelete:
         assert '"arguments":"{}"' in history
         assert "handled_out_of_band" in history
 
+    def test_pending_private_call_tombstone_retains_only_binding_identity(self, service, conn_id):
+        st = service._state(conn_id)
+        st.mark_response_pending("response_private")
+        events = service.dispatch_pipeline_event(
+            conn_id,
+            AssistantOutputEvent(
+                parts=[
+                    AssistantToolCallPart(
+                        tool=ResponseFunctionToolCall(
+                            id="fc_private",
+                            type="function_call",
+                            call_id="call_private",
+                            name="lookup",
+                            arguments='{"query":"PRIVATE_ARGUMENT_SENTINEL"}',
+                        )
+                    )
+                ],
+                response_key="response_private",
+            ),
+        )
+        wire_item_id = next(
+            event.item_id for event in events if isinstance(event, ResponseFunctionCallArgumentsDoneEvent)
+        )
+
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=wire_item_id),
+        )
+
+        assert st.deleted_response_function_calls[wire_item_id] == (0, "call_private")
+        assert "PRIVATE_ARGUMENT_SENTINEL" not in repr(st.deleted_response_function_calls)
+
     def test_unknown_item_returns_error(self, service, conn_id):
         events = service.handle_conversation_item_delete(
             conn_id,
@@ -562,7 +594,7 @@ class TestHandleConversationItemDelete:
                 RealtimeConversationItemAssistantMessage(
                     type="message",
                     role="assistant",
-                    content=[{"type": "output_text", "text": "PRIVATE_DELAYED_TEXT trailing writeback"}],
+                    content=[{"type": "output_text", "text": "**PRIVATE_DELAYED_TEXT** trailing writeback"}],
                 )
             ],
         )
@@ -619,6 +651,61 @@ class TestHandleConversationItemDelete:
         assert completed == []
         assert st.runtime_config.chat.buffer == []
         assert service.text_prompt_queue.empty()
+
+    def test_metadata_free_active_input_delete_suppresses_all_late_terminals(
+        self,
+        service,
+        conn_id,
+        text_prompt_queue,
+    ):
+        st = service._state(conn_id)
+        started = service.dispatch_pipeline_event(conn_id, SpeechStartedEvent())
+        wire_item_id = next(event.item_id for event in started if isinstance(event, InputAudioBufferSpeechStartedEvent))
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=wire_item_id),
+        )
+        transcription_events = service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="PRIVATE_METADATA_FREE_INPUT"),
+        )
+        audio_events = service.dispatch_pipeline_event(
+            conn_id,
+            AudioInputCompletedEvent(
+                audio=np.zeros(1600, dtype=np.float32),
+                audio_sample_rate=16000,
+                audio_duration_s=0.1,
+            ),
+        )
+
+        assert isinstance(deleted[-1], ConversationItemDeletedEvent)
+        assert transcription_events == []
+        assert audio_events == []
+        assert st.runtime_config.chat.buffer == []
+        assert text_prompt_queue.empty()
+        assert st.response_pending is False
+
+    def test_new_speech_clears_metadata_free_input_delete_tombstone(self, service, conn_id):
+        first_started = service.dispatch_pipeline_event(conn_id, SpeechStartedEvent())
+        first_item_id = next(
+            event.item_id for event in first_started if isinstance(event, InputAudioBufferSpeechStartedEvent)
+        )
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=first_item_id),
+        )
+
+        second_started = service.dispatch_pipeline_event(conn_id, SpeechStartedEvent())
+        completed = service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="new input"),
+        )
+
+        second_item_id = next(
+            event.item_id for event in second_started if isinstance(event, InputAudioBufferSpeechStartedEvent)
+        )
+        assert completed[0].item_id == second_item_id
 
     def test_history_binding_skips_nonvisible_whitespace_item(self, service, conn_id):
         st = service._state(conn_id)
@@ -2643,6 +2730,26 @@ class TestEncodeAudioChunk:
         events = service.encode_audio_chunk(conn_id, _pcm_bytes(256))
         resp = events[0].response
         assert resp.metadata == {"key": "value"}
+
+    def test_out_of_band_audio_item_never_enters_default_conversation_order(self, service, conn_id):
+        created = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(type="response.create", response={"conversation": "none"}),
+        )
+        assert isinstance(created, ResponseCreatedEvent)
+
+        events = service.encode_audio_chunk(conn_id, _pcm_bytes(256))
+        item_id = next(event.item_id for event in events if isinstance(event, ResponseAudioDeltaEvent))
+        st = service._state(conn_id)
+
+        assert item_id not in st.conversation_item_order
+        assert st.last_item_id is None
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=item_id),
+        )
+        assert isinstance(deleted[0], RealtimeErrorEvent)
+        assert deleted[0].error.type == "item_not_found"
 
 
 # ===================================================================
