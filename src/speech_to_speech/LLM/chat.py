@@ -488,6 +488,28 @@ class Chat:
             restored.append(original)
         return restored, surviving_nodes
 
+    def _restore_compaction_node_for_response(
+        self,
+        node: _CompactionNode,
+        item_id: str,
+    ) -> tuple[list[SupportedItem], list[_CompactionNode]]:
+        """Expand the exact branch needed by a queued response turn."""
+
+        restored: list[SupportedItem] = []
+        surviving_nodes: list[_CompactionNode] = []
+        for original in node.originals:
+            if isinstance(original, _CompactionNode):
+                if item_id in original.deletable_user_ids:
+                    nested_items, nested_nodes = self._restore_compaction_node_for_response(original, item_id)
+                    restored.extend(nested_items)
+                    surviving_nodes.extend(nested_nodes)
+                else:
+                    restored.extend((original.user_summary, original.assistant_summary))
+                    surviving_nodes.append(original)
+                continue
+            restored.append(original)
+        return restored, surviving_nodes
+
     def _remove_response_items_for_user_locked(self, item_id: str) -> None:
         """Remove canonical response output owned by one deleted user item."""
 
@@ -731,9 +753,84 @@ class Chat:
             clone._private_content_logging = self._private_content_logging
             return clone
 
-    def snapshot_for_response_turn(self, target_user_id: str, later_user_ids: set[str]) -> Chat:
-        """Return current context with later queued users excluded and the target last."""
+    def user_message(self, item_id: str) -> RealtimeConversationItemUserMessage | None:
+        """Return a detached copy of one exact user item, if it is present."""
+
         with self._lock:
+            item = next(
+                (
+                    candidate
+                    for candidate in self.buffer
+                    if isinstance(candidate, RealtimeConversationItemUserMessage) and candidate.id == item_id
+                ),
+                None,
+            )
+            return item.model_copy(deep=True) if item is not None else None
+
+    def response_owner_for_item(self, item_id: str) -> str | None:
+        """Return the canonical user item that owns derived response output."""
+
+        with self._lock:
+            return self._response_item_owners.get(item_id)
+
+    def snapshot_for_response_turn(
+        self,
+        target_user_id: str,
+        later_user_ids: set[str],
+        *,
+        fallback_user: RealtimeConversationItemUserMessage | None = None,
+    ) -> Chat:
+        """Return current context with one queued target restored and last.
+
+        A prior response may have compacted or hard-evicted the queued user
+        before its turn reached the model lane. Restore the exact item from
+        reversible compaction provenance, or from its admission snapshot after
+        lossy eviction. The generation bump also prevents an older in-flight
+        compactor from consuming the target after this snapshot is prepared.
+        """
+        with self._lock:
+            self._gen_counter += 1
+            self._compact_in_flight = False
+            target_present = any(
+                isinstance(item, RealtimeConversationItemUserMessage) and item.id == target_user_id
+                for item in self.buffer
+            )
+            if not target_present:
+                for summary_id, node in list(self._compaction_nodes.items()):
+                    if target_user_id not in node.deletable_user_ids:
+                        continue
+                    summary_ids = {node.user_summary.id, node.assistant_summary.id}
+                    indexes = [index for index, item in enumerate(self.buffer) if item.id in summary_ids]
+                    if not indexes:
+                        self._compaction_nodes.pop(summary_id, None)
+                        continue
+                    restored, surviving_nodes = self._restore_compaction_node_for_response(node, target_user_id)
+                    insert_at = min(indexes)
+                    self.buffer = [item for item in self.buffer if item.id not in summary_ids]
+                    self.buffer[insert_at:insert_at] = restored
+                    self._compaction_nodes.pop(summary_id, None)
+                    for surviving in surviving_nodes:
+                        assert surviving.user_summary.id is not None
+                        self._compaction_nodes[surviving.user_summary.id] = surviving
+                    target_present = True
+                    break
+            if not target_present and fallback_user is not None and fallback_user.id == target_user_id:
+                insert_at = next(
+                    (
+                        index
+                        for index, item in enumerate(self.buffer)
+                        if isinstance(item, RealtimeConversationItemUserMessage) and item.id in later_user_ids
+                    ),
+                    len(self.buffer),
+                )
+                self.buffer.insert(insert_at, fallback_user.model_copy(deep=True))
+                self._deletable_user_ids.add(target_user_id)
+                target_present = True
+            self._user_turn_count = sum(
+                1 for item in self.buffer if isinstance(item, RealtimeConversationItemUserMessage)
+            )
+            if not target_present:
+                logger.warning("Queued response user %s was unavailable in live and admission history", target_user_id)
             clone = Chat(self.size)
             clone.init_chat_message = self.init_chat_message
             selected = [

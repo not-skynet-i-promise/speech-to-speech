@@ -60,7 +60,7 @@ flowchart LR
 | `input_audio_buffer.append` | Stream base64 PCM audio. Decoded, resampled to 16 kHz, and chunked for the VAD. |
 | `session.update` | Deep-merge session config (instructions, tools, voice, turn detection, audio format). |
 | `conversation.item.create` | Inject `input_text` or `function_call_output` into the LLM context without triggering generation. |
-| `conversation.item.delete` | Delete one exact protocol-visible user item. An input-audio item ID removes its mapped transcript and cancels only a queued or active response owned by that turn. |
+| `conversation.item.delete` | Delete one exact protocol-visible user item. An input-audio item ID removes its mapped transcript, derived assistant/tool and tool-follow-up history, and cancels only a queued or active response owned by that turn. |
 | `response.create` | Trigger LLM generation. Supports per-response `instructions` and `tool_choice` overrides; rejected while any automatic or explicit response is active or pending. |
 | `response.cancel` | Cancel the in-progress response and re-enable listening. |
 
@@ -68,6 +68,11 @@ flowchart LR
 Set it to `false` to emit and store each non-empty completed transcription without
 automatically starting generation; send `response.create` when the response
 should begin.
+
+Automatic responses use a bounded FIFO. A speculative revision that resolves
+to an empty transcript retires its pending or active slot, and a queued turn is
+restored from exact compaction provenance (or its admission snapshot after
+lossy eviction) before it reaches the model.
 
 ### Server -> Client
 
@@ -263,7 +268,7 @@ indices are dense.
 
 1. Client executes the tool and sends `conversation.item.create` with `type: "function_call_output"` and `output: "<result>"`
 2. `RealtimeService` appends the tool output to the chat context and emits `conversation.item.created`; this does not trigger generation.
-3. If the tool result needs to be spoken to the user, such as camera/search/data results, the client sends `response.create` to trigger follow-up generation.
+3. If the tool result needs to be spoken to the user, such as camera/search/data results, the client sends `response.create` to trigger follow-up generation. The follow-up retains the original user item's deletion ownership.
 4. For fire-and-forget robot actions such as dance, emotion, head movement, stop, or idle tools, the client can stop after `conversation.item.created`; the assistant should already have spoken the natural lead-in before the tool call.
 
 ---

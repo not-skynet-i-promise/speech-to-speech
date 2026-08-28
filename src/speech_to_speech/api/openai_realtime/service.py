@@ -929,6 +929,16 @@ class RealtimeService:
             cfg.chat.remove_user_message(st.speculative_user_item_id)
             st.input_item_chat_ids.pop(input_item_id, None)
             st.speculative_user_item_id = None
+            if input_item_id in st.response_context_input_item_ids:
+                st.response_context_input_item_id = None
+                st.response_context_input_item_ids.clear()
+                st.response_context_turn_id = None
+                st.response_context_turn_revision = None
+                st.response_context_speech_stopped_at_s = None
+            if event.turn_id is not None:
+                events.extend(self.response.discard_turn(conn_id, event.turn_id))
+                if not st.in_response and not st.response_pending and self.should_listen is not None:
+                    self.should_listen.set()
         elif event.turn_id is not None and event.turn_id != st.speculative_user_turn_id:
             st.speculative_user_item_id = None
 

@@ -12,7 +12,10 @@ from openai.types.realtime import (
     ConversationItemInputAudioTranscriptionCompletedEvent,
     ConversationItemInputAudioTranscriptionDeltaEvent,
 )
-from openai.types.realtime.conversation_item import RealtimeConversationItemUserMessage
+from openai.types.realtime.conversation_item import (
+    RealtimeConversationItemFunctionCallOutput,
+    RealtimeConversationItemUserMessage,
+)
 from openai.types.realtime.conversation_item_input_audio_transcription_completed_event import (
     UsageTranscriptTextUsageDuration,
 )
@@ -102,6 +105,15 @@ class ConversationHandler(RealtimeBaseHandler):
                 st.runtime_config.chat.mark_user_message_deletable(item.id)
                 st.response_context_input_item_id = item.id
                 st.response_context_input_item_ids = {item.id}
+            elif (
+                isinstance(item, RealtimeConversationItemFunctionCallOutput)
+                and (owner_id := st.runtime_config.chat.response_owner_for_item(item.id)) is not None
+            ):
+                mapped_input_ids = [
+                    input_id for input_id in st.protocol_item_ids if st.input_item_chat_ids.get(input_id) == owner_id
+                ]
+                st.response_context_input_item_id = mapped_input_ids[-1] if mapped_input_ids else owner_id
+                st.response_context_input_item_ids = set(mapped_input_ids) or {owner_id}
             else:
                 st.response_context_input_item_id = None
                 st.response_context_input_item_ids.clear()

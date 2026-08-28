@@ -1350,6 +1350,29 @@ class TestCompaction:
             for part in getattr(item, "content", [])
         )
 
+    def test_queued_response_snapshot_restores_exact_user_after_hard_eviction(self):
+        chat = Chat(size=1)
+        target = chat.add_item(make_user_message("exact queued request"))
+        assert target.id is not None
+        chat.mark_user_message_deletable(target.id)
+        admission = chat.copy()
+        later_ids = set()
+        for text in ("later one", "later two"):
+            later = chat.add_item(make_user_message(text))
+            assert later.id is not None
+            later_ids.add(later.id)
+
+        assert chat.user_message(target.id) is None
+
+        snapshot = chat.snapshot_for_response_turn(
+            target.id,
+            later_ids,
+            fallback_user=admission.user_message(target.id),
+        )
+
+        assert chat.user_message(target.id) is not None
+        assert [item.content[0].text for item in snapshot.buffer if item.role == "user"] == ["exact queued request"]
+
     def test_completed_compaction_can_restore_and_delete_one_exact_user(self):
         chat = Chat(size=2)
         users = []

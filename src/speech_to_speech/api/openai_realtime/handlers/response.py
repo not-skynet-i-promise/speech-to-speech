@@ -93,6 +93,39 @@ class ResponseHandler(RealtimeBaseHandler):
         st.pending_response_enqueued = False
         st.deferred_response_requests.clear()
 
+    def discard_turn(self, conn_id: str, turn_id: str) -> list[ServerEvent]:
+        """Discard one superseded speculative turn without stranding the FIFO."""
+
+        st = self._state(conn_id)
+        st.deferred_response_requests = [
+            request for request in st.deferred_response_requests if request.turn_id != turn_id
+        ]
+        active_matches = st.in_response and st.active_response_turn_id == turn_id
+        pending_matches = st.response_pending and st.pending_response_turn_id == turn_id
+        if not active_matches and not pending_matches:
+            return []
+        if self._service.cancel_scope is not None and (active_matches or not st.in_response):
+            self._service.cancel_scope.cancel()
+        if active_matches or not st.in_response:
+            return self.finish_response(
+                conn_id,
+                status="cancelled",
+                reason="client_cancelled",
+            )
+
+        # A different response is active and this turn only owns the held slot.
+        # Remove it without cancelling the active generation, then preserve FIFO
+        # by moving the next still-current turn into the held slot.
+        st.response_pending = False
+        st.pending_response_turn_id = None
+        st.pending_response_turn_revision = None
+        st.pending_response_request = None
+        st.pending_response_enqueued = False
+        successor = self.pop_next_deferred_request(conn_id)
+        if successor is not None:
+            self.resume_pending_request(conn_id, successor, enqueue=False)
+        return []
+
     def _end_response(self, conn_id: str, status: _ResponseStatus = "completed") -> None:
         st = self._state(conn_id)
         if status == "cancelled":
@@ -515,7 +548,13 @@ class ResponseHandler(RealtimeBaseHandler):
             if later_chat_id is not None:
                 later_chat_ids.add(later_chat_id)
         refreshed_chat = (
-            st.runtime_config.chat.snapshot_for_response_turn(target_chat_id, later_chat_ids)
+            st.runtime_config.chat.snapshot_for_response_turn(
+                target_chat_id,
+                later_chat_ids,
+                fallback_user=(
+                    request.chat_snapshot.user_message(target_chat_id) if request.chat_snapshot is not None else None
+                ),
+            )
             if target_chat_id is not None
             else request.chat_snapshot
         )

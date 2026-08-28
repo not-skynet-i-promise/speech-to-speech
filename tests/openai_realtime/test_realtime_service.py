@@ -1270,6 +1270,73 @@ class TestHandleConversationItemDelete:
         ]
         service.unregister(conn_id)
 
+    def test_promoted_turn_restores_exact_user_after_completed_compaction(self):
+        from speech_to_speech.LLM.chat import Chat, CompactionResult
+
+        prompt_queue = Queue()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            speculative_turns=SpeculativeTurnTracker(),
+            cancel_scope=CancelScope(),
+        )
+        conn_id = service.register()
+        state = service._state(conn_id)
+        state.runtime_config.chat = Chat(size=2)
+
+        for turn_id, transcript in (
+            ("turn_active", "first exact"),
+            ("turn_target", "second exact"),
+            ("turn_later", "third exact"),
+        ):
+            service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id=turn_id, turn_revision=0, interrupt_response=False),
+            )
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(transcript=transcript, turn_id=turn_id, turn_revision=0),
+            )
+            if turn_id == "turn_active":
+                active_request = prompt_queue.get_nowait()
+                service.dispatch_pipeline_event(
+                    conn_id,
+                    AssistantTextEvent(text="first reply", turn_id=turn_id, turn_revision=0),
+                )
+                state.runtime_config.chat.add_response_item(
+                    make_assistant_message("first reply"),
+                    after_user_id=active_request.response_user_item_id,
+                )
+
+        target_chat_id = state.input_item_chat_ids[state.turn_input_item_ids["turn_target"]]
+        state.runtime_config.chat.trim_if_needed(
+            lambda _snapshot: CompactionResult(user_summary="lossy summary", assistant_summary="summary reply")
+        )
+        assert state.runtime_config.chat._compact_thread is not None
+        state.runtime_config.chat._compact_thread.join(timeout=2.0)
+        assert state.runtime_config.chat.user_message(target_chat_id) is None
+
+        service.finish_response(conn_id)
+
+        promoted = prompt_queue.get_nowait()
+        assert promoted.turn_id == "turn_target"
+        assert promoted.response_user_item_id == target_chat_id
+        snapshot_texts = [
+            part.text
+            for item in promoted.chat_snapshot.buffer
+            for part in getattr(item, "content", [])
+            if getattr(part, "text", None)
+        ]
+        assert "second exact" in snapshot_texts
+        assert "third exact" not in snapshot_texts
+        assert state.runtime_config.chat.user_message(target_chat_id) is not None
+        reply = state.runtime_config.chat.add_response_item(
+            make_assistant_message("second exact reply"),
+            after_user_id=promoted.response_user_item_id,
+        )
+        assert reply is not None
+        assert state.runtime_config.chat.response_owner_for_item(reply.id) == target_chat_id
+        service.unregister(conn_id)
+
     def test_response_fifo_overflow_is_reported_without_replacing_accepted_turns(self):
         prompt_queue = Queue()
         service = RealtimeService(text_prompt_queue=prompt_queue)
@@ -1933,6 +2000,78 @@ class TestDeferConversationItemsDuringResponse:
         assert not any(isinstance(e, RealtimeErrorEvent) for e in finish_events)
         assert chat._has_call_id_in_buffer("call_1")
         assert chat.buffer[-1].type == "function_call_output"
+
+    def test_tool_result_follow_up_keeps_original_user_deletion_owner(
+        self,
+        service,
+        conn_id,
+        text_prompt_queue,
+    ):
+        from openai.types.realtime.realtime_conversation_item_function_call import (
+            RealtimeConversationItemFunctionCall,
+        )
+
+        st = service._state(conn_id)
+        chat = st.runtime_config.chat
+        started = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_owner", turn_revision=0, interrupt_response=False),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="look this up", turn_id="turn_owner", turn_revision=0),
+        )
+        first_request = text_prompt_queue.get_nowait()
+        assert first_request.response_user_item_id is not None
+        service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(text="checking", turn_id="turn_owner", turn_revision=0),
+        )
+        chat.add_response_item(
+            RealtimeConversationItemFunctionCall(
+                type="function_call",
+                call_id="call_owned",
+                name="search",
+                arguments="{}",
+            ),
+            after_user_id=first_request.response_user_item_id,
+        )
+        service.finish_response(conn_id)
+        created = service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={"type": "function_call_output", "output": "result", "call_id": "call_owned"},
+            ),
+        )
+        output_id = created[0].item.id
+
+        assert output_id is not None
+        assert chat.response_owner_for_item(output_id) == first_request.response_user_item_id
+        assert st.response_context_input_item_id == started.item_id
+        assert st.response_context_input_item_ids == {started.item_id}
+
+        response_created = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        assert isinstance(response_created, ResponseCreatedEvent)
+        request = text_prompt_queue.get_nowait()
+        assert request.response_user_item_id == first_request.response_user_item_id
+        assert st.active_response_input_item_ids == {started.item_id}
+        chat.add_response_item(make_assistant_message("owned follow-up"), after_user_id=request.response_user_item_id)
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=started.item_id),
+        )
+
+        assert isinstance(deleted[0], ConversationItemDeletedEvent)
+        assert any(isinstance(event, ResponseDoneEvent) for event in deleted)
+        assert not st.in_response
+        assert all(
+            getattr(part, "text", None) not in {"look this up", "owned follow-up"}
+            for item in chat.buffer
+            for part in getattr(item, "content", [])
+        )
+        assert not any(getattr(item, "call_id", None) == "call_owned" for item in chat.buffer)
 
     def test_guarded_deferred_batch_is_atomic_when_later_output_is_invalid(
         self,
@@ -3709,7 +3848,7 @@ class TestDispatchPipelineEvent:
             conn_id,
             SpeechStoppedEvent(duration_s=2.0, turn_id="turn_1", turn_revision=1),
         )
-        service.dispatch_pipeline_event(
+        empty_events = service.dispatch_pipeline_event(
             conn_id,
             TranscriptionCompletedEvent(transcript="", turn_id="turn_1", turn_revision=1),
         )
@@ -3719,7 +3858,73 @@ class TestDispatchPipelineEvent:
         first_req = text_prompt_queue.get_nowait()
         assert first_req.turn_revision == 0
         assert text_prompt_queue.empty()
-        assert service._state(conn_id).response_usage.audio_duration_s == 2.0
+        assert any(isinstance(event, ResponseCreatedEvent) for event in empty_events)
+        assert any(isinstance(event, ResponseDoneEvent) for event in empty_events)
+        assert not service._state(conn_id).in_response
+        assert not service._state(conn_id).response_pending
+        assert service.total_usage.audio_duration_s == 2.0
+        assert service.total_usage.responses_cancelled == 1
+        service.unregister(conn_id)
+
+    def test_empty_active_revision_closes_lane_before_the_next_turn(self, runtime_config, should_listen):
+        text_prompt_queue = Queue()
+        tracker = SpeculativeTurnTracker()
+        cancel_scope = CancelScope()
+        service = RealtimeService(
+            text_prompt_queue=text_prompt_queue,
+            should_listen=should_listen,
+            speculative_turns=tracker,
+            cancel_scope=cancel_scope,
+        )
+        conn_id = service.register()
+        service._state(conn_id).runtime_config = runtime_config
+
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_empty", turn_revision=0, interrupt_response=False),
+        )
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="false start", turn_id="turn_empty", turn_revision=0),
+        )
+        assert text_prompt_queue.get_nowait().turn_revision == 0
+        service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(text="stale reply", turn_id="turn_empty", turn_revision=0),
+        )
+        assert service._state(conn_id).in_response
+
+        tracker.observe("turn_empty", 1)
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(
+                turn_id="turn_empty",
+                turn_revision=1,
+                reopened=True,
+                interrupt_response=False,
+            ),
+        )
+        terminal = service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="", turn_id="turn_empty", turn_revision=1),
+        )
+
+        assert any(isinstance(event, ResponseDoneEvent) and event.response.status == "cancelled" for event in terminal)
+        assert not service._state(conn_id).in_response
+        assert not service._state(conn_id).response_pending
+        assert cancel_scope.generation == 1
+
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_next", turn_revision=0, interrupt_response=False),
+        )
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="real question", turn_id="turn_next", turn_revision=0),
+        )
+        successor = text_prompt_queue.get_nowait()
+        assert successor.turn_id == "turn_next"
+        assert service._state(conn_id).response_pending
         service.unregister(conn_id)
 
     def test_empty_first_revision_tracks_audio_for_later_nonempty_reopen(self, runtime_config, should_listen):
