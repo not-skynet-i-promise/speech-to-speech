@@ -618,6 +618,42 @@ class Chat:
             clone._private_content_logging = self._private_content_logging
             return clone
 
+    def snapshot_for_response_turn(self, target_user_id: str, later_user_ids: set[str]) -> Chat:
+        """Return current context with later queued users excluded and the target last."""
+        with self._lock:
+            clone = Chat(self.size)
+            clone.init_chat_message = self.init_chat_message
+            selected = [
+                item
+                for item in self.buffer
+                if not (
+                    isinstance(item, RealtimeConversationItemUserMessage)
+                    and item.id is not None
+                    and item.id in later_user_ids
+                )
+            ]
+            target = next(
+                (
+                    item
+                    for item in selected
+                    if isinstance(item, RealtimeConversationItemUserMessage) and item.id == target_user_id
+                ),
+                None,
+            )
+            if target is not None:
+                selected.remove(target)
+                selected.append(target)
+            clone.buffer = selected
+            clone._pending_tool_calls = dict(self._pending_tool_calls)
+            clone._user_turn_count = sum(
+                1 for item in selected if isinstance(item, RealtimeConversationItemUserMessage)
+            )
+            clone._deletable_user_ids = set(self._deletable_user_ids)
+            clone._compaction_nodes = dict(self._compaction_nodes)
+            clone._compaction_suspended = self._compaction_suspended
+            clone._private_content_logging = self._private_content_logging
+            return clone
+
     def reset(
         self,
         *,

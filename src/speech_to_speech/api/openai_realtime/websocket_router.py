@@ -168,6 +168,7 @@ def _keep_user_text_event(item: Any) -> bool:
     return isinstance(
         item,
         (
+            SpeechStartedEvent,
             SpeechStoppedEvent,
             PartialTranscriptionEvent,
             TranscriptionCompletedEvent,

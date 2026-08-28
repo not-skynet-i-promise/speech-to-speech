@@ -101,8 +101,10 @@ class ConversationHandler(RealtimeBaseHandler):
             if isinstance(item, RealtimeConversationItemUserMessage):
                 st.runtime_config.chat.mark_user_message_deletable(item.id)
                 st.response_context_input_item_id = item.id
+                st.response_context_input_item_ids = {item.id}
             else:
                 st.response_context_input_item_id = None
+                st.response_context_input_item_ids.clear()
             st.response_context_turn_id = None
             st.response_context_turn_revision = None
             st.response_context_speech_stopped_at_s = None
@@ -197,15 +199,16 @@ class ConversationHandler(RealtimeBaseHandler):
             st.speculative_user_turn_revision = None
             st.speculative_user_speech_stopped_at_s = None
             st.speculative_audio_duration_s = 0.0
-        if st.response_context_input_item_id == event.item_id:
+        if event.item_id in st.response_context_input_item_ids:
             st.response_context_input_item_id = None
+            st.response_context_input_item_ids.clear()
             st.response_context_turn_id = None
             st.response_context_turn_revision = None
             st.response_context_speech_stopped_at_s = None
 
         pending_matches = turn_id is not None and st.pending_response_turn_id == turn_id
         active_matches = (turn_id is not None and st.active_response_turn_id == turn_id) or (
-            st.active_response_input_item_id == event.item_id
+            event.item_id in st.active_response_input_item_ids
         )
         promote_successor = pending_matches and not st.in_response
         if pending_matches:

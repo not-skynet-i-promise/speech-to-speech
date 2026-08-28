@@ -4,6 +4,7 @@ import logging
 from typing import TYPE_CHECKING, Optional
 
 from openai.types.realtime import (
+    ConversationItem,
     RealtimeResponse,
     ResponseAudioDoneEvent,
     ResponseAudioTranscriptDoneEvent,
@@ -14,6 +15,7 @@ from openai.types.realtime import (
     ResponseTextDeltaEvent,
     ResponseTextDoneEvent,
 )
+from openai.types.realtime.conversation_item import RealtimeConversationItemUserMessage
 from openai.types.realtime.realtime_response import Audio, AudioOutput
 from openai.types.realtime.realtime_response_status import RealtimeResponseStatus
 from openai.types.realtime.realtime_response_usage import RealtimeResponseUsage
@@ -49,6 +51,9 @@ class ResponseHandler(RealtimeBaseHandler):
                 st.turn_input_item_ids.get(st.active_response_turn_id)
                 if st.active_response_turn_id is not None
                 else None
+            )
+            st.active_response_input_item_ids = (
+                {st.active_response_input_item_id} if st.active_response_input_item_id is not None else set()
             )
             if successor is None:
                 st.response_pending = False
@@ -116,6 +121,7 @@ class ResponseHandler(RealtimeBaseHandler):
         st.active_response_turn_id = None
         st.active_response_turn_revision = None
         st.active_response_input_item_id = None
+        st.active_response_input_item_ids.clear()
         st.response_failure_pending = False
         st.current_response_params = None
         st.next_output_index = 0
@@ -256,22 +262,61 @@ class ResponseHandler(RealtimeBaseHandler):
         # they appear in history. Out-of-band: leave the default conversation untouched —
         # the input rides along on the request and seeds a throwaway chat in the LM.
         if not out_of_band and event.response and event.response.input:
+            input_items = list(event.response.input)
+            seen_ids = set(st.protocol_item_ids)
+            seen_ids.update(item_id for item in st.deferred_items if (item_id := getattr(item, "id", None)) is not None)
+            for item in input_items:
+                item_id = getattr(item, "id", None)
+                if item_id is None:
+                    continue
+                if item_id in seen_ids:
+                    if st.runtime_config.home_assistant_guard_operational:
+                        return self._service.poison_home_assistant_guard(conn_id, "invalid_input_item")
+                    return self.make_client_content_error(
+                        conn_id,
+                        "Conversation item ID already exists.",
+                        "duplicate_item_id",
+                    )
+                seen_ids.add(item_id)
+            accepted_user_ids: list[str] = []
+            accepted_item_ids: list[str] = []
+
+            def record_accepted_item(item: ConversationItem) -> None:
+                if item.id is None:
+                    return
+                st.record_protocol_item(item.id)
+                accepted_item_ids.append(item.id)
+                if isinstance(item, RealtimeConversationItemUserMessage):
+                    st.runtime_config.chat.mark_user_message_deletable(item.id)
+                    accepted_user_ids.append(item.id)
+
             try:
                 if st.runtime_config.sensitive_content:
-                    add_supported_items_atomically(st.runtime_config.chat, list(event.response.input))
+                    add_supported_items_atomically(st.runtime_config.chat, input_items)
+                    for item in input_items:
+                        record_accepted_item(item)
                 else:
                     # Preserve the default Realtime behavior: accepted prefix items
                     # remain in ordinary history if a later item is rejected. Private
                     # sessions need the stronger all-or-nothing retention boundary.
-                    for item in event.response.input:
+                    for item in input_items:
                         add_supported_item(st.runtime_config.chat, item)
+                        record_accepted_item(item)
             except ChatItemError as exc:
+                if accepted_item_ids:
+                    st.response_context_input_item_id = accepted_user_ids[-1] if accepted_user_ids else None
+                    st.response_context_input_item_ids = set(accepted_user_ids)
+                    st.response_context_turn_id = None
+                    st.response_context_turn_revision = None
+                    st.response_context_speech_stopped_at_s = None
                 if st.runtime_config.home_assistant_guard_operational:
                     return self._service.poison_home_assistant_guard(conn_id, "invalid_input_item")
                 return self.make_client_content_error(conn_id, str(exc), "invalid_input_item")
-            # response.input is newer context than any prior audio turn but is
-            # not represented by a protocol-visible input-audio item.
-            st.response_context_input_item_id = None
+            # response.input is newer context than any prior audio turn. Track
+            # every accepted user item because deletion of any one invalidates
+            # the response that serialized the batch.
+            st.response_context_input_item_id = accepted_user_ids[-1] if accepted_user_ids else None
+            st.response_context_input_item_ids = set(accepted_user_ids)
             st.response_context_turn_id = None
             st.response_context_turn_revision = None
             st.response_context_speech_stopped_at_s = None
@@ -286,6 +331,7 @@ class ResponseHandler(RealtimeBaseHandler):
         st.active_response_turn_id = None if out_of_band else st.response_context_turn_id
         st.active_response_turn_revision = None if out_of_band else st.response_context_turn_revision
         st.active_response_input_item_id = None if out_of_band else st.response_context_input_item_id
+        st.active_response_input_item_ids = set() if out_of_band else set(st.response_context_input_item_ids)
 
         st.current_response_params = event.response
         st.current_response_id = _generate_id("resp")
@@ -432,7 +478,24 @@ class ResponseHandler(RealtimeBaseHandler):
         """Re-admit one held successor after its preceding response closes."""
         st = self._state(conn_id)
         generation = self._service.cancel_scope.generation if self._service.cancel_scope else None
-        request = request.model_copy(update={"cancel_generation": generation})
+        target_input_id = st.turn_input_item_ids.get(request.turn_id) if request.turn_id is not None else None
+        target_chat_id = st.input_item_chat_ids.get(target_input_id) if target_input_id is not None else None
+        later_chat_ids: set[str] = set()
+        for later_request in st.deferred_response_requests:
+            if later_request.turn_id is None:
+                continue
+            later_input_id = st.turn_input_item_ids.get(later_request.turn_id)
+            if later_input_id is None:
+                continue
+            later_chat_id = st.input_item_chat_ids.get(later_input_id)
+            if later_chat_id is not None:
+                later_chat_ids.add(later_chat_id)
+        refreshed_chat = (
+            st.runtime_config.chat.snapshot_for_response_turn(target_chat_id, later_chat_ids)
+            if target_chat_id is not None
+            else request.chat_snapshot
+        )
+        request = request.model_copy(update={"cancel_generation": generation, "chat_snapshot": refreshed_chat})
         st.response_pending = True
         st.pending_response_turn_id = request.turn_id
         st.pending_response_turn_revision = request.turn_revision

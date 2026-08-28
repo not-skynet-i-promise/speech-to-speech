@@ -232,6 +232,7 @@ class ConnState(BaseModel):
     active_response_turn_id: Optional[str] = None
     active_response_turn_revision: Optional[int] = None
     active_response_input_item_id: Optional[str] = None
+    active_response_input_item_ids: set[str] = Field(default_factory=set)
     # A provider failure is surfaced on the text side-channel before its normal
     # terminal sentinel reaches the audio queue. Keep the active slot owned until
     # that sentinel arrives, otherwise it can close a newly promoted successor.
@@ -240,6 +241,7 @@ class ConnState(BaseModel):
     # ``response.create`` may own. Client-created/input items clear the audio
     # turn fields so an old audio deletion cannot cancel an unrelated response.
     response_context_input_item_id: Optional[str] = None
+    response_context_input_item_ids: set[str] = Field(default_factory=set)
     response_context_turn_id: Optional[str] = None
     response_context_turn_revision: Optional[int] = None
     response_context_speech_stopped_at_s: Optional[float] = None
@@ -935,6 +937,7 @@ class RealtimeService:
             st.speculative_user_speech_stopped_at_s = event.speech_stopped_at_s
         if transcript:
             st.response_context_input_item_id = input_item_id
+            st.response_context_input_item_ids = {input_item_id}
             st.response_context_turn_id = event.turn_id
             st.response_context_turn_revision = event.turn_revision
             st.response_context_speech_stopped_at_s = event.speech_stopped_at_s

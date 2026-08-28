@@ -39,6 +39,18 @@ from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, PIPELINE_END
 # ---------------------------------------------------------------------------
 
 
+def test_cancel_flush_preserves_a_distinct_turn_speech_start():
+    text_events = Queue()
+    started = SpeechStartedEvent(turn_id="turn_next", turn_revision=0, interrupt_response=False)
+    text_events.put(AssistantTextEvent(text="stale response"))
+    text_events.put(started)
+
+    router_module._flush_queue(text_events, preserve=router_module._keep_user_text_event)
+
+    assert text_events.get_nowait() is started
+    assert text_events.empty()
+
+
 @pytest.fixture(autouse=True)
 def short_drain_timeout(monkeypatch):
     """Shorten the SESSION_END drain warning threshold so tests don't wait 10s.

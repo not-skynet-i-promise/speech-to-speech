@@ -55,6 +55,7 @@ from speech_to_speech.api.openai_realtime.transcript_barrier import (
     TranscriptBarrierResolvedServerEvent,
     TranscriptBarrierResolveEvent,
 )
+from speech_to_speech.LLM.chat import make_assistant_message
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
@@ -1190,6 +1191,63 @@ class TestHandleConversationItemDelete:
         assert prompt_queue.get_nowait().turn_id == "turn_2"
         service.unregister(conn_id)
 
+    def test_promoted_turn_refreshes_prior_context_without_later_queued_user(self):
+        prompt_queue = Queue()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            speculative_turns=SpeculativeTurnTracker(),
+            cancel_scope=CancelScope(),
+        )
+        conn_id = service.register()
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_active", turn_revision=0, interrupt_response=False),
+        )
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="first", turn_id="turn_active", turn_revision=0),
+        )
+        prompt_queue.get_nowait()
+        service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(text="first reply", turn_id="turn_active", turn_revision=0),
+        )
+        service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "msg_deferred_context",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "accepted context"}],
+                },
+            ),
+        )
+        for turn_id, transcript in (("turn_next", "second"), ("turn_later", "third")):
+            service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id=turn_id, turn_revision=0, interrupt_response=False),
+            )
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(transcript=transcript, turn_id=turn_id, turn_revision=0),
+            )
+        state = service._state(conn_id)
+        state.runtime_config.chat.add_item(make_assistant_message("committed first reply"))
+
+        service.finish_response(conn_id)
+
+        promoted = prompt_queue.get_nowait()
+        assert promoted.turn_id == "turn_next"
+        assert [(item.role, item.content[0].text) for item in promoted.chat_snapshot.buffer] == [
+            ("user", "first"),
+            ("assistant", "committed first reply"),
+            ("user", "accepted context"),
+            ("user", "second"),
+        ]
+        service.unregister(conn_id)
+
     def test_response_fifo_overflow_is_reported_without_replacing_accepted_turns(self):
         prompt_queue = Queue()
         service = RealtimeService(text_prompt_queue=prompt_queue)
@@ -1473,6 +1531,81 @@ class TestHandleConversationItemDelete:
         assert [event.type for event in deleted] == ["conversation.item.deleted"]
         assert service._state(conn_id).in_response
         assert cancel_scope.generation == generation_before_delete
+
+    def test_response_input_rejects_a_duplicate_live_id_without_false_deletion(self, service, conn_id):
+        created = service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "msg_duplicate",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "original"}],
+                },
+            ),
+        )
+        assert created[0].type == "conversation.item.created"
+
+        rejected = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": "msg_duplicate",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "duplicate"}],
+                        }
+                    ]
+                },
+            ),
+        )
+
+        assert isinstance(rejected, RealtimeErrorEvent)
+        assert rejected.error.type == "duplicate_item_id"
+        assert [item.content[0].text for item in service._state(conn_id).runtime_config.chat.buffer] == ["original"]
+
+    def test_deleting_any_recorded_response_input_user_cancels_its_response(self):
+        prompt_queue = Queue()
+        cancel_scope = CancelScope()
+        service = RealtimeService(text_prompt_queue=prompt_queue, cancel_scope=cancel_scope)
+        conn_id = service.register()
+        created = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": "msg_input_one",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "one"}],
+                        },
+                        {
+                            "id": "msg_input_two",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "two"}],
+                        },
+                    ]
+                },
+            ),
+        )
+        assert isinstance(created, ResponseCreatedEvent)
+        prompt_queue.get_nowait()
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="msg_input_one"),
+        )
+
+        assert [event.type for event in deleted] == ["conversation.item.deleted", "response.done"]
+        assert service._state(conn_id).in_response is False
+        assert cancel_scope.generation == 1
         service.unregister(conn_id)
 
     def test_untranscribed_audio_delete_never_removes_the_prior_turn(self, service, conn_id):
