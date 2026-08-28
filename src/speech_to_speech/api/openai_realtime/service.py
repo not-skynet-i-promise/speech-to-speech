@@ -347,6 +347,9 @@ class ConnState(BaseModel):
             self.response_pending = bool(self.pending_response_keys)
             return
         self.pending_response_keys.discard(response_key)
+        for item_id, request in self.queued_input_responses.items():
+            if request.response_key == response_key and request.history_item_id is not None:
+                self.conversation_item_chat_ids[item_id] = request.history_item_id
         self.forget_queued_input_response(response_key)
         self.pending_token_usage.pop(response_key, None)
         self.closed_response_keys[response_key] = None
@@ -558,12 +561,12 @@ class RealtimeService:
             self.total_usage.output_tokens += output_tokens
         st.close_response_key(response_key)
 
-    def retract_queued_input_response(self, conn_id: str, item_id: str) -> None:
+    def retract_queued_input_response(self, conn_id: str, item_id: str) -> list[ServerEvent]:
         """Cancel the implicit generation queued by a deleted input item."""
         st = self._state(conn_id)
         request = st.queued_input_responses.pop(item_id, None)
         if request is None:
-            return
+            return []
         response_key = request.response_key
 
         # Win the Chat race even after a worker has removed the request from the
@@ -587,7 +590,15 @@ class RealtimeService:
                 if removed_request is not None:
                     queue.queue.remove(removed_request)
                     queue.not_full.notify()
+        if st.in_response and st.current_response_key == response_key:
+            return self.finish_response(
+                conn_id,
+                status="cancelled",
+                reason="client_cancelled",
+                response_key=response_key,
+            )
         self.close_response_key(conn_id, response_key)
+        return []
 
     def handle_conversation_item_create(self, conn_id: str, event: ConversationItemCreateEvent) -> list[ServerEvent]:
         if self._state(conn_id).tool_followup_prefetch_request is not None:
@@ -838,6 +849,7 @@ class RealtimeService:
                 runtime_config=st.runtime_config,
                 audio=event.audio,
                 audio_sample_rate=event.audio_sample_rate,
+                input_item_id=input_item_id,
                 turn_id=event.turn_id,
                 turn_revision=event.turn_revision,
                 speech_stopped_at_s=event.speech_stopped_at_s,

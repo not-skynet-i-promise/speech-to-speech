@@ -18,7 +18,7 @@ from uuid import uuid4
 import numpy as np
 from openai.types.realtime.realtime_response_create_params import RealtimeResponseCreateParams
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.pipeline.transcript_logging import log_exception
@@ -353,13 +353,26 @@ class GenerateResponseRequest(PipelineMessage):
     turn_id: str | None = None
     turn_revision: int | None = None
     speech_stopped_at_s: float | None = None
+    input_item_id: str | None = Field(default=None, exclude=True, repr=False)
+    history_item_id: str | None = Field(default=None, exclude=True, repr=False)
     prefetch_transaction: ResponsePrefetchTransaction | None = Field(default=None, exclude=True, repr=False)
     cancel_event: Event = Field(default_factory=Event, exclude=True, repr=False)
+    _provider_lock: Lock = PrivateAttr(default_factory=Lock)
+    _provider_started: bool = PrivateAttr(default=False)
 
     def cancel(self) -> None:
         """Mark this request unusable and release any direct-audio payload."""
-        self.audio = None
-        self.cancel_event.set()
+        with self._provider_lock:
+            self.audio = None
+            self.cancel_event.set()
+
+    def begin_provider_request(self) -> bool:
+        """Claim the provider boundary unless cancellation won the race."""
+        with self._provider_lock:
+            if self.cancel_event.is_set() or self._provider_started:
+                return False
+            self._provider_started = True
+            return True
 
     @property
     def is_cancelled(self) -> bool:

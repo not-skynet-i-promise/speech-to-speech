@@ -155,11 +155,19 @@ class StreamContext(BaseModel):
     recorded_call_ids: set[str] = Field(default_factory=set)
     prefetch_transaction: ResponsePrefetchTransaction | None = None
     cancel_event: Event | None = None
+    request: GenerateResponseRequest | None = None
 
     @property
     def interrupted(self) -> bool:
         """True when generation ended early for any reason."""
         return self.cancelled or self.stopped or bool(self.cancel_event and self.cancel_event.is_set())
+
+    def begin_provider_request(self) -> bool:
+        """Claim inference unless the owning request was cancelled first."""
+        if self.request is None or self.request.begin_provider_request():
+            return True
+        self.cancelled = True
+        return False
 
 
 class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
@@ -485,6 +493,10 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
     def _check_stop(self, gen: int | None, ctx: StreamContext) -> bool:
         """Check whether generation should be aborted and mark the reason on *ctx*."""
+        if ctx.cancel_event is not None and ctx.cancel_event.is_set():
+            ctx.cancelled = True
+            logger.info("LLM generation cancelled (deleted input)")
+            return True
         if ctx.prefetch_transaction is not None and ctx.prefetch_transaction.discarded:
             ctx.cancelled = True
             logger.info("LLM prefetch cancelled")
@@ -594,6 +606,7 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         ctx.cancel_generation = gen
         ctx.prefetch_transaction = request.prefetch_transaction
         ctx.cancel_event = request.cancel_event
+        ctx.request = request
         if not self._turn_is_latest(ctx.turn_id, ctx.turn_revision):
             logger.info("Skipping stale LLM request for turn=%s rev=%s", ctx.turn_id, ctx.turn_revision)
             yield EndOfResponse(
@@ -877,6 +890,8 @@ class LanguageModelHandler(BaseLanguageModelHandler):
 
         if self.backend == "mlx":
             with MLXLockContext(handler_name="MLX-LLM", timeout=10.0):
+                if self._check_stop(gen, ctx) or not ctx.begin_provider_request():
+                    return
                 token_iter = mlx_stream_generate(
                     self.model,  # type: ignore[arg-type]
                     self.tokenizer,  # type: ignore[arg-type]
@@ -912,6 +927,8 @@ class LanguageModelHandler(BaseLanguageModelHandler):
                 with lock:
                     self.pipe(chat_prompt, **self.gen_kwargs)
 
+            if self._check_stop(gen, ctx) or not ctx.begin_provider_request():
+                return
             thread = Thread(target=_locked_pipe)
             thread.start()
             yield from self._stream_tokens(self.streamer, gen, language_code, ctx, runtime_config, response)
@@ -1063,6 +1080,8 @@ class VisionLanguageModelHandler(BaseLanguageModelHandler):
             logger.debug("MLX VLM prompt token count: %d", ctx.input_tokens)
 
             with MLXLockContext(handler_name="MLX-VLM", timeout=10.0):
+                if self._check_stop(gen, ctx) or not ctx.begin_provider_request():
+                    return
                 token_iter = mlx_vlm_stream_generate(  # type: ignore[arg-type]
                     self.model,
                     self.processor,
@@ -1107,6 +1126,8 @@ class VisionLanguageModelHandler(BaseLanguageModelHandler):
                 with lock:
                     self.model.generate(**generate_kwargs)  # type: ignore[union-attr,operator]
 
+            if self._check_stop(gen, ctx) or not ctx.begin_provider_request():
+                return
             thread = Thread(target=_locked_generate)
             thread.start()
             yield from self._stream_tokens(self.streamer, gen, language_code, ctx, runtime_config, response)

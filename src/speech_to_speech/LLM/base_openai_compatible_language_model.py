@@ -51,6 +51,7 @@ from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.handler_types import LLMIn, LLMOut
 from speech_to_speech.pipeline.messages import (
     EndOfResponse,
+    GenerateResponseRequest,
     LLMResponseChunk,
     ResponsePrefetchTransaction,
     TokenUsage,
@@ -122,6 +123,7 @@ class _Turn(BaseModel):
     wants_audio: bool
     response_key: str
     cancel_event: ThreadingEvent
+    request: GenerateResponseRequest
     prefetch_transaction: ResponsePrefetchTransaction | None = None
     # End of the conversation when this turn started; keeps its output ahead of
     # user messages appended while the model was still running.
@@ -782,19 +784,18 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     # the default conversation, or the out-of-band context). The provider
                     # would reject this; fail with a clear message instead of an opaque error.
                     error_message = "Cannot generate a response: no instructions and no input were provided."
-                elif self._turn_is_cancelled(turn):
-                    # Serialization (especially WAV/base64 conversion) can be
-                    # expensive enough for conversation.item.delete to cancel
-                    # the worker-owned request while it is in progress. Recheck
-                    # immediately before crossing the provider boundary.
-                    pass
                 else:
-                    provider_request_started = True
 
                     def make_request() -> Any:
+                        nonlocal provider_request_started
+                        if not turn.request.begin_provider_request():
+                            return None
+                        provider_request_started = True
                         return (request_fn or self._request)(api_input, optional_kwargs)
 
-                    if turn.prefetch_transaction is not None:
+                    if self._turn_is_cancelled(turn):
+                        pass
+                    elif turn.prefetch_transaction is not None:
                         events = self._iter_prefetch_events_interruptibly(
                             make_request,
                             event_iterator_fn or self._iter_events,
@@ -802,7 +803,8 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                         )
                     else:
                         api_response = make_request()
-                        events = (event_iterator_fn or self._iter_events)(api_response)
+                        if api_response is not None:
+                            events = (event_iterator_fn or self._iter_events)(api_response)
                 if events is not None:
                     if self.stream:
                         generation_completed = yield from self._consume_streaming(events, state, turn)
@@ -1000,6 +1002,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
         audio_b64 = self._audio_to_wav_base64(audio, request.audio_sample_rate)
         audio_message = active_chat.add_item(make_user_audio_message(audio_b64))
+        request.history_item_id = audio_message.id
         optional_kwargs = self._build_audio_optional_kwargs(response, req_tools, req_tool_choice)
 
         transactional_user_message_id: str | None = None
@@ -1044,6 +1047,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             wants_audio=wants_audio,
             response_key=request.response_key,
             cancel_event=request.cancel_event,
+            request=request,
             prefetch_transaction=request.prefetch_transaction,
             history_anchor_id=history_anchor_id,
         )
@@ -1147,6 +1151,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             wants_audio=wants_audio,
             response_key=request.response_key,
             cancel_event=request.cancel_event,
+            request=request,
             prefetch_transaction=request.prefetch_transaction,
             history_anchor_id=history_anchor_id,
         )

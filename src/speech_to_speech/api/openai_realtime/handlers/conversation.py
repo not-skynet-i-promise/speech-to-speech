@@ -231,7 +231,7 @@ class ConversationHandler(RealtimeBaseHandler):
             st.current_item_id = None
             st.current_output_index = None
             st.current_output_kind = None
-        self._service.retract_queued_input_response(conn_id, event.item_id)
+        preceding_events.extend(self._service.retract_queued_input_response(conn_id, event.item_id))
         st.forget_conversation_item(event.item_id)
         st.tombstone_conversation_item(event.item_id)
         return [

@@ -1251,7 +1251,8 @@ def test_audio_request_uses_chat_completions_input_audio_payload():
         chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create)),
     )
 
-    outputs = list(handler.process(_make_audio_request()))
+    request = _make_audio_request()
+    outputs = list(handler.process(request))
 
     assert isinstance(outputs[0], LLMResponseChunk)
     assert outputs[0].text == "Yes, I heard you."
@@ -1268,6 +1269,8 @@ def test_audio_request_uses_chat_completions_input_audio_payload():
     audio_part = user_messages[-1]["content"][0]["input_audio"]
     assert audio_part["format"] == "wav"
     assert audio_part["data"]
+    assert request.history_item_id is not None
+    assert any(item.id == request.history_item_id for item in request.runtime_config.chat.buffer)
 
 
 def test_cancelled_audio_request_releases_payload_without_calling_provider():
@@ -1313,6 +1316,62 @@ def test_audio_cancelled_during_serialization_does_not_reach_provider():
     assert isinstance(outputs[0], EndOfResponse)
     assert outputs[0].response_key == request.response_key
     assert request.runtime_config.chat.buffer == []
+    create.assert_not_called()
+
+
+def test_audio_cancellation_is_atomic_with_provider_start():
+    handler = _make_handler(stream=False)
+    create = MagicMock()
+    handler.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+    )
+    request = _make_audio_request()
+    original_check = handler._turn_is_cancelled
+    cancellation_injected = False
+
+    def cancel_after_clear_check(turn):
+        nonlocal cancellation_injected
+        cancelled = original_check(turn)
+        if not cancellation_injected:
+            cancellation_injected = True
+            request.cancel()
+        return cancelled
+
+    handler._turn_is_cancelled = cancel_after_clear_check
+
+    outputs = list(handler.process(request))
+
+    assert cancellation_injected
+    assert request.is_cancelled
+    assert isinstance(outputs[-1], EndOfResponse)
+    create.assert_not_called()
+
+
+def test_text_cancellation_is_atomic_with_provider_start():
+    handler = _make_handler(stream=False)
+    create = MagicMock()
+    handler.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+    )
+    request = _make_request("PRIVATE_TEXT_INPUT")
+    original_check = handler._turn_is_cancelled
+    cancellation_injected = False
+
+    def cancel_after_clear_check(turn):
+        nonlocal cancellation_injected
+        cancelled = original_check(turn)
+        if not cancellation_injected:
+            cancellation_injected = True
+            request.cancel()
+        return cancelled
+
+    handler._turn_is_cancelled = cancel_after_clear_check
+
+    outputs = list(handler.process(request))
+
+    assert cancellation_injected
+    assert request.is_cancelled
+    assert isinstance(outputs[-1], EndOfResponse)
     create.assert_not_called()
 
 
