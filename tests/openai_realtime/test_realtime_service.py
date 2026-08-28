@@ -1484,6 +1484,10 @@ class TestHandleConversationItemDelete:
                 )
 
         target_chat_id = state.input_item_chat_ids[state.turn_input_item_ids["turn_target"]]
+        # Isolate the completed-compaction restoration branch. Production keeps
+        # this owner leased while active; that hard-eviction invariant has its
+        # own regression test.
+        state.runtime_config.chat.release_response_turn(active_request.response_user_item_id, force=True)
         state.runtime_config.chat.trim_if_needed(
             lambda _snapshot: CompactionResult(user_summary="lossy summary", assistant_summary="summary reply")
         )
@@ -1593,6 +1597,7 @@ class TestHandleConversationItemDelete:
 
         st = service._state(conn_id)
         st.runtime_config.chat = Chat(size=2)
+        service.text_prompt_queue = None
         audio_items = []
         for index in range(3):
             started = service.dispatch_pipeline_event(
@@ -1796,6 +1801,146 @@ class TestHandleConversationItemDelete:
         assert [event.type for event in deleted] == ["conversation.item.deleted"]
         assert service._state(conn_id).in_response
         assert cancel_scope.generation == generation_before_delete
+
+    def test_response_input_reuse_retires_deleted_audio_identity_before_later_delete(self):
+        service = RealtimeService(text_prompt_queue=Queue(), cancel_scope=CancelScope())
+        conn_id = service.register()
+        state = service._state(conn_id)
+        created = service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "msg_inline_reuse",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "old audio transcript"}],
+                },
+            ),
+        )
+        assert created[0].type == "conversation.item.created"
+        state.audio_input_item_ids.add("msg_inline_reuse")
+        state.input_item_chat_ids["msg_inline_reuse"] = "msg_inline_reuse"
+        state.input_item_turn_ids["msg_inline_reuse"] = "turn_inline_old"
+        state.turn_input_item_ids["turn_inline_old"] = "msg_inline_reuse"
+        assert (
+            service.handle_conversation_item_delete(
+                conn_id,
+                ConversationItemDeleteEvent(type="conversation.item.delete", item_id="msg_inline_reuse"),
+            )[0].type
+            == "conversation.item.deleted"
+        )
+
+        response = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": "msg_inline_reuse",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "new inline request"}],
+                        }
+                    ]
+                },
+            ),
+        )
+        assert isinstance(response, ResponseCreatedEvent)
+        assert "msg_inline_reuse" not in state.audio_input_item_ids
+        assert "msg_inline_reuse" not in state.deleted_input_item_ids
+
+        deleted_again = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="msg_inline_reuse"),
+        )
+        assert [event.type for event in deleted_again] == ["conversation.item.deleted", "response.done"]
+        assert state.runtime_config.chat.user_message("msg_inline_reuse") is None
+        service.unregister(conn_id)
+
+    def test_initial_active_response_owner_survives_later_turn_hard_eviction(self):
+        from openai.types.realtime.realtime_conversation_item_function_call import (
+            RealtimeConversationItemFunctionCall,
+        )
+
+        prompt_queue = Queue()
+        tracker = SpeculativeTurnTracker()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            chat_size=1,
+            speculative_turns=tracker,
+            cancel_scope=CancelScope(),
+        )
+        conn_id = service.register()
+        first_audio = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_a", turn_revision=0, interrupt_response=False),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="turn A", turn_id="turn_a", turn_revision=0),
+        )
+        prompt_queue.get_nowait()
+        state = service._state(conn_id)
+        first_chat_id = state.input_item_chat_ids[first_audio.item_id]
+        service.response._ensure_response(conn_id)
+
+        for turn_id, transcript in (("turn_b", "turn B"), ("turn_c", "turn C")):
+            service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id=turn_id, turn_revision=0, interrupt_response=False),
+            )
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(transcript=transcript, turn_id=turn_id, turn_revision=0),
+            )
+
+        chat = state.runtime_config.chat
+        assert chat.user_message(first_chat_id) is not None
+        recorded = chat.add_response_item(
+            RealtimeConversationItemFunctionCall(
+                type="function_call",
+                id="fc_active_owner",
+                call_id="call_active_owner",
+                name="lookup",
+                arguments="{}",
+            ),
+            after_user_id=first_chat_id,
+        )
+        assert isinstance(recorded, RealtimeConversationItemFunctionCall)
+        assert "call_active_owner" in chat._pending_tool_calls
+        service.unregister(conn_id)
+
+    def test_clearing_initial_pending_response_releases_its_eviction_lease(self):
+        prompt_queue = Queue()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            chat_size=1,
+            speculative_turns=SpeculativeTurnTracker(),
+            cancel_scope=CancelScope(),
+        )
+        conn_id = service.register()
+        started = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_pending", turn_revision=0, interrupt_response=False),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(
+                transcript="pending request",
+                turn_id="turn_pending",
+                turn_revision=0,
+            ),
+        )
+        state = service._state(conn_id)
+        chat_id = state.input_item_chat_ids[started.item_id]
+        assert chat_id in state.runtime_config.chat._protected_response_user_ids
+
+        service.response.clear_pending_requests(conn_id)
+
+        assert chat_id not in state.runtime_config.chat._protected_response_user_ids
+        service.unregister(conn_id)
 
     def test_response_input_rejects_a_duplicate_live_id_without_false_deletion(self, service, conn_id):
         created = service.handle_conversation_item_create(
@@ -2388,6 +2533,38 @@ class TestHandleConversationItemDelete:
         assert "item_0" not in st.audio_input_item_ids
         assert "item_0" not in st.input_item_turn_ids
         assert "turn_0" not in st.turn_input_item_ids
+
+    def test_protocol_index_retirement_permanently_discards_late_audio_turn(self, monkeypatch):
+        import speech_to_speech.api.openai_realtime.service as service_module
+
+        monkeypatch.setattr(service_module, "MAX_TRACKED_PROTOCOL_ITEMS", 2)
+        tracker = SpeculativeTurnTracker()
+        service = RealtimeService(speculative_turns=tracker)
+        conn_id = service.register()
+        state = service._state(conn_id)
+        for index in range(3):
+            item_id = f"item_{index}"
+            turn_id = f"turn_{index}"
+            tracker.observe(turn_id, 0)
+            state.audio_input_item_ids.add(item_id)
+            state.input_item_turn_ids[item_id] = turn_id
+            state.turn_input_item_ids[turn_id] = item_id
+            state.record_protocol_item(item_id)
+
+        assert not tracker.is_latest("turn_0", 0)
+        assert (
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(transcript="must stay retired", turn_id="turn_0", turn_revision=0),
+            )
+            == []
+        )
+        assert not any(
+            getattr(part, "text", None) == "must stay retired"
+            for item in state.runtime_config.chat.buffer
+            for part in getattr(item, "content", [])
+        )
+        service.unregister(conn_id)
 
     def test_audio_tail_delete_restores_protocol_visible_predecessor(self, service, conn_id):
         first = service.dispatch_pipeline_event(
@@ -5108,6 +5285,38 @@ class TestUsageMetricsTracking:
         )
         assert usage.input_tokens == 7
         assert usage.output_tokens == 3
+        service.unregister(conn_id)
+
+    def test_later_turn_usage_same_generation_cannot_charge_active_response(self):
+        cancel_scope = CancelScope()
+        service = RealtimeService(text_prompt_queue=Queue(), cancel_scope=cancel_scope)
+        conn_id = service.register()
+        service.response.resume_pending_request(
+            conn_id,
+            GenerateResponseRequest(
+                runtime_config=service._state(conn_id).runtime_config,
+                turn_id="turn_active",
+                turn_revision=0,
+                cancel_generation=cancel_scope.generation,
+            ),
+            enqueue=False,
+        )
+        service.response._ensure_response(conn_id)
+
+        service.dispatch_pipeline_event(
+            conn_id,
+            TokenUsageEvent(
+                input_tokens=100,
+                output_tokens=50,
+                turn_id="turn_next",
+                turn_revision=0,
+                cancel_generation=cancel_scope.generation,
+            ),
+        )
+
+        usage = service._state(conn_id).response_usage
+        assert usage.input_tokens == 0
+        assert usage.output_tokens == 0
         service.unregister(conn_id)
 
     def test_token_usage_emits_no_events(self, service, conn_id):

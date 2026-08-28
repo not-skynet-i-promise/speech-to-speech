@@ -89,6 +89,13 @@ class ResponseHandler(RealtimeBaseHandler):
     def clear_pending_requests(self, conn_id: str) -> None:
         """Forget every queued response admission after cancellation/barge-in."""
         st = self._state(conn_id)
+        pending_requests = [
+            request for request in (st.pending_response_request, *st.deferred_response_requests) if request is not None
+        ]
+        for request in pending_requests:
+            for user_item_id in request.response_user_item_ids:
+                st.runtime_config.chat.release_response_turn(user_item_id, force=True)
+            st.runtime_config.chat.release_response_turn(request.response_user_item_id, force=True)
         st.response_pending = False
         st.pending_response_turn_id = None
         st.pending_response_turn_revision = None
@@ -329,6 +336,7 @@ class ResponseHandler(RealtimeBaseHandler):
                 nonlocal accepted_primary_input_id
                 if item.id is None:
                     return
+                st.retire_reused_audio_item_id(item.id)
                 st.record_protocol_item(item.id)
                 accepted_item_ids.append(item.id)
                 if isinstance(item, RealtimeConversationItemUserMessage):
@@ -414,6 +422,9 @@ class ResponseHandler(RealtimeBaseHandler):
         st.active_response_cancel_generation = active_generation
         st.active_response_input_item_id = None if out_of_band else st.response_context_input_item_id
         st.active_response_input_item_ids = set() if out_of_band else set(st.response_context_input_item_ids)
+        if not out_of_band:
+            for input_item_id in st.active_response_input_item_ids:
+                st.runtime_config.chat.protect_response_turn(st.input_item_chat_ids.get(input_item_id, input_item_id))
 
         st.current_response_params = event.response
         st.current_response_id = _generate_id("resp")
@@ -517,14 +528,10 @@ class ResponseHandler(RealtimeBaseHandler):
                 )
             )
         if st.in_response:
-            active_response_user_id = (
-                st.input_item_chat_ids.get(
-                    st.active_response_input_item_id,
-                    st.active_response_input_item_id,
-                )
-                if st.active_response_input_item_id is not None
-                else None
-            )
+            active_response_user_ids = {
+                st.input_item_chat_ids.get(input_item_id, input_item_id)
+                for input_item_id in st.active_response_input_item_ids
+            }
             resp_id, item_id = self._ensure_response(conn_id)
             if response_wants_audio(st.current_response_params) and st.audio_output_started:
                 events.append(
@@ -558,10 +565,11 @@ class ResponseHandler(RealtimeBaseHandler):
                 )
             )
             self._end_response(conn_id, status)
-            st.runtime_config.chat.release_response_turn(
-                active_response_user_id,
-                force=status != "completed",
-            )
+            for active_response_user_id in active_response_user_ids:
+                st.runtime_config.chat.release_response_turn(
+                    active_response_user_id,
+                    force=status != "completed",
+                )
         elif st.response_pending:
             self.clear_pending_requests(conn_id)
         # Apply any client items that arrived mid-generation now that in_response

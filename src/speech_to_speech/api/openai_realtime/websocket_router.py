@@ -210,6 +210,39 @@ def _flush_queue(q: Queue[QItem], *, preserve: Callable[[QItem], bool] | None = 
             q.not_empty.notify(len(preserved))
 
 
+async def _dispatch_speech_start_locked(
+    ws: WebSocket | None,
+    unit: PipelineUnit,
+    session_id: str,
+    event: SpeechStartedEvent,
+) -> bool:
+    """Dispatch one speech start and apply its cancellation boundary atomically."""
+
+    state = unit.service._state(session_id)
+    was_in_response = state.in_response
+    was_response_pending = state.response_pending
+    events = unit.service.dispatch_pipeline_event(session_id, event)
+    if ws is not None and events:
+        await _send_events_unlocked(ws, events)
+    if not events or not (was_in_response or was_response_pending):
+        return False
+    if not event.interrupt_response or not state.runtime_config.interrupt_response_enabled:
+        logger.info("Pipeline %d: speech during response: interrupt_response disabled, ignoring", unit.index)
+        return False
+
+    unit.cancel_scope.cancel()
+    unit.service.response.clear_pending_requests(session_id)
+    _flush_queue(unit.output_queue, preserve=_keep_audio_sentinel)
+    _flush_queue(unit.text_output_queue, preserve=_keep_user_text_event)
+    unit.response_playing.clear()
+    logger.info(
+        "Pipeline %d: speech during %s: cancelled, queue flushed",
+        unit.index,
+        "response" if was_in_response else "pending response",
+    )
+    return True
+
+
 async def _drain_pending_response_events(
     ws: WebSocket | None,
     unit: PipelineUnit,
@@ -235,7 +268,9 @@ async def _drain_pending_response_events(
         )
     )
 
-    def belongs_to_closing_response(event: AssistantTextEvent) -> bool:
+    def belongs_to_closing_response(
+        event: AssistantTextEvent | TokenUsageEvent | ResponseFailedEvent,
+    ) -> bool:
         """Require positive owner correlation after a non-response boundary."""
 
         matched = False
@@ -253,6 +288,11 @@ async def _drain_pending_response_events(
             if event.cancel_generation != closing_generation:
                 return False
             matched = True
+        if closing_turn_id is None and closing_generation is None:
+            # Preserve legacy untagged usage accounting only when neither side
+            # has an owner tag. Client-visible output and failures still obey
+            # the boundary; a tagged event belongs to a later response.
+            return isinstance(event, TokenUsageEvent) and event.turn_id is None and event.cancel_generation is None
         return matched
 
     preserved: list[Any] = []
@@ -265,13 +305,15 @@ async def _drain_pending_response_events(
                 item = unit.text_output_queue.get_nowait()
             except Empty:
                 break
-            # Usage is accounting-only, so keep the old whole-queue drain behavior.
-            # Assistant events are client-visible response output and stop at the
-            # first non-response boundary to preserve normal text-event ordering.
-            if isinstance(item, TokenUsageEvent):
+            # Response-side events stop at the first unrelated boundary. Tagged
+            # closing events may cross it, but successor accounting/failures must
+            # remain queued for the response that owns them.
+            if isinstance(item, TokenUsageEvent) and (drain_assistant_events or belongs_to_closing_response(item)):
                 unit.service.dispatch_pipeline_event(session_id, item)
                 drained_usage += 1
-            elif isinstance(item, ResponseFailedEvent):
+            elif isinstance(item, ResponseFailedEvent) and (
+                drain_assistant_events or belongs_to_closing_response(item)
+            ):
                 events = unit.service.dispatch_pipeline_event(session_id, item)
                 if ws is not None and events:
                     send = _send_events_unlocked if lock_held else _send_events
@@ -284,6 +326,14 @@ async def _drain_pending_response_events(
                 if ws is not None and events:
                     send = _send_events_unlocked if lock_held else _send_events
                     await send(ws, events)
+            elif (
+                isinstance(item, SpeechStartedEvent)
+                and item.interrupt_response
+                and state.runtime_config.interrupt_response_enabled
+                and (state.in_response or state.response_pending)
+            ):
+                if await _dispatch_speech_start_locked(ws, unit, session_id, item):
+                    break
             else:
                 preserved.append(item)
                 drain_assistant_events = False
@@ -857,12 +907,6 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                     dequeued_generation = unit.cancel_scope.generation
                     if session is not None and ws is not None and session_id:
                         async with session.outbound_lock:
-                            is_speech_start = isinstance(text_msg, SpeechStartedEvent)
-                            speech_start_dispatched = False
-                            st = unit.service._state(session_id)
-                            was_in_response = is_speech_start and st.in_response
-                            was_response_pending = is_speech_start and st.response_pending
-
                             stale_untagged_assistant = (
                                 isinstance(text_msg, AssistantTextEvent)
                                 and text_msg.cancel_generation is None
@@ -872,33 +916,14 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                                 stale_untagged_assistant or _generation_is_discardable(unit, text_msg.cancel_generation)
                             ):
                                 pass
+                            elif isinstance(text_msg, SpeechStartedEvent):
+                                await _dispatch_speech_start_locked(ws, unit, session_id, text_msg)
                             elif isinstance(text_msg, PipelineEvent):
                                 events = unit.service.dispatch_pipeline_event(session_id, text_msg)
-                                speech_start_dispatched = is_speech_start and bool(events)
                                 if events:
                                     await _send_events_unlocked(ws, events)
                                 if unit.service.private_protocol_failed(session_id):
                                     await ws.close(code=1008, reason="Private session failed")
-
-                            if speech_start_dispatched and (was_in_response or was_response_pending):
-                                active_cfg = st.runtime_config
-                                if text_msg.interrupt_response and active_cfg.interrupt_response_enabled:
-                                    unit.cancel_scope.cancel()
-                                    unit.service.response.clear_pending_requests(session_id)
-                                    _flush_queue(unit.output_queue, preserve=_keep_audio_sentinel)
-                                    _flush_queue(unit.text_output_queue, preserve=_keep_user_text_event)
-                                    if unit.response_playing.is_set():
-                                        unit.response_playing.clear()
-                                    logger.info(
-                                        "Pipeline %d: speech during %s: cancelled, queue flushed",
-                                        unit.index,
-                                        "response" if was_in_response else "pending response",
-                                    )
-                                else:
-                                    logger.info(
-                                        "Pipeline %d: speech during response: interrupt_response disabled, ignoring",
-                                        unit.index,
-                                    )
                 except Empty:
                     pass
 

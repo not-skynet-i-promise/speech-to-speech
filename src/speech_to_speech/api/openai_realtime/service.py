@@ -263,6 +263,7 @@ class ConnState(BaseModel):
     input_item_turn_ids: dict[str, str] = Field(default_factory=dict)
     turn_input_item_ids: dict[str, str] = Field(default_factory=dict)
     deleted_input_item_ids: OrderedDict[str, None] = Field(default_factory=OrderedDict)
+    speculative_turn_tracker: SpeculativeTurnTracker | None = Field(default=None, exclude=True)
 
     def retire_reused_audio_item_id(self, item_id: str) -> None:
         """Drop stale audio identity before a deleted protocol ID is reused.
@@ -281,6 +282,8 @@ class ConnState(BaseModel):
         if retired_chat_id is not None:
             self.runtime_config.chat.retire_user_message_deletable(retired_chat_id)
         retired_turn_id = self.input_item_turn_ids.pop(item_id, None)
+        if retired_turn_id is not None and self.speculative_turn_tracker is not None:
+            self.speculative_turn_tracker.discard(retired_turn_id)
         if retired_turn_id is not None and self.turn_input_item_ids.get(retired_turn_id) == item_id:
             self.turn_input_item_ids.pop(retired_turn_id, None)
         if self.speculative_input_item_id == item_id:
@@ -305,6 +308,8 @@ class ConnState(BaseModel):
             retired_chat_id = self.input_item_chat_ids.pop(retired_item_id, retired_item_id)
             self.runtime_config.chat.retire_user_message_deletable(retired_chat_id)
             retired_turn_id = self.input_item_turn_ids.pop(retired_item_id, None)
+            if retired_turn_id is not None and self.speculative_turn_tracker is not None:
+                self.speculative_turn_tracker.discard(retired_turn_id)
             if retired_turn_id is not None and self.turn_input_item_ids.get(retired_turn_id) == retired_item_id:
                 self.turn_input_item_ids.pop(retired_turn_id, None)
             self.deleted_input_item_ids.pop(retired_item_id, None)
@@ -408,7 +413,10 @@ class RealtimeService:
         """Register a new connection and return its session_id."""
         if self.speculative_turns:
             self.speculative_turns.reset()
-        state = ConnState(runtime_config=RuntimeConfig(chat=Chat(self._chat_size)))
+        state = ConnState(
+            runtime_config=RuntimeConfig(chat=Chat(self._chat_size)),
+            speculative_turn_tracker=self.speculative_turns,
+        )
         self._conns[state.session_id] = state
         self.total_usage.connections += 1
         return state.session_id
@@ -1071,6 +1079,7 @@ class RealtimeService:
                     st.pending_response_turn_id = event.turn_id
                     st.pending_response_turn_revision = event.turn_revision
                     st.pending_response_request = request
+                    cfg.chat.protect_response_turn(request.response_user_item_id)
                     queue.put(request)
                     st.pending_response_enqueued = True
 
@@ -1175,21 +1184,36 @@ class RealtimeService:
             logger.debug("Dropping stale token usage for turn=%s rev=%s", event.turn_id, event.turn_revision)
             return []
         st = self._state(conn_id)
+        if st.in_response:
+            owner_turn_id = st.active_response_turn_id
+            owner_turn_revision = st.active_response_turn_revision
+            owner_generation = st.active_response_cancel_generation
+        elif st.response_pending and st.pending_response_request is not None:
+            owner_turn_id = st.pending_response_turn_id
+            owner_turn_revision = st.pending_response_turn_revision
+            owner_generation = st.pending_response_request.cancel_generation
+        else:
+            owner_turn_id = None
+            owner_turn_revision = None
+            owner_generation = None
         if event.cancel_generation is not None:
-            expected_generation = (
-                st.active_response_cancel_generation
-                if st.in_response
-                else (
-                    st.pending_response_request.cancel_generation
-                    if st.response_pending and st.pending_response_request is not None
-                    else None
-                )
-            )
-            if expected_generation != event.cancel_generation:
+            if (st.in_response or st.response_pending) and owner_generation != event.cancel_generation:
                 logger.debug(
                     "Dropping token usage for stale cancellation generation=%s (active=%s)",
                     event.cancel_generation,
-                    expected_generation,
+                    owner_generation,
+                )
+                return []
+        if event.turn_id is not None and (st.in_response or st.response_pending):
+            if event.turn_id != owner_turn_id or (
+                event.turn_revision is not None
+                and owner_turn_revision is not None
+                and event.turn_revision != owner_turn_revision
+            ):
+                logger.debug(
+                    "Dropping token usage for non-active turn=%s rev=%s",
+                    event.turn_id,
+                    event.turn_revision,
                 )
                 return []
         st.response_usage.input_tokens += event.input_tokens

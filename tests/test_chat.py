@@ -403,6 +403,27 @@ class TestAddItem:
             RealtimeConversationItemUserMessage,
         ]
 
+    def test_multi_input_response_leases_survive_until_shared_tool_result(self):
+        chat = Chat(size=5)
+        first = chat.add_item(_user("first dependency"))
+        second = chat.add_item(_user("second dependency"))
+        assert first.id is not None and second.id is not None
+        chat.protect_response_turn(first.id)
+        chat.protect_response_turn(second.id)
+        chat.add_response_item(
+            _fc("shared_lease"),
+            after_user_id=second.id,
+            owner_user_ids={first.id, second.id},
+        )
+
+        chat.release_response_turn(first.id)
+        chat.release_response_turn(second.id)
+        assert {first.id, second.id} <= chat._protected_response_user_ids
+
+        chat.add_item(_fco("shared_lease", "resolved"))
+        assert first.id not in chat._protected_response_user_ids
+        assert second.id not in chat._protected_response_user_ids
+
     def test_response_writeback_drops_when_exact_user_left_history(self):
         chat = Chat(size=5)
         user = chat.add_item(_user("delete me"))

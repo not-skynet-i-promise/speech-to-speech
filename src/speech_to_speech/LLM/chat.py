@@ -289,11 +289,20 @@ class Chat:
             return True
         return False
 
-    def _release_resolved_tool_turn_locked(self, anchor: str | None) -> None:
-        """Release a tool owner after its final outstanding call is resolved."""
+    def _release_resolved_tool_turn_locked(self, anchor: str | None, dependencies: set[str]) -> None:
+        """Release tool owners after their final outstanding call is resolved."""
 
-        if anchor is not None and anchor not in self._pending_tool_call_anchors.values():
-            self._protected_response_user_ids.discard(anchor)
+        candidates = set(dependencies)
+        if anchor is not None:
+            candidates.add(anchor)
+        pending_dependencies = (
+            set().union(*self._pending_tool_call_dependencies.values())
+            if self._pending_tool_call_dependencies
+            else set()
+        )
+        pending_anchors = set(self._pending_tool_call_anchors.values())
+        for item_id in candidates - pending_dependencies - pending_anchors:
+            self._protected_response_user_ids.discard(item_id)
 
     def append_tool_output(self, call_id: str, output_item: RealtimeConversationItemFunctionCallOutput) -> None:
         """Append a ``function_call_output``, re-injecting its ``function_call`` if evicted.
@@ -326,7 +335,7 @@ class Chat:
                 inherited = self._response_item_dependencies.get(function_call.id, dependencies)
                 if inherited:
                     self._response_item_dependencies[output_item.id] = set(inherited)
-            self._release_resolved_tool_turn_locked(anchor)
+            self._release_resolved_tool_turn_locked(anchor, dependencies)
             return
 
         if call_id in self._pending_tool_calls:
@@ -359,7 +368,7 @@ class Chat:
                 inherited = dependencies or {anchor}
                 self._response_item_dependencies[fc.id] = set(inherited)
                 self._response_item_dependencies[output_item.id] = set(inherited)
-            self._release_resolved_tool_turn_locked(anchor)
+            self._release_resolved_tool_turn_locked(anchor, dependencies)
             return
 
         raise ChatItemError(f"No function_call with call_id '{call_id}' found in conversation history.")
@@ -982,8 +991,24 @@ class Chat:
         if item_id is None:
             return
         with self._lock:
-            if force or item_id not in self._pending_tool_call_anchors.values():
+            retained_by_tool = item_id in self._pending_tool_call_anchors.values() or any(
+                item_id in dependencies for dependencies in self._pending_tool_call_dependencies.values()
+            )
+            if force or not retained_by_tool:
                 self._protected_response_user_ids.discard(item_id)
+
+    def protect_response_turn(self, item_id: str | None) -> None:
+        """Lease one admitted in-band response owner against hard eviction."""
+
+        if item_id is None:
+            return
+        with self._lock:
+            if not any(
+                isinstance(item, RealtimeConversationItemUserMessage) and item.id == item_id for item in self.buffer
+            ):
+                return
+            self._bound_protected_tool_turns_locked(item_id)
+            self._protected_response_user_ids.add(item_id)
 
     def snapshot_for_response_turn(
         self,

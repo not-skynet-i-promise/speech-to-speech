@@ -1498,7 +1498,7 @@ class TestSendLoop:
                 tools=[{"type": "function_call", "call_id": "c1", "name": "play_emotion", "arguments": "{}"}],
             )
         )
-        text_output_queue.put(SpeechStartedEvent())
+        text_output_queue.put(SpeechStartedEvent(interrupt_response=False))
         text_output_queue.put(TokenUsageEvent(input_tokens=10, output_tokens=5))
         text_output_queue.put(AssistantTextEvent(text="queued after boundary"))
         ws = _FakeWebSocket()
@@ -1517,6 +1517,63 @@ class TestSendLoop:
         assert isinstance(queued_assistant, AssistantTextEvent)
         assert queued_assistant.text == "queued after boundary"
         assert text_output_queue.empty()
+
+    def test_response_completion_drain_preserves_successor_accounting_after_boundary(self, setup):
+        _, service, input_queue, output_queue, text_output_queue, should_listen, _, response_playing, cancel_scope = (
+            setup
+        )
+        unit = PipelineUnit(
+            index=0,
+            service=service,
+            cancel_scope=cancel_scope,
+            should_listen=should_listen,
+            response_playing=response_playing,
+            input_queue=input_queue,
+            output_queue=output_queue,
+            text_output_queue=text_output_queue,
+            text_prompt_queue=Queue(),
+            handlers=[],
+        )
+        conn_id = service.register()
+        generation = cancel_scope.generation
+        service.response.resume_pending_request(
+            conn_id,
+            GenerateResponseRequest(
+                runtime_config=service._state(conn_id).runtime_config,
+                turn_id="turn_old",
+                turn_revision=0,
+                cancel_generation=generation,
+            ),
+            enqueue=False,
+        )
+        service.response._ensure_response(conn_id)
+        text_output_queue.put(SpeechStartedEvent(turn_id="turn_next", turn_revision=0, interrupt_response=False))
+        successor_usage = TokenUsageEvent(
+            input_tokens=10,
+            output_tokens=5,
+            turn_id="turn_next",
+            turn_revision=0,
+            cancel_generation=generation,
+        )
+        successor_failure = ResponseFailedEvent(
+            message="next response failed",
+            turn_id="turn_next",
+            turn_revision=0,
+            cancel_generation=generation,
+        )
+        text_output_queue.put(successor_usage)
+        text_output_queue.put(successor_failure)
+
+        asyncio.run(router_module._drain_pending_response_events(None, unit, conn_id))
+
+        state = service._state(conn_id)
+        assert state.response_usage.input_tokens == 0
+        assert state.response_usage.output_tokens == 0
+        assert text_output_queue.get_nowait().type == "speech_started"
+        assert text_output_queue.get_nowait() is successor_usage
+        assert text_output_queue.get_nowait() is successor_failure
+        assert text_output_queue.empty()
+        service.unregister(conn_id)
 
     def test_closing_assistant_after_boundary_is_sent_before_response_done(self, setup):
         _, service, input_queue, output_queue, text_output_queue, should_listen, _, response_playing, cancel_scope = (
@@ -1579,6 +1636,74 @@ class TestSendLoop:
         state = service._state(conn_id)
         assert state.current_response_id is None
         assert not state.in_response
+        service.unregister(conn_id)
+
+    def test_interrupting_speech_boundary_cancels_and_drops_later_closing_tool(self, setup):
+        _, service, input_queue, output_queue, text_output_queue, should_listen, _, response_playing, cancel_scope = (
+            setup
+        )
+        unit = PipelineUnit(
+            index=0,
+            service=service,
+            cancel_scope=cancel_scope,
+            should_listen=should_listen,
+            response_playing=response_playing,
+            input_queue=input_queue,
+            output_queue=output_queue,
+            text_output_queue=text_output_queue,
+            text_prompt_queue=Queue(),
+            handlers=[],
+        )
+        conn_id = service.register()
+        generation = cancel_scope.generation
+        service.response.resume_pending_request(
+            conn_id,
+            GenerateResponseRequest(
+                runtime_config=service._state(conn_id).runtime_config,
+                turn_id="turn_old",
+                turn_revision=0,
+                cancel_generation=generation,
+            ),
+            enqueue=False,
+        )
+        service.response._ensure_response(conn_id)
+        text_output_queue.put(
+            AssistantTextEvent(
+                text="old response before interruption",
+                turn_id="turn_old",
+                turn_revision=0,
+                cancel_generation=generation,
+            )
+        )
+        text_output_queue.put(SpeechStartedEvent(interrupt_response=True))
+        text_output_queue.put(
+            AssistantTextEvent(
+                tools=[
+                    {
+                        "type": "function_call",
+                        "call_id": "call_must_drop",
+                        "name": "must_not_execute",
+                        "arguments": "{}",
+                    }
+                ],
+                turn_id="turn_old",
+                turn_revision=0,
+                cancel_generation=generation,
+            )
+        )
+        ws = _FakeWebSocket()
+
+        asyncio.run(router_module._drain_pending_response_events(ws, unit, conn_id))
+
+        assert cancel_scope.generation == generation + 1
+        assert not service._state(conn_id).in_response
+        assert text_output_queue.empty()
+        sent = json.dumps(ws.sent)
+        assert "old response before interruption" in sent
+        assert "must_not_execute" not in sent
+        done = next(payload for payload in ws.sent if payload["type"] == "response.done")
+        assert done["response"]["status"] == "cancelled"
+        assert service.finish_response(conn_id) == []
         service.unregister(conn_id)
 
     def test_response_completion_drain_latches_failure_before_terminal(self, setup):
