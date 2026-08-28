@@ -315,11 +315,12 @@ sequenceDiagram
     Note over TTS,Client: Response active or pending (in_response / response_pending)
     User->>VAD: speaks
     VAD->>SendLoop: speech_started on text_output_queue
-    SendLoop->>Client: input_audio_buffer.speech_started
-    SendLoop->>Client: response.done (status=cancelled, reason=turn_detected)
+    SendLoop->>SendLoop: dispatch closes old response and builds protocol events
     SendLoop->>SendLoop: cancel_scope.cancel() (gen++ & discarding=True)
     SendLoop->>SendLoop: flush output_queue + text_output_queue
     SendLoop->>SendLoop: response_playing.clear()
+    SendLoop->>Client: input_audio_buffer.speech_started
+    SendLoop->>Client: response.done (status=cancelled, reason=turn_detected)
     LLM->>LLM: is_stale(gen) → True, aborts generation
     TTS->>TTS: is_stale(gen) → True, aborts generation
     TTS->>SendLoop: __RESPONSE_DONE__ (tagged with gen)
@@ -330,8 +331,8 @@ sequenceDiagram
 **Step by step:**
 
 1. **VAD detects speech**: puts a `SpeechStartedEvent` on `text_output_queue`.
-2. **`_send_loop` processes text events first** (priority over audio): translates `speech_started` into protocol events. If an active response was in progress, `RealtimeService.dispatch_pipeline_event` emits `response.done` with `status="cancelled"` and `reason="turn_detected"`; it first emits `response.output_audio.done` only when at least one audio delta was sent.
-3. **Cancel + queue flush**: if a response is active (`in_response`) *or* pending (`response_pending` -- accepted `response.create`, no audio yet), and interrupts are enabled (see step 4), the send loop calls `cancel_scope.cancel()` (increments generation, enables discard), clears `response_pending`, drains `output_queue` (preserving `__RESPONSE_DONE__` sentinels) and `text_output_queue` (preserving user-side events: `speech_stopped`, partial/completed transcriptions, token usage), then clears `response_playing`.
+2. **`_send_loop` processes text events first** (priority over audio): translates `speech_started` into protocol events. If an active response was in progress, `RealtimeService.dispatch_pipeline_event` synchronously closes it and builds `response.done` with `status="cancelled"` and `reason="turn_detected"`; it also builds `response.output_audio.done` first only when at least one audio delta was sent. These events are not transmitted yet.
+3. **Cancel + queue flush before outbound I/O**: if a response is active (`in_response`) *or* pending (`response_pending` -- accepted `response.create`, no audio yet), and interrupts are enabled (see step 4), the send loop calls `cancel_scope.cancel()` (increments generation, enables discard), clears pending requests, drains `output_queue` (preserving `__RESPONSE_DONE__` sentinels) and `text_output_queue` (preserving user-side events: `speech_stopped`, partial/completed transcriptions, token usage), then clears `response_playing`. Only after that synchronous boundary does it transmit the previously built protocol events.
 4. **Interrupt gating**: the cancel only fires if the `SpeechStartedEvent.interrupt_response` flag is set *and* the session config allows it (`turn_detection.interrupt_response`, read via `RuntimeConfig.interrupt_response_enabled`, default true). When disabled, user speech during a response is transcribed but the response keeps playing.
 5. **LLM/TTS cancellation**: each response carries the generation stamped when it entered the LLM queue. Immediately before local-model/provider execution, the LLM atomically admits only that exact generation and remains visible as active until its generator exits. A local Transformers worker that survives the bounded join retains a second activation lease until the thread actually exits, and every generation owns a distinct streamer/stopping criterion, so private-barrier activation cannot race past live work or reuse its token channel. Worker exceptions are caught before Python's default thread exception hook, redacted under the same live session guard, and reduced to one content-free generation failure while waking the matching streamer. LLM and TTS also check `cancel_scope.is_stale(gen)` on every streaming token and abort early when stale.
 6. **Discard guard**: while `cancel_scope.discarding` is True, the send loop drops audio chunks and assistant text whose `cancel_generation` is not current (see `_generation_is_discardable` above). The guard clears when a `__RESPONSE_DONE__` with a matching generation arrives (via `cancel_scope.response_done(gen)`), or when an explicit `response.create` starts a new response (`cancel_scope.new_response()`).

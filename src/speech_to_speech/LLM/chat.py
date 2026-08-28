@@ -960,6 +960,21 @@ class Chat:
             )
             return item.model_copy(deep=True) if item is not None else None
 
+    def live_item_ids(self) -> set[str]:
+        """Return IDs still owned by canonical conversation state.
+
+        The realtime protocol index is intentionally bounded independently of
+        chat history.  Callers use this snapshot to prevent a retired protocol
+        ID from being rebound while its original item is still live here.
+        """
+
+        with self._lock:
+            item_ids = {item.id for item in self.buffer if item.id is not None}
+            item_ids.update(item.id for item in self._pending_tool_calls.values() if item.id is not None)
+            if self.init_chat_message is not None and self.init_chat_message.id is not None:
+                item_ids.add(self.init_chat_message.id)
+            return item_ids
+
     def response_owner_for_item(self, item_id: str) -> str | None:
         """Return the canonical user item that owns derived response output."""
 

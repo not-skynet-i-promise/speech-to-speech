@@ -323,7 +323,8 @@ class ResponseHandler(RealtimeBaseHandler):
         # the input rides along on the request and seeds a throwaway chat in the LM.
         if not out_of_band and event.response and event.response.input:
             input_items = list(event.response.input)
-            seen_ids = set(st.protocol_item_ids)
+            seen_ids = st.runtime_config.chat.live_item_ids()
+            seen_ids.update(st.protocol_item_ids)
             seen_ids.update(item_id for item in st.deferred_items if (item_id := getattr(item, "id", None)) is not None)
             for item in input_items:
                 item_id = getattr(item, "id", None)

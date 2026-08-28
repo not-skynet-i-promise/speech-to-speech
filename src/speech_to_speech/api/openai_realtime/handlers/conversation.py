@@ -80,8 +80,10 @@ class ConversationHandler(RealtimeBaseHandler):
         item_id = getattr(item, "id", None)
         if item_id is None:
             return False
-        return item_id in st.protocol_item_ids or any(
-            getattr(existing, "id", None) == item_id for existing in st.deferred_items
+        return (
+            item_id in st.runtime_config.chat.live_item_ids()
+            or item_id in st.protocol_item_ids
+            or any(getattr(existing, "id", None) == item_id for existing in st.deferred_items)
         )
 
     def _duplicate_item_error(self, conn_id: str, event_id: str | None = None) -> ServerEvent:
@@ -159,7 +161,8 @@ class ConversationHandler(RealtimeBaseHandler):
             return []
         items = st.deferred_items
         st.deferred_items = []
-        seen_ids = set(st.protocol_item_ids)
+        seen_ids = st.runtime_config.chat.live_item_ids()
+        seen_ids.update(st.protocol_item_ids)
         for item in items:
             item_id = getattr(item, "id", None)
             if item_id is not None and item_id in seen_ids:

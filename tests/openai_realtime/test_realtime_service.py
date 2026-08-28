@@ -895,6 +895,103 @@ class TestHandleConversationItemDelete:
         assert len(st.deferred_items) == 1
         assert st.runtime_config.chat.buffer == []
 
+    def test_conversation_create_rejects_live_id_after_protocol_index_retirement(self, monkeypatch):
+        import speech_to_speech.api.openai_realtime.service as service_module
+
+        monkeypatch.setattr(service_module, "MAX_TRACKED_PROTOCOL_ITEMS", 2)
+        service = RealtimeService(text_prompt_queue=Queue())
+        conn_id = service.register()
+        original = ConversationItemCreateEvent(
+            type="conversation.item.create",
+            item={
+                "id": "msg_retired_live",
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "original"}],
+            },
+        )
+        service.handle_conversation_item_create(conn_id, original)
+        for index in range(2):
+            service.handle_conversation_item_create(
+                conn_id,
+                ConversationItemCreateEvent(
+                    type="conversation.item.create",
+                    item={
+                        "id": f"sys_retire_{index}",
+                        "type": "message",
+                        "role": "system",
+                        "content": [{"type": "input_text", "text": str(index)}],
+                    },
+                ),
+            )
+
+        state = service._state(conn_id)
+        assert "msg_retired_live" not in state.protocol_item_ids
+        assert "msg_retired_live" in state.runtime_config.chat.live_item_ids()
+
+        duplicate = service.handle_conversation_item_create(conn_id, original)
+
+        assert isinstance(duplicate[0], RealtimeErrorEvent)
+        assert duplicate[0].error.type == "duplicate_item_id"
+        assert [item.content[0].text for item in state.runtime_config.chat.buffer] == ["original"]
+        service.unregister(conn_id)
+
+    def test_response_input_rejects_live_id_after_protocol_index_retirement(self, monkeypatch):
+        import speech_to_speech.api.openai_realtime.service as service_module
+
+        monkeypatch.setattr(service_module, "MAX_TRACKED_PROTOCOL_ITEMS", 2)
+        service = RealtimeService(text_prompt_queue=Queue())
+        conn_id = service.register()
+        service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "msg_retired_live",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "original"}],
+                },
+            ),
+        )
+        for index in range(2):
+            service.handle_conversation_item_create(
+                conn_id,
+                ConversationItemCreateEvent(
+                    type="conversation.item.create",
+                    item={
+                        "id": f"sys_retire_{index}",
+                        "type": "message",
+                        "role": "system",
+                        "content": [{"type": "input_text", "text": str(index)}],
+                    },
+                ),
+            )
+
+        state = service._state(conn_id)
+        assert "msg_retired_live" not in state.protocol_item_ids
+        rejected = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": "msg_retired_live",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "duplicate"}],
+                        }
+                    ]
+                },
+            ),
+        )
+
+        assert isinstance(rejected, RealtimeErrorEvent)
+        assert rejected.error.type == "duplicate_item_id"
+        assert [item.content[0].text for item in state.runtime_config.chat.buffer] == ["original"]
+        service.unregister(conn_id)
+
     def test_deletes_exact_created_user_item(self, service, conn_id):
         created = service.handle_conversation_item_create(
             conn_id,
@@ -2234,7 +2331,37 @@ class TestHandleConversationItemDelete:
     def test_response_input_dependency_batch_cannot_exceed_protocol_bound(self, monkeypatch):
         import speech_to_speech.api.openai_realtime.service as service_module
 
-        monkeypatch.setattr(service_module, "MAX_TRACKED_PROTOCOL_ITEMS", 2)
+        monkeypatch.setattr(service_module, "MAX_TRACKED_PROTOCOL_ITEMS", 5)
+        monkeypatch.setattr(service_module, "MAX_DEFERRED_RESPONSE_REQUESTS", 1)
+
+        accepted_queue = Queue()
+        accepted_service = RealtimeService(text_prompt_queue=accepted_queue, cancel_scope=CancelScope())
+        accepted_conn_id = accepted_service.register()
+        accepted = accepted_service.handle_response_create(
+            accepted_conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": f"msg_accepted_{index}",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": str(index)}],
+                        }
+                        for index in range(2)
+                    ]
+                },
+            ),
+        )
+        assert accepted is not None and accepted.type == "response.created"
+        accepted_queue.get_nowait()
+        assert accepted_service._state(accepted_conn_id).response_context_input_item_ids == {
+            "msg_accepted_0",
+            "msg_accepted_1",
+        }
+        accepted_service.unregister(accepted_conn_id)
+
         service = RealtimeService(text_prompt_queue=Queue(), cancel_scope=CancelScope())
         conn_id = service.register()
 
