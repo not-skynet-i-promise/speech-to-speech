@@ -130,6 +130,8 @@ class ResponseHandler(RealtimeBaseHandler):
         st.audio_output_started = False
         st.pending_text_outputs = []
         st.pending_function_calls = {}
+        st.deleted_response_text_outputs = {}
+        st.deleted_response_function_calls = {}
         st.finished_function_call_indices = set()
         st.next_assistant_output_sequence = 0
         st.pending_early_tool_calls = {}
@@ -517,23 +519,71 @@ class ResponseHandler(RealtimeBaseHandler):
     def _bind_response_history_items(self, conn_id: str) -> None:
         """Bind response wire IDs to the corresponding model-history IDs."""
         st = self._state(conn_id)
+        if is_out_of_band(st.current_response_params):
+            return
         history_items = [
             item
             for item in st.runtime_config.chat.provisional_items(st.current_response_key)
             if isinstance(item, (RealtimeConversationItemAssistantMessage, RealtimeConversationItemFunctionCall))
         ]
-        protocol_items: list[tuple[int, str, type[object]]] = [
-            (int(pending["output_index"]), str(pending["item_id"]), RealtimeConversationItemAssistantMessage)
-            for pending in st.pending_text_outputs
+        text_outputs = [*st.pending_text_outputs, *st.deleted_response_text_outputs.values()]
+        protocol_items: list[tuple[int, str, str, object]] = [
+            (
+                int(pending["output_index"]),
+                str(pending["item_id"]),
+                "assistant",
+                self._assistant_text(pending, response_wants_audio(st.current_response_params)),
+            )
+            for pending in text_outputs
         ]
         protocol_items.extend(
-            (output_index, str(call.id), RealtimeConversationItemFunctionCall)
-            for output_index, call in st.pending_function_calls.items()
+            (output_index, str(call.id), "function_call", call.call_id)
+            for output_index, call in (
+                *st.pending_function_calls.items(),
+                *st.deleted_response_function_calls.values(),
+            )
             if call.id is not None
         )
-        for (_, protocol_id, expected_type), history_item in zip(sorted(protocol_items), history_items):
-            if isinstance(history_item, expected_type) and history_item.id is not None:
-                st.record_conversation_item(protocol_id, history_item.id)
+        history_cursor = 0
+        for _, protocol_id, kind, identity in sorted(protocol_items):
+            match = None
+            for index in range(history_cursor, len(history_items)):
+                candidate = history_items[index]
+                if kind == "function_call":
+                    compatible = (
+                        isinstance(candidate, RealtimeConversationItemFunctionCall) and candidate.call_id == identity
+                    )
+                else:
+                    compatible = isinstance(candidate, RealtimeConversationItemAssistantMessage) and (
+                        self._history_assistant_text(
+                            candidate,
+                            response_wants_audio(st.current_response_params),
+                        )
+                        == identity
+                    )
+                if compatible:
+                    match = candidate
+                    history_cursor = index + 1
+                    break
+            if match is None or match.id is None:
+                continue
+            if protocol_id in st.deleted_conversation_item_ids:
+                st.runtime_config.chat.remove_item(match.id)
+            else:
+                st.record_conversation_item(protocol_id, match.id)
+            st.deleted_response_text_outputs.pop(protocol_id, None)
+            st.deleted_response_function_calls.pop(protocol_id, None)
+
+    @staticmethod
+    def _history_assistant_text(item: RealtimeConversationItemAssistantMessage, wants_audio: bool) -> str:
+        """Return the response-visible text identity of one history message."""
+        parts = [
+            str(getattr(content, "transcript", None) or getattr(content, "text", None) or "")
+            for content in item.content
+        ]
+        if wants_audio:
+            return " ".join(part.strip() for part in parts if part.strip())
+        return "".join(parts)
 
     # ── Public handlers ───────────────────────────
 
@@ -898,7 +948,8 @@ class ResponseHandler(RealtimeBaseHandler):
                             delta=text,
                         )
                     )
-                st.record_conversation_item(item_id)
+                if not is_out_of_band(st.current_response_params):
+                    st.record_conversation_item(item_id)
             elif isinstance(part, AssistantToolCallPart):
                 if not _early_tool_call:
                     events.extend(self.finish_audio_output(conn_id, event.response_key))
@@ -956,7 +1007,8 @@ class ResponseHandler(RealtimeBaseHandler):
                 # Explicitly in-progress calls receive output_item.done at
                 # response close, once the outcome is known.
                 st.pending_function_calls[output_idx] = pending_call
-                st.record_conversation_item(function_item_id, function_item_id)
+                if not is_out_of_band(st.current_response_params):
+                    st.record_conversation_item(function_item_id, function_item_id)
         self._bind_response_history_items(conn_id)
         if output_sequence is not None:
             st.pending_early_tool_calls.pop(output_sequence, None)

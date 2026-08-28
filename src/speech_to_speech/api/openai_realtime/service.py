@@ -211,6 +211,14 @@ class ConnState(BaseModel):
     # storage IDs (notably for generated messages and transcribed audio).
     conversation_item_order: list[str] = Field(default_factory=list)
     conversation_item_chat_ids: dict[str, str] = Field(default_factory=dict)
+    # Response output can reach the wire before the LM commits its matching
+    # history items. Keep bounded tombstones plus the response descriptors
+    # needed to remove a late write-back after an acknowledged deletion.
+    deleted_conversation_item_ids: dict[str, None] = Field(default_factory=dict)
+    deleted_response_text_outputs: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    deleted_response_function_calls: dict[str, tuple[int, RealtimeConversationItemFunctionCall]] = Field(
+        default_factory=dict
+    )
     input_audio_duration_s: float = 0.0
     last_item_id: Optional[str] = None
     current_response_params: RealtimeResponseCreateParams | None = None
@@ -279,6 +287,12 @@ class ConnState(BaseModel):
         self.conversation_item_order = [known_id for known_id in self.conversation_item_order if known_id != item_id]
         self.conversation_item_chat_ids.pop(item_id, None)
         self.last_item_id = self.conversation_item_order[-1] if self.conversation_item_order else None
+
+    def tombstone_conversation_item(self, item_id: str) -> None:
+        """Remember a deletion long enough to suppress delayed history write-back."""
+        self.deleted_conversation_item_ids[item_id] = None
+        while len(self.deleted_conversation_item_ids) > 256:
+            self.deleted_conversation_item_ids.pop(next(iter(self.deleted_conversation_item_ids)))
 
     def mark_response_pending(self, response_key: str) -> None:
         """Track an implicit response from queueing until its first output."""

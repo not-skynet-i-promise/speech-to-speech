@@ -48,6 +48,7 @@ from openai.types.realtime.conversation_item import (
     RealtimeConversationItemFunctionCallOutput,
     RealtimeConversationItemUserMessage,
 )
+from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 
 from speech_to_speech.api.openai_realtime.service import (
     CHUNK_SIZE_BYTES,
@@ -540,6 +541,35 @@ class TestHandleConversationItemDelete:
         assert isinstance(deleted[0], ConversationItemDeletedEvent)
         assert st.runtime_config.chat.buffer == []
 
+    def test_generated_message_deleted_before_history_writeback_stays_deleted(self, service, conn_id):
+        st = service._state(conn_id)
+        st.mark_response_pending("response_delayed")
+        events = service.dispatch_pipeline_event(
+            conn_id,
+            AssistantOutputEvent(text="PRIVATE_DELAYED_TEXT", response_key="response_delayed"),
+        )
+        wire_item_id = next(event.item_id for event in events if isinstance(event, ResponseAudioTranscriptDeltaEvent))
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=wire_item_id),
+        )
+        assert isinstance(deleted[-1], ConversationItemDeletedEvent)
+
+        st.runtime_config.chat.add_provisional_generation_items(
+            "response_delayed",
+            [
+                RealtimeConversationItemAssistantMessage(
+                    type="message",
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "PRIVATE_DELAYED_TEXT"}],
+                )
+            ],
+        )
+        service.finish_response(conn_id)
+
+        assert "PRIVATE_DELAYED_TEXT" not in "\n".join(item.model_dump_json() for item in st.runtime_config.chat.buffer)
+
     def test_transcribed_audio_deletes_by_wire_visible_id(self, service, conn_id):
         started = service.dispatch_pipeline_event(
             conn_id,
@@ -563,6 +593,91 @@ class TestHandleConversationItemDelete:
 
         assert isinstance(deleted[0], ConversationItemDeletedEvent)
         assert service._state(conn_id).runtime_config.chat.buffer == []
+
+    def test_active_input_deleted_before_transcription_stays_deleted(self, service, conn_id):
+        st = service._state(conn_id)
+        started = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_deleted_early", turn_revision=0),
+        )
+        wire_item_id = next(event.item_id for event in started if isinstance(event, InputAudioBufferSpeechStartedEvent))
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=wire_item_id),
+        )
+        completed = service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(
+                transcript="PRIVATE_DELETED_INPUT",
+                turn_id="turn_deleted_early",
+                turn_revision=0,
+            ),
+        )
+
+        assert isinstance(deleted[-1], ConversationItemDeletedEvent)
+        assert completed == []
+        assert st.runtime_config.chat.buffer == []
+        assert service.text_prompt_queue.empty()
+
+    def test_history_binding_skips_nonvisible_whitespace_item(self, service, conn_id):
+        st = service._state(conn_id)
+        call = RealtimeConversationItemFunctionCall(
+            id="fc_known",
+            type="function_call",
+            call_id="call_known",
+            name="lookup",
+            arguments="{}",
+        )
+        st.runtime_config.chat.add_provisional_generation_items(
+            "response_mixed",
+            [
+                RealtimeConversationItemAssistantMessage(
+                    type="message",
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "   "}],
+                ),
+                call,
+                RealtimeConversationItemAssistantMessage(
+                    type="message",
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "after"}],
+                ),
+            ],
+        )
+        st.mark_response_pending("response_mixed")
+        events = service.dispatch_pipeline_event(
+            conn_id,
+            AssistantOutputEvent(
+                parts=[
+                    AssistantToolCallPart(
+                        tool=ResponseFunctionToolCall(
+                            id="fc_known",
+                            type="function_call",
+                            call_id="call_known",
+                            name="lookup",
+                            arguments="{}",
+                        )
+                    ),
+                    AssistantTextPart(text="after"),
+                ],
+                response_key="response_mixed",
+            ),
+        )
+        wire_item_id = next(
+            event.item_id
+            for event in events
+            if isinstance(event, ResponseAudioTranscriptDeltaEvent) and event.delta == "after"
+        )
+
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=wire_item_id),
+        )
+
+        history = "\n".join(item.model_dump_json() for item in st.runtime_config.chat.buffer)
+        assert '"after"' not in history
+        assert "fc_known" in history
 
     def test_tail_delete_preserves_protocol_order_for_pending_calls(self, service, conn_id):
         def create(item_id: str, call_id: str) -> ConversationItemCreatedEvent:
@@ -594,7 +709,7 @@ class TestHandleConversationItemDelete:
         assert second.previous_item_id == "fc_1"
         assert third.previous_item_id == "fc_1"
 
-    def test_delete_removes_deferred_created_ack(self, service, conn_id):
+    def test_delete_completes_pending_create_before_deletion(self, service, conn_id):
         st = service._state(conn_id)
         st.runtime_config.chat.add_provisional_generation_items(
             "response_origin",
@@ -634,8 +749,63 @@ class TestHandleConversationItemDelete:
             ConversationItemDeleteEvent(type="conversation.item.delete", item_id="fco_pending"),
         )
 
-        assert isinstance(deleted[0], ConversationItemDeletedEvent)
+        assert isinstance(deleted[0], ConversationItemCreatedEvent)
+        assert isinstance(deleted[1], ConversationItemDeletedEvent)
         assert service.conversation.flush_pending_item_acks(conn_id) == []
+
+    def test_delete_of_unapplied_deferred_create_returns_not_found(self, service, conn_id):
+        st = service._state(conn_id)
+        st.in_response = True
+        events = service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "deferred_user",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "later"}],
+                },
+            ),
+        )
+        assert events == []
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="deferred_user"),
+        )
+
+        assert isinstance(deleted[0], RealtimeErrorEvent)
+        assert [item.id for item in st.deferred_items] == ["deferred_user"]
+
+    def test_out_of_band_response_item_is_not_deletable(self, service, conn_id):
+        created = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "conversation": "none",
+                    "input": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "isolated"}],
+                        }
+                    ],
+                },
+            ),
+        )
+        assert isinstance(created, ResponseCreatedEvent)
+        events = service.dispatch_pipeline_event(conn_id, AssistantOutputEvent(text="isolated answer"))
+        wire_item_id = next(event.item_id for event in events if isinstance(event, ResponseAudioTranscriptDeltaEvent))
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=wire_item_id),
+        )
+
+        assert isinstance(deleted[0], RealtimeErrorEvent)
+        assert deleted[0].error.type == "item_not_found"
 
     def test_delete_function_output_restores_pending_call_guard(self, service, conn_id):
         st = service._state(conn_id)
