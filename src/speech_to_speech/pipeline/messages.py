@@ -366,13 +366,19 @@ class GenerateResponseRequest(PipelineMessage):
             self.audio = None
             self.cancel_event.set()
 
-    def begin_provider_request(self) -> bool:
-        """Claim the provider boundary unless cancellation won the race."""
+    def start_provider_request(self, start: Callable[[], Any]) -> tuple[bool, Any]:
+        """Atomically admit and start provider work unless cancellation won.
+
+        The lock remains held through ``start`` so a deletion acknowledgement
+        cannot complete between the cancellation check and provider invocation.
+        It is released as soon as the request/worker has actually started; it
+        never covers response streaming or local inference completion.
+        """
         with self._provider_lock:
             if self.cancel_event.is_set() or self._provider_started:
-                return False
+                return False, None
             self._provider_started = True
-            return True
+            return True, start()
 
     @property
     def is_cancelled(self) -> bool:

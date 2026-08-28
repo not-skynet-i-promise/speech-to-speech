@@ -64,6 +64,21 @@ def transcript_for_log(text: object) -> str:
     return f"chars={len(value)}"
 
 
+def transcript_for_response_log(text: object, response: object | None) -> str:
+    """Render response content while always suppressing out-of-band prose.
+
+    ``conversation: none`` responses intentionally bypass durable conversation
+    and client text sinks. That stronger boundary also applies when the operator
+    has explicitly enabled ordinary transcript logging.
+    """
+    conversation = getattr(response, "conversation", None)
+    if isinstance(response, dict):
+        conversation = response.get("conversation")
+    if conversation == "none":
+        return "content=isolated-response-suppressed"
+    return transcript_for_log(text)
+
+
 def log_exception(
     target: logging.Logger,
     message: str,

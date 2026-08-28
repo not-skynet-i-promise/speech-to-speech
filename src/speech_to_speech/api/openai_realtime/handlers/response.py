@@ -316,7 +316,7 @@ class ResponseHandler(RealtimeBaseHandler):
                 origin_response_key=st.tool_followup_prefetch_origin_response_key,
             )
             return []
-        if event.response_key in st.closed_response_keys:
+        if st.response_key_is_closed(event.response_key):
             if event.response_key not in st.completed_tool_response_keys:
                 return []
             st.completed_tool_response_keys.pop(event.response_key, None)
@@ -594,6 +594,7 @@ class ResponseHandler(RealtimeBaseHandler):
                     st.runtime_config.chat.remove_item(match.id)
             if matching_calls:
                 st.deleted_response_function_calls.pop(protocol_id, None)
+                st.deleted_conversation_item_ids.pop(protocol_id, None)
         history_items = visible_history_items()
         text_outputs = [*st.pending_text_outputs, *st.deleted_response_text_outputs.values()]
         protocol_items: list[tuple[int, str, str, object | None]] = [
@@ -645,15 +646,21 @@ class ResponseHandler(RealtimeBaseHandler):
             if not final:
                 return
             if st.deleted_response_text_outputs:
+                deleted_text_ids = set(st.deleted_response_text_outputs)
                 for item in st.runtime_config.chat.provisional_items(st.current_response_key):
                     if isinstance(item, RealtimeConversationItemAssistantMessage) and item.id is not None:
                         st.runtime_config.chat.remove_item(item.id)
                 st.deleted_response_text_outputs.clear()
+                for protocol_id in deleted_text_ids:
+                    st.deleted_conversation_item_ids.pop(protocol_id, None)
             if any(call_id is None for _output_index, call_id in st.deleted_response_function_calls.values()):
                 for item in visible_history_items():
                     if isinstance(item, RealtimeConversationItemFunctionCall) and item.id is not None:
                         st.runtime_config.chat.remove_item(item.id)
+            deleted_call_ids = set(st.deleted_response_function_calls)
             st.deleted_response_function_calls.clear()
+            for protocol_id in deleted_call_ids:
+                st.deleted_conversation_item_ids.pop(protocol_id, None)
             for call in st.pending_function_calls.values():
                 matched_call = next(
                     (
@@ -692,6 +699,7 @@ class ResponseHandler(RealtimeBaseHandler):
                     st.runtime_config.chat.remove_item(matched_history.id)
                 for _, protocol_id, _, _ in group:
                     st.deleted_response_text_outputs.pop(protocol_id, None)
+                    st.deleted_conversation_item_ids.pop(protocol_id, None)
             else:
                 protocol_id = group[0][1]
                 if protocol_id in st.deleted_conversation_item_ids:
@@ -699,6 +707,7 @@ class ResponseHandler(RealtimeBaseHandler):
                 else:
                     st.record_conversation_item(protocol_id, matched_history.id)
                 st.deleted_response_function_calls.pop(protocol_id, None)
+                st.deleted_conversation_item_ids.pop(protocol_id, None)
 
     @staticmethod
     def _history_assistant_is_visible(item: RealtimeConversationItemAssistantMessage, wants_audio: bool) -> bool:

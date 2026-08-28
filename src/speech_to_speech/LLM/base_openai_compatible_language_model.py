@@ -57,7 +57,7 @@ from speech_to_speech.pipeline.messages import (
     TokenUsage,
 )
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
-from speech_to_speech.pipeline.transcript_logging import log_exception, transcript_for_log
+from speech_to_speech.pipeline.transcript_logging import log_exception, transcript_for_response_log
 from speech_to_speech.utils.utils import is_out_of_band, response_wants_audio
 
 logger = logging.getLogger(__name__)
@@ -678,9 +678,9 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 if self._turn_is_cancelled(turn):
                     logger.info("LLM generation cancelled (interruption)")
                 else:
-                    logger.debug("Clean text: %s", transcript_for_log(state.clean_text))
+                    logger.debug("Clean text: %s", transcript_for_response_log(state.clean_text, turn.response))
                     yield from _flush(sentence_batch)
-            logger.info("Tools: %s", transcript_for_log(state.tools))
+            logger.info("Tools: %s", transcript_for_response_log(state.tools, turn.response))
         return (
             not cancelled
             and not self._turn_is_cancelled(turn)
@@ -724,8 +724,8 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 ):
                     state.output_emitted = True
                     yield self._chunk(turn, text=out)
-        logger.debug("Clean text: %s", transcript_for_log(state.clean_text))
-        logger.info("Tools: %s", transcript_for_log(state.tools))
+        logger.debug("Clean text: %s", transcript_for_response_log(state.clean_text, turn.response))
+        logger.info("Tools: %s", transcript_for_response_log(state.tools, turn.response))
         return (
             not cancelled
             and not self._turn_is_cancelled(turn)
@@ -788,10 +788,16 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
                     def make_request() -> Any:
                         nonlocal provider_request_started
-                        if not turn.request.begin_provider_request():
+
+                        def invoke_provider() -> Any:
+                            nonlocal provider_request_started
+                            provider_request_started = True
+                            return (request_fn or self._request)(api_input, optional_kwargs)
+
+                        started, api_response = turn.request.start_provider_request(invoke_provider)
+                        if not started:
                             return None
-                        provider_request_started = True
-                        return (request_fn or self._request)(api_input, optional_kwargs)
+                        return api_response
 
                     if self._turn_is_cancelled(turn):
                         pass

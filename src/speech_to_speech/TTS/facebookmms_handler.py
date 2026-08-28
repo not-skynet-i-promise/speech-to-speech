@@ -15,7 +15,7 @@ from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.handler_types import TTSIn, TTSOut
 from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, EndOfResponse
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
-from speech_to_speech.pipeline.transcript_logging import log_exception, transcript_for_log
+from speech_to_speech.pipeline.transcript_logging import log_exception, transcript_for_response_log
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +115,8 @@ class FacebookMMSTTSHandler(BaseHandler[TTSIn, TTSOut]):
             return None
 
         try:
-            logger.debug("Tokenizing text: %s", transcript_for_log(text))
+            response = getattr(self, "_content_log_response", None)
+            logger.debug("Tokenizing text: %s", transcript_for_response_log(text, response))
             logger.debug(f"Current language: {self.language}")
             logger.debug(f"Tokenizer: {self.tokenizer}")
 
@@ -124,7 +125,7 @@ class FacebookMMSTTSHandler(BaseHandler[TTSIn, TTSOut]):
             attention_mask = inputs.attention_mask.to(self.device)
 
             logger.debug(f"Input IDs shape: {input_ids.shape}, dtype: {input_ids.dtype}")
-            logger.debug("Input IDs: %s", transcript_for_log(input_ids))
+            logger.debug("Input IDs: %s", transcript_for_response_log(input_ids, response))
 
             if input_ids.numel() == 0:
                 logger.error("Input IDs tensor is empty")
@@ -166,7 +167,7 @@ class FacebookMMSTTSHandler(BaseHandler[TTSIn, TTSOut]):
         text = tts_input.text
 
         console.print(f"[green]ASSISTANT: {text}")
-        logger.debug("Processing text: %s", transcript_for_log(text))
+        logger.debug("Processing text: %s", transcript_for_response_log(text, tts_input.response))
         logger.debug(f"Language code: {language_code}")
 
         restore_initial_model = (
@@ -185,7 +186,11 @@ class FacebookMMSTTSHandler(BaseHandler[TTSIn, TTSOut]):
                 )
                 logger.warning(f"Unsupported language: {language_code}")
 
-        audio_output = self.generate_audio(text)
+        self._content_log_response = tts_input.response
+        try:
+            audio_output = self.generate_audio(text)
+        finally:
+            self._content_log_response = None
 
         if audio_output is None or audio_output.numel() == 0:
             logger.warning("No audio output generated")

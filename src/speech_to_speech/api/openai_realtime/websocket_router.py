@@ -149,7 +149,7 @@ def _response_key_is_obsolete(unit: PipelineUnit, session_id: str, response_key:
     if response_key is None:
         return False
     st = unit.service._state(session_id)
-    if response_key in st.closed_response_keys:
+    if st.response_key_is_closed(response_key):
         return True
     return (
         st.in_response
@@ -981,6 +981,7 @@ def create_app(
                                         await transport.send_events(events)
                                 else:
                                     unit.service.close_response_key(session_id, response_key)
+                                st.retire_closed_response_key(response_key)
                                 if cleaned_active_response:
                                     unit.response_playing.clear()
                                 if not (st.in_response or st.response_pending):
@@ -994,12 +995,18 @@ def create_app(
                         if audio_generation is not None and unit.cancel_scope.is_stale(audio_generation):
                             if session_id:
                                 unit.service.close_response_key(session_id, response_key)
+                                unit.service._state(session_id).retire_closed_response_key(response_key)
                             unit.cancel_scope.response_done(audio_generation)
                             unit.should_listen.set()
                             logger.info(f"Pipeline {unit.index}: stale response complete, listening re-enabled")
                             continue
                         if session_id is not None and _response_key_is_obsolete(unit, session_id, response_key):
-                            _discard_obsolete_response_key(unit, session_id, response_key)
+                            unit.service._state(session_id).retire_closed_response_key(response_key)
+                            logger.debug(
+                                "Pipeline %d: retired obsolete response %s at ordered audio terminal",
+                                unit.index,
+                                response_key,
+                            )
                             continue
                         if transport is not None and session_id:
                             await transport.send_events(

@@ -612,6 +612,10 @@ class TestHandleConversationItemDelete:
         )
         assert isinstance(deleted[-1], ConversationItemDeletedEvent)
 
+        # Suppression is tied to delayed write-back, not an arbitrary LRU cap.
+        for index in range(300):
+            st.tombstone_conversation_item(f"other_unresolved_output_{index}")
+
         st.runtime_config.chat.add_provisional_generation_items(
             "response_delayed",
             [
@@ -667,6 +671,45 @@ class TestHandleConversationItemDelete:
         assert "PRIVATE_BEFORE" not in done.response.output[0].model_dump_json()
         assert "PRIVATE_BEFORE" not in history
         assert "PUBLIC_AFTER" in history
+
+    def test_closed_response_suppression_survives_churn_until_ordered_terminal(self, service, conn_id):
+        st = service._state(conn_id)
+        response_key = "response_with_delayed_output"
+        st.mark_response_pending(response_key)
+        service.dispatch_pipeline_event(
+            conn_id,
+            AssistantOutputEvent(text="already delivered", response_key=response_key),
+        )
+        service.finish_response(
+            conn_id,
+            status="cancelled",
+            reason="client_cancelled",
+            response_key=response_key,
+        )
+
+        for index in range(180):
+            other_key = f"other_closed_response_{index}"
+            st.mark_response_pending(other_key)
+            service.dispatch_pipeline_event(
+                conn_id,
+                AssistantOutputEvent(text="ordinary", response_key=other_key),
+            )
+            service.finish_response(
+                conn_id,
+                status="cancelled",
+                reason="client_cancelled",
+                response_key=other_key,
+            )
+
+        late = service.dispatch_pipeline_event(
+            conn_id,
+            AssistantOutputEvent(text="PRIVATE_LATE_OUTPUT", response_key=response_key),
+        )
+
+        assert late == []
+        assert st.response_key_is_closed(response_key)
+        st.retire_closed_response_key(response_key)
+        assert not st.response_key_is_closed(response_key)
 
     def test_deleted_function_descriptor_survives_unrelated_output_until_writeback(self, service, conn_id):
         st = service._state(conn_id)
@@ -957,6 +1000,8 @@ class TestHandleConversationItemDelete:
             conn_id,
             ConversationItemDeleteEvent(type="conversation.item.delete", item_id=wire_item_id),
         )
+        for index in range(300):
+            st.tombstone_input_terminal(f"other_unresolved_turn_{index}", 0)
         completed = service.dispatch_pipeline_event(
             conn_id,
             TranscriptionCompletedEvent(

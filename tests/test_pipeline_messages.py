@@ -1,5 +1,8 @@
+from threading import Event, Thread
+
+from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.pipeline import PartialTranscriptionEvent
-from speech_to_speech.pipeline.messages import ResponsePrefetchTransaction
+from speech_to_speech.pipeline.messages import GenerateResponseRequest, ResponsePrefetchTransaction
 
 
 def test_partial_transcription_event_retains_delta_constructor():
@@ -63,3 +66,33 @@ def test_prefetch_transaction_abort_failure_does_not_skip_remaining_cleanup():
 
     assert transaction.discarded
     assert aborted == ["next callback"]
+
+
+def test_provider_start_is_atomic_with_request_cancellation():
+    """Cancellation cannot acknowledge inside the provider-start boundary."""
+    request = GenerateResponseRequest(runtime_config=RuntimeConfig())
+    provider_entered = Event()
+    release_provider_start = Event()
+    cancellation_returned = Event()
+    result: list[tuple[bool, object]] = []
+
+    def start_provider() -> object:
+        provider_entered.set()
+        assert release_provider_start.wait(1.0)
+        return "provider-started"
+
+    starter = Thread(target=lambda: result.append(request.start_provider_request(start_provider)))
+    starter.start()
+    assert provider_entered.wait(1.0)
+
+    canceller = Thread(target=lambda: (request.cancel(), cancellation_returned.set()))
+    canceller.start()
+    assert not cancellation_returned.wait(0.05)
+
+    release_provider_start.set()
+    starter.join(timeout=1.0)
+    canceller.join(timeout=1.0)
+
+    assert result == [(True, "provider-started")]
+    assert cancellation_returned.is_set()
+    assert request.is_cancelled

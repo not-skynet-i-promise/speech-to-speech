@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Iterator, Sized
+from collections.abc import Callable, Iterable, Iterator, Sized
 from queue import Empty
 from threading import Event, Lock, Thread
 from typing import Any, Literal, Optional, Protocol, runtime_checkable
@@ -68,7 +68,7 @@ from speech_to_speech.pipeline.messages import (
     TokenUsage,
 )
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
-from speech_to_speech.pipeline.transcript_logging import log_exception, transcript_for_log
+from speech_to_speech.pipeline.transcript_logging import log_exception, transcript_for_response_log
 from speech_to_speech.utils.utils import is_out_of_band, response_wants_audio
 
 try:
@@ -162,12 +162,15 @@ class StreamContext(BaseModel):
         """True when generation ended early for any reason."""
         return self.cancelled or self.stopped or bool(self.cancel_event and self.cancel_event.is_set())
 
-    def begin_provider_request(self) -> bool:
-        """Claim inference unless the owning request was cancelled first."""
-        if self.request is None or self.request.begin_provider_request():
-            return True
+    def start_provider_request(self, start: Callable[[], Any]) -> tuple[bool, Any]:
+        """Atomically admit and start inference for the owning request."""
+        if self.request is None:
+            return True, start()
+        started, result = self.request.start_provider_request(start)
+        if started:
+            return True, result
         self.cancelled = True
-        return False
+        return False, None
 
 
 class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
@@ -767,8 +770,8 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     history_committed = True
                 else:
                     trailing_chunk = None
-            logger.debug("Clean text: %s", transcript_for_log(ctx.generated_text))
-            logger.info("Tools: %s", transcript_for_log(ctx.tools))
+            logger.debug("Clean text: %s", transcript_for_response_log(ctx.generated_text, response))
+            logger.info("Tools: %s", transcript_for_response_log(ctx.tools, response))
 
             if trailing_chunk is not None:
                 yield trailing_chunk
@@ -890,14 +893,18 @@ class LanguageModelHandler(BaseLanguageModelHandler):
 
         if self.backend == "mlx":
             with MLXLockContext(handler_name="MLX-LLM", timeout=10.0):
-                if self._check_stop(gen, ctx) or not ctx.begin_provider_request():
+                if self._check_stop(gen, ctx):
                     return
-                token_iter = mlx_stream_generate(
-                    self.model,  # type: ignore[arg-type]
-                    self.tokenizer,  # type: ignore[arg-type]
-                    chat_prompt,  # type: ignore[arg-type]
-                    max_tokens=self.gen_kwargs["max_new_tokens"],
+                started, token_iter = ctx.start_provider_request(
+                    lambda: mlx_stream_generate(
+                        self.model,  # type: ignore[arg-type]
+                        self.tokenizer,  # type: ignore[arg-type]
+                        chat_prompt,  # type: ignore[arg-type]
+                        max_tokens=self.gen_kwargs["max_new_tokens"],
+                    )
                 )
+                if not started:
+                    return
                 if ctx.prefetch_transaction is not None:
 
                     def abort_mlx_generation() -> None:
@@ -927,10 +934,12 @@ class LanguageModelHandler(BaseLanguageModelHandler):
                 with lock:
                     self.pipe(chat_prompt, **self.gen_kwargs)
 
-            if self._check_stop(gen, ctx) or not ctx.begin_provider_request():
+            if self._check_stop(gen, ctx):
                 return
             thread = Thread(target=_locked_pipe)
-            thread.start()
+            started, _ = ctx.start_provider_request(thread.start)
+            if not started:
+                return
             yield from self._stream_tokens(self.streamer, gen, language_code, ctx, runtime_config, response)
             self._finish_transformers_generation(thread)
             if self.device == "mps":
@@ -1080,16 +1089,20 @@ class VisionLanguageModelHandler(BaseLanguageModelHandler):
             logger.debug("MLX VLM prompt token count: %d", ctx.input_tokens)
 
             with MLXLockContext(handler_name="MLX-VLM", timeout=10.0):
-                if self._check_stop(gen, ctx) or not ctx.begin_provider_request():
+                if self._check_stop(gen, ctx):
                     return
-                token_iter = mlx_vlm_stream_generate(  # type: ignore[arg-type]
-                    self.model,
-                    self.processor,
-                    formatted_prompt,
-                    images or None,
-                    max_tokens=self.gen_kwargs.get("max_new_tokens", 1024),
-                    enable_thinking=self.enable_thinking,
+                started, token_iter = ctx.start_provider_request(
+                    lambda: mlx_vlm_stream_generate(  # type: ignore[arg-type]
+                        self.model,
+                        self.processor,
+                        formatted_prompt,
+                        images or None,
+                        max_tokens=self.gen_kwargs.get("max_new_tokens", 1024),
+                        enable_thinking=self.enable_thinking,
+                    )
                 )
+                if not started:
+                    return
                 if ctx.prefetch_transaction is not None:
 
                     def abort_mlx_generation() -> None:
@@ -1126,10 +1139,12 @@ class VisionLanguageModelHandler(BaseLanguageModelHandler):
                 with lock:
                     self.model.generate(**generate_kwargs)  # type: ignore[union-attr,operator]
 
-            if self._check_stop(gen, ctx) or not ctx.begin_provider_request():
+            if self._check_stop(gen, ctx):
                 return
             thread = Thread(target=_locked_generate)
-            thread.start()
+            started, _ = ctx.start_provider_request(thread.start)
+            if not started:
+                return
             yield from self._stream_tokens(self.streamer, gen, language_code, ctx, runtime_config, response)
             self._finish_transformers_generation(thread)
             if self.device == "mps":

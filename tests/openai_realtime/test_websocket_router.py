@@ -738,10 +738,13 @@ class TestSendLoop:
                 )
 
                 deadline = time.monotonic() + 1.0
-                while response_key not in state.closed_response_keys and time.monotonic() < deadline:
+                while service.total_usage.input_tokens != 11 and time.monotonic() < deadline:
                     time.sleep(0.01)
 
-                assert response_key in state.closed_response_keys
+                # The ordered cleanup terminal proves no more output can arrive,
+                # so its suppression record is retired after accounting usage.
+                assert response_key not in state.closed_response_keys
+                assert response_key not in state.pending_response_keys
                 assert state.pending_token_usage == {}
                 assert service.total_usage.input_tokens == 11
                 assert service.total_usage.output_tokens == 7

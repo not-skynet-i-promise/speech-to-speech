@@ -8,6 +8,7 @@ from threading import Event
 from types import SimpleNamespace
 
 import pytest
+from openai.types.realtime.realtime_response_create_params import RealtimeResponseCreateParams
 from openai.types.responses import ResponseFunctionToolCall
 
 from speech_to_speech.api.openai_realtime.service import RealtimeService
@@ -129,6 +130,24 @@ def test_llm_text_and_tool_arguments_follow_the_gate(caplog, enabled):
     list(processor.process(chunk))
 
     _assert_content_visibility(_logged_text(caplog), enabled, SENTINEL, TOOL_SENTINEL)
+
+
+def test_isolated_response_content_stays_suppressed_when_transcript_logging_is_enabled(caplog):
+    """Out-of-band prose must not enter retained logs under the debug opt-in."""
+    caplog.set_level(logging.DEBUG)
+    chunk = LLMResponseChunk(
+        parts=[AssistantTextPart(text=SENTINEL)],
+        response=RealtimeResponseCreateParams(conversation="none"),
+    )
+    processor = object.__new__(LMOutputProcessor)
+    processor.setup()
+    set_log_transcripts(True)
+
+    list(processor.process(chunk))
+
+    logged = _logged_text(caplog)
+    assert SENTINEL not in logged
+    assert "isolated-response-suppressed" in logged
 
 
 @pytest.mark.parametrize("enabled", [False, True])

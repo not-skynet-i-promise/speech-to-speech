@@ -223,7 +223,7 @@ class ConnState(BaseModel):
     conversation_item_order: list[str] = Field(default_factory=list)
     conversation_item_chat_ids: dict[str, str] = Field(default_factory=dict)
     # Response output can reach the wire before the LM commits its matching
-    # history items. Keep bounded tombstones plus the response descriptors
+    # history items. Keep lifecycle-bound tombstones plus the response descriptors
     # needed to remove a late write-back after an acknowledged deletion.
     deleted_conversation_item_ids: dict[str, None] = Field(default_factory=dict)
     deleted_response_text_outputs: dict[str, dict[str, Any]] = Field(default_factory=dict)
@@ -303,20 +303,38 @@ class ConnState(BaseModel):
         self.last_item_id = self.conversation_item_order[-1] if self.conversation_item_order else None
 
     def tombstone_conversation_item(self, item_id: str) -> None:
-        """Remember a deletion long enough to suppress delayed history write-back."""
+        """Remember a deletion until its delayed response write-back is reconciled."""
         self.deleted_conversation_item_ids[item_id] = None
-        while len(self.deleted_conversation_item_ids) > 256:
-            self.deleted_conversation_item_ids.pop(next(iter(self.deleted_conversation_item_ids)))
 
     def tombstone_input_terminal(self, turn_id: str | None, turn_revision: int | None) -> None:
-        """Suppress late terminals for one acknowledged-deleted input turn."""
+        """Suppress a late terminal until that producer actually terminates."""
         self.deleted_input_turn_revisions[(turn_id, turn_revision)] = None
-        while len(self.deleted_input_turn_revisions) > 256:
-            self.deleted_input_turn_revisions.pop(next(iter(self.deleted_input_turn_revisions)))
 
     def input_terminal_was_deleted(self, turn_id: str | None, turn_revision: int | None) -> bool:
         """Return whether an ambiguous pipeline terminal must remain suppressed."""
         return (turn_id, turn_revision) in self.deleted_input_turn_revisions
+
+    def consume_deleted_input_terminal(self, turn_id: str | None, turn_revision: int | None) -> bool:
+        """Retire an explicit tombstone when its one terminal is observed.
+
+        Metadata-free terminals cannot be correlated to a single producer, so
+        their fail-closed ``(None, None)`` tombstone lasts for the connection.
+        """
+        key = (turn_id, turn_revision)
+        if key not in self.deleted_input_turn_revisions:
+            return False
+        if turn_id is not None:
+            self.deleted_input_turn_revisions.pop(key, None)
+        return True
+
+    def response_key_is_closed(self, response_key: str | None) -> bool:
+        """Return whether output for a completed/cancelled response is stale."""
+        return response_key is not None and response_key in self.closed_response_keys
+
+    def retire_closed_response_key(self, response_key: str | None) -> None:
+        """Release a tombstone after the ordered audio terminal drains."""
+        if response_key is not None:
+            self.closed_response_keys.pop(response_key, None)
 
     def mark_response_pending(self, response_key: str) -> None:
         """Track an implicit response from queueing until its first output."""
@@ -358,8 +376,6 @@ class ConnState(BaseModel):
         self.forget_queued_input_response(response_key)
         self.pending_token_usage.pop(response_key, None)
         self.closed_response_keys[response_key] = None
-        while len(self.closed_response_keys) > 128:
-            self.closed_response_keys.pop(next(iter(self.closed_response_keys)))
         self.response_pending = bool(self.pending_response_keys)
 
 
@@ -661,6 +677,18 @@ class RealtimeService:
         if isinstance(event, TokenUsageEvent):
             return self._on_token_usage(conn_id, event)
 
+        if isinstance(
+            event,
+            (
+                AssistantOutputEvent,
+                AssistantResponseDoneEvent,
+                AssistantToolCallReadyEvent,
+                ResponseFailedEvent,
+            ),
+        ) and self._state(conn_id).response_key_is_closed(getattr(event, "response_key", None)):
+            logger.debug("Ignoring %s for a closed response", event.type)
+            return []
+
         if isinstance(event, (AssistantOutputEvent, AssistantToolCallReadyEvent)):
             # A TTS failure can overtake assistant content that the LLM already
             # queued for the same response. Do not publish text or tools after
@@ -821,7 +849,7 @@ class RealtimeService:
     def _on_audio_input_completed(self, conn_id: str, event: AudioInputCompletedEvent) -> list[ServerEvent]:
         """Record final input audio and queue its realtime LM request."""
         st = self._state(conn_id)
-        if st.input_terminal_was_deleted(event.turn_id, event.turn_revision):
+        if st.consume_deleted_input_terminal(event.turn_id, event.turn_revision):
             logger.debug(
                 "Ignoring direct-audio completion for deleted turn=%s rev=%s",
                 event.turn_id,
@@ -870,7 +898,7 @@ class RealtimeService:
     def _on_token_usage(self, conn_id: str, event: TokenUsageEvent) -> list[ServerEvent]:
         """Accumulate usage only on the response identified by the event."""
         st = self._state(conn_id)
-        if event.response_key is not None and event.response_key in st.closed_response_keys:
+        if st.response_key_is_closed(event.response_key):
             self.total_usage.input_tokens += event.input_tokens
             self.total_usage.output_tokens += event.output_tokens
             return []

@@ -168,6 +168,7 @@ class ConversationHandler(RealtimeBaseHandler):
             found = True
 
         removed_call_ids: set[str] = set()
+        needs_delayed_history_suppression = False
         if found:
             removed_text_outputs = [
                 pending for pending in st.pending_text_outputs if pending["item_id"] == event.item_id
@@ -182,6 +183,7 @@ class ConversationHandler(RealtimeBaseHandler):
                     "item_id": str(removed["item_id"]),
                 }
                 if not history_was_bound:
+                    needs_delayed_history_suppression = True
                     st.deleted_response_text_outputs[event.item_id] = {
                         "item_id": removed["item_id"],
                         "output_index": removed["output_index"],
@@ -201,6 +203,7 @@ class ConversationHandler(RealtimeBaseHandler):
                     "name": call.name,
                 }
                 if not history_was_bound:
+                    needs_delayed_history_suppression = True
                     st.deleted_response_function_calls[event.item_id] = (output_index, call.call_id)
         for call_ids in st.generation_done_tool_calls.values():
             call_ids.difference_update(removed_call_ids)
@@ -243,7 +246,8 @@ class ConversationHandler(RealtimeBaseHandler):
             st.current_output_kind = None
         preceding_events.extend(self._service.retract_queued_input_response(conn_id, event.item_id))
         st.forget_conversation_item(event.item_id)
-        st.tombstone_conversation_item(event.item_id)
+        if needs_delayed_history_suppression:
+            st.tombstone_conversation_item(event.item_id)
         return [
             *preceding_events,
             ConversationItemDeletedEvent(
@@ -459,7 +463,7 @@ class ConversationHandler(RealtimeBaseHandler):
     ) -> list[ConversationItemInputAudioTranscriptionCompletedEvent]:
         """Terminalize one transcript item and emit its authoritative final event."""
         st = self._state(conn_id)
-        if st.input_terminal_was_deleted(event.turn_id, event.turn_revision):
+        if st.consume_deleted_input_terminal(event.turn_id, event.turn_revision):
             logger.debug(
                 "Ignoring transcription completion for deleted turn=%s rev=%s",
                 event.turn_id,
@@ -504,7 +508,7 @@ class ConversationHandler(RealtimeBaseHandler):
     ) -> list[ConversationItemInputAudioTranscriptionFailedEvent]:
         """Terminalize one transcript item and emit its item-scoped failure."""
         st = self._state(conn_id)
-        if st.input_terminal_was_deleted(event.turn_id, event.turn_revision):
+        if st.consume_deleted_input_terminal(event.turn_id, event.turn_revision):
             logger.debug(
                 "Ignoring transcription failure for deleted turn=%s rev=%s",
                 event.turn_id,

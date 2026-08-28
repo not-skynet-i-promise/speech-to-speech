@@ -41,6 +41,7 @@ from speech_to_speech.pipeline.messages import (
     ResponsePrefetchTransaction,
     TokenUsage,
 )
+from speech_to_speech.pipeline.transcript_logging import set_log_transcripts
 
 
 def _make_text_delta_event(text):
@@ -1677,6 +1678,28 @@ def test_out_of_band_emits_output_but_does_not_commit_to_default_conversation():
     # ...but the default conversation keeps only the seeded user turn — no assistant commit.
     assert len(cfg.chat.buffer) == 1
     assert not any(isinstance(i, RealtimeConversationItemAssistantMessage) for i in cfg.chat.buffer)
+
+
+def test_out_of_band_generated_prose_never_enters_backend_logs(caplog):
+    sentinel = "ISOLATED_GENERATED_ANSWER_SENTINEL"
+    handler = _make_handler()
+    request, _cfg = _make_oob_request([make_user_message("isolated request")])
+    _capture_create(
+        handler,
+        [
+            _make_text_delta_event(f"{sentinel}."),
+            _make_output_item_done_event(content=f"{sentinel}."),
+        ],
+    )
+    caplog.set_level(logging.DEBUG)
+    set_log_transcripts(True)
+    try:
+        list(handler.process(request))
+    finally:
+        set_log_transcripts(False)
+
+    assert sentinel not in caplog.text
+    assert "isolated-response-suppressed" in caplog.text
 
 
 def test_empty_response_overrides_disable_session_instructions_and_tools():
