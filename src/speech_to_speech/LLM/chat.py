@@ -260,6 +260,41 @@ class Chat:
             len(self.buffer),
         )
 
+    def _restore_compacted_user_locked(self, target_user_id: str) -> bool:
+        """Restore one exact user branch from reversible compaction provenance."""
+
+        if any(
+            isinstance(item, RealtimeConversationItemUserMessage) and item.id == target_user_id for item in self.buffer
+        ):
+            return True
+        for summary_id, node in list(self._compaction_nodes.items()):
+            if target_user_id not in node.deletable_user_ids:
+                continue
+            summary_ids = {node.user_summary.id, node.assistant_summary.id}
+            indexes = [index for index, item in enumerate(self.buffer) if item.id in summary_ids]
+            if not indexes:
+                self._compaction_nodes.pop(summary_id, None)
+                continue
+            restored, surviving_nodes = self._restore_compaction_node_for_response(node, target_user_id)
+            insert_at = min(indexes)
+            self.buffer = [item for item in self.buffer if item.id not in summary_ids]
+            self.buffer[insert_at:insert_at] = restored
+            self._compaction_nodes.pop(summary_id, None)
+            for surviving in surviving_nodes:
+                assert surviving.user_summary.id is not None
+                self._compaction_nodes[surviving.user_summary.id] = surviving
+            self._user_turn_count = sum(
+                1 for item in self.buffer if isinstance(item, RealtimeConversationItemUserMessage)
+            )
+            return True
+        return False
+
+    def _release_resolved_tool_turn_locked(self, anchor: str | None) -> None:
+        """Release a tool owner after its final outstanding call is resolved."""
+
+        if anchor is not None and anchor not in self._pending_tool_call_anchors.values():
+            self._protected_response_user_ids.discard(anchor)
+
     def append_tool_output(self, call_id: str, output_item: RealtimeConversationItemFunctionCallOutput) -> None:
         """Append a ``function_call_output``, re-injecting its ``function_call`` if evicted.
 
@@ -275,7 +310,7 @@ class Chat:
         """Body of :meth:`append_tool_output`. Caller must hold ``_lock``."""
         if self._has_call_id_in_buffer(call_id):
             self._pending_tool_calls.pop(call_id, None)
-            self._pending_tool_call_anchors.pop(call_id, None)
+            anchor = self._pending_tool_call_anchors.pop(call_id, None)
             dependencies = self._pending_tool_call_dependencies.pop(call_id, set())
             self._mark_call_completed(call_id, output_item.status)
             call_index, function_call = next(
@@ -291,6 +326,7 @@ class Chat:
                 inherited = self._response_item_dependencies.get(function_call.id, dependencies)
                 if inherited:
                     self._response_item_dependencies[output_item.id] = set(inherited)
+            self._release_resolved_tool_turn_locked(anchor)
             return
 
         if call_id in self._pending_tool_calls:
@@ -298,14 +334,20 @@ class Chat:
                 logger.info("Re-injecting private evicted function_call; content redacted")
             else:
                 logger.info("Re-injecting evicted function_call for call_id=%s", call_id)
-            fc = self._pending_tool_calls.pop(call_id)
-            fc.status = "completed" if output_item.status is None else output_item.status
+            fc = self._pending_tool_calls[call_id]
             had_anchor = call_id in self._pending_tool_call_anchors
-            anchor = self._pending_tool_call_anchors.pop(call_id, None)
-            dependencies = self._pending_tool_call_dependencies.pop(call_id, set())
+            anchor = self._pending_tool_call_anchors.get(call_id)
+            dependencies = self._pending_tool_call_dependencies.get(call_id, set())
             insertion_index = self._response_insertion_index_locked(anchor) if anchor is not None else None
+            if had_anchor and insertion_index is None and anchor is not None:
+                self._restore_compacted_user_locked(anchor)
+                insertion_index = self._response_insertion_index_locked(anchor)
             if had_anchor and insertion_index is None:
                 raise ChatItemError("The function_call's owning user turn is no longer in conversation history.")
+            self._pending_tool_calls.pop(call_id)
+            self._pending_tool_call_anchors.pop(call_id, None)
+            self._pending_tool_call_dependencies.pop(call_id, None)
+            fc.status = "completed" if output_item.status is None else output_item.status
             if insertion_index is None:
                 self.buffer.extend((fc, output_item))
             else:
@@ -317,6 +359,7 @@ class Chat:
                 inherited = dependencies or {anchor}
                 self._response_item_dependencies[fc.id] = set(inherited)
                 self._response_item_dependencies[output_item.id] = set(inherited)
+            self._release_resolved_tool_turn_locked(anchor)
             return
 
         raise ChatItemError(f"No function_call with call_id '{call_id}' found in conversation history.")
@@ -920,6 +963,19 @@ class Chat:
         with self._lock:
             return set(self._response_item_dependencies.get(item_id, set()))
 
+    def latest_user_message_id(self, candidate_ids: set[str]) -> str | None:
+        """Return the last canonical user among *candidate_ids*."""
+
+        with self._lock:
+            return next(
+                (
+                    item.id
+                    for item in reversed(self.buffer)
+                    if isinstance(item, RealtimeConversationItemUserMessage) and item.id in candidate_ids
+                ),
+                None,
+            )
+
     def release_response_turn(self, item_id: str | None, *, force: bool = False) -> None:
         """Release a restored turn once no pending tool round-trip still owns it."""
 
@@ -949,29 +1005,7 @@ class Chat:
         with self._lock:
             self._gen_counter += 1
             self._compact_in_flight = False
-            target_present = any(
-                isinstance(item, RealtimeConversationItemUserMessage) and item.id == target_user_id
-                for item in self.buffer
-            )
-            if not target_present:
-                for summary_id, node in list(self._compaction_nodes.items()):
-                    if target_user_id not in node.deletable_user_ids:
-                        continue
-                    summary_ids = {node.user_summary.id, node.assistant_summary.id}
-                    indexes = [index for index, item in enumerate(self.buffer) if item.id in summary_ids]
-                    if not indexes:
-                        self._compaction_nodes.pop(summary_id, None)
-                        continue
-                    restored, surviving_nodes = self._restore_compaction_node_for_response(node, target_user_id)
-                    insert_at = min(indexes)
-                    self.buffer = [item for item in self.buffer if item.id not in summary_ids]
-                    self.buffer[insert_at:insert_at] = restored
-                    self._compaction_nodes.pop(summary_id, None)
-                    for surviving in surviving_nodes:
-                        assert surviving.user_summary.id is not None
-                        self._compaction_nodes[surviving.user_summary.id] = surviving
-                    target_present = True
-                    break
+            target_present = self._restore_compacted_user_locked(target_user_id)
             if not target_present and fallback_user is not None and fallback_user.id == target_user_id:
                 insert_at = next(
                     (

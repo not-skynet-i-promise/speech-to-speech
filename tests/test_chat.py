@@ -498,6 +498,12 @@ class TestAddItem:
             RealtimeConversationItemFunctionCallOutput,
         ]
 
+        newest = chat.add_item(_user("newest user after tool completion"))
+        assert newest.id is not None
+        chat.trim_if_needed()
+        assert chat.user_message(newest.id) is not None
+        assert chat.user_message(target.id) is None
+
     def test_outstanding_promoted_tool_turns_are_bounded_before_new_admission(self):
         chat = Chat(size=1)
         first = chat.add_item(_user("first promoted tool turn"))
@@ -1189,6 +1195,29 @@ class TestCompaction:
         assert len(fc_indices) == 1 and len(fco_indices) == 1
         assert fco_indices[0] == fc_indices[0] + 1
         assert "call_c1" not in chat._pending_tool_calls
+
+    def test_compaction_restores_anchored_user_before_delayed_tool_output(self):
+        chat = Chat(size=2)
+        compactor = _make_stub_compactor()
+        owner = chat.add_item(_user("anchored delayed tool owner"))
+        assert owner.id is not None
+        chat.mark_user_message_deletable(owner.id)
+        chat.add_response_item(_fc("anchored"), after_user_id=owner.id)
+        chat.release_response_turn(owner.id)
+        for index in range(1, 4):
+            chat.add_item(_user(f"u{index}"))
+            chat.add_item(_assistant(f"a{index}"))
+
+        chat.trim_if_needed(compactor)
+        _wait_thread(chat)
+        assert chat.user_message(owner.id) is None
+
+        chat.add_item(_fco("anchored", "delayed result"))
+
+        assert chat.user_message(owner.id) is not None
+        owner_index = next(index for index, item in enumerate(chat.buffer) if item.id == owner.id)
+        assert isinstance(chat.buffer[owner_index + 1], RealtimeConversationItemFunctionCall)
+        assert isinstance(chat.buffer[owner_index + 2], RealtimeConversationItemFunctionCallOutput)
 
     def test_compaction_preserves_appends_during_compaction(self):
         chat = Chat(size=2)

@@ -74,13 +74,17 @@ to an empty transcript retires its pending or active slot, and a queued turn is
 restored from exact compaction provenance (or its admission snapshot after
 lossy eviction) before it reaches the model. Promotion preserves FIFO order,
 incorporates completed output from earlier turns, and excludes client items
-that arrived after the promoted turn was admitted. For a `response.input`
+that arrived after the promoted turn was admitted, even when a deleted
+protocol ID is reused later. For a `response.input`
 batch, derived assistant and tool history remains deletion-owned by every user
 item serialized into that response, including when the tool result itself is
 supplied inline through `response.input`. Restored turns with outstanding tool
 results are retained only up to the configured chat size; admitting another
 restored turn retires the oldest outstanding tool ownership before it can crowd
-the newly accepted user out of the hard-bounded history.
+the newly accepted user out of the hard-bounded history. A delayed tool result
+restores its exact owner from reversible compaction provenance, and resolving
+the owner's final pending call releases that protection so later users remain
+evictable in causal order.
 
 ### Server -> Client
 
@@ -293,6 +297,11 @@ Barge-in (user speaks while the assistant is playing audio) is handled cooperati
 - **Discard flag** (`cancel_scope.discarding`): set by `cancel()`, checked by the async `_send_loop` to drop output from superseded generations that arrives between `cancel()` and `response_done()`. Cleared by `response_done(generation)` (only when the sentinel's generation matches the discarded or current one -- sentinels from unrelated older generations are ignored), by `new_response()` on an explicit `response.create`, or by `reset()` on session claim/release.
 
 Pipeline output is **generation-tagged**: `AudioOutput` chunks, `AssistantTextEvent`s, token-usage reports, and response failures carry a `cancel_generation` field stamped by the handler that produced them. The send loop drops stale audio/assistant output, and the service rejects usage or a failure that does not own the active generation. Output from the *current* generation always passes through, so a fresh response is never swallowed, charged, or failed by a superseded turn (e.g. a speculative turn whose TTS never emitted a `__RESPONSE_DONE__` sentinel).
+Assistant events also retain their turn ownership across user-event queue
+boundaries; output left behind after its response closes is discarded instead
+of opening or attaching to a successor response. A transient speculative reopen
+at either backend's final history fence is resolved outside the private-content
+lock and retried, so a cancelled reopen cannot silently lose valid writeback.
 
 ```mermaid
 sequenceDiagram

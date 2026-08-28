@@ -210,6 +210,9 @@ class GenerateResponseRequest(PipelineMessage):
     # request may incorporate output from an earlier response, but must not see
     # client items that arrived after its own admission.
     admitted_protocol_item_ids: set[str] | None = None
+    # Monotonic admission boundary for protocol items. Unlike the ID set above,
+    # this distinguishes a later item that reuses an ID after deletion.
+    admitted_protocol_sequence: int | None = None
     response: RealtimeResponseCreateParams | None = None
     language_code: Optional[str] = None
     turn_id: str | None = None

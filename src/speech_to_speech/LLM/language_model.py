@@ -214,11 +214,11 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             return True
         return self.speculative_turns.is_latest_after_reopen_grace(turn_id, turn_revision)
 
-    def _turn_owns_writeback_now(self, turn_id: str | None, turn_revision: int | None) -> bool:
-        """Fail closed on a stale or concurrently reopening turn without waiting."""
+    def _turn_owns_writeback_now(self, turn_id: str | None, turn_revision: int | None) -> bool | None:
+        """Check writeback ownership without waiting; ``None`` asks the caller to retry."""
         if self.speculative_turns is None:
             return True
-        return self.speculative_turns.try_is_latest_after_reopen_grace(turn_id, turn_revision) is True
+        return self.speculative_turns.try_is_latest_after_reopen_grace(turn_id, turn_revision)
 
     @abstractmethod
     def _load_model(
@@ -804,37 +804,44 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             # conversation (their context was a throwaway chat).
             commit_allowed = turn_output_allowed and not out_of_band
             if commit_allowed:
-                with runtime_config.transcript_barrier_state_guard():
-                    generation_stale = (
-                        ctx.cancel_generation is not None
-                        and self.cancel_scope is not None
-                        and self.cancel_scope.is_stale(ctx.cancel_generation)
-                    )
-                    if (
-                        not runtime_config.transcript_barrier_failed
-                        and not generation_stale
-                        and self._turn_owns_writeback_now(ctx.turn_id, ctx.turn_revision)
-                    ):
-                        original_chat.add_response_item(
-                            make_assistant_message(ctx.generated_text),
-                            after_user_id=request.response_user_item_id,
-                            owner_user_ids=request.response_user_item_ids,
+                while True:
+                    with runtime_config.transcript_barrier_state_guard():
+                        generation_stale = (
+                            ctx.cancel_generation is not None
+                            and self.cancel_scope is not None
+                            and self.cancel_scope.is_stale(ctx.cancel_generation)
                         )
-                        for t in ctx.tools:
-                            original_chat.add_response_item(
-                                RealtimeConversationItemFunctionCall(
-                                    type="function_call",
-                                    id=t.id,
-                                    call_id=t.call_id,
-                                    name=t.name,
-                                    arguments=t.arguments,
-                                    status=t.status,
-                                ),
-                                after_user_id=request.response_user_item_id,
-                                owner_user_ids=request.response_user_item_ids,
-                            )
-                        original_chat.strip_images(consumed_image_ids)
-                        original_chat.trim_if_needed(self.compactor)
+                        if runtime_config.transcript_barrier_failed or generation_stale:
+                            break
+                        owns_writeback = self._turn_owns_writeback_now(ctx.turn_id, ctx.turn_revision)
+                        if owns_writeback is not None:
+                            if owns_writeback:
+                                original_chat.add_response_item(
+                                    make_assistant_message(ctx.generated_text),
+                                    after_user_id=request.response_user_item_id,
+                                    owner_user_ids=request.response_user_item_ids,
+                                )
+                                for t in ctx.tools:
+                                    original_chat.add_response_item(
+                                        RealtimeConversationItemFunctionCall(
+                                            type="function_call",
+                                            id=t.id,
+                                            call_id=t.call_id,
+                                            name=t.name,
+                                            arguments=t.arguments,
+                                            status=t.status,
+                                        ),
+                                        after_user_id=request.response_user_item_id,
+                                        owner_user_ids=request.response_user_item_ids,
+                                    )
+                                original_chat.strip_images(consumed_image_ids)
+                                original_chat.trim_if_needed(self.compactor)
+                            break
+                    # A reopen began between the blocking output check and the
+                    # guarded writeback fence. Wait only outside the content lock,
+                    # then retry if the original revision still owns the turn.
+                    if not self._turn_output_allowed(ctx.turn_id, ctx.turn_revision):
+                        break
             with runtime_config.transcript_barrier_content_guard() as private_content:
                 if private_content:
                     logger.debug("Generated text redacted (characters=%d)", len(ctx.generated_text))

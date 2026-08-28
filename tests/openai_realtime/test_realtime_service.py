@@ -2079,6 +2079,132 @@ class TestHandleConversationItemDelete:
         assert all(item.id != response_item.id for item in chat.buffer)
         service.unregister(conn_id)
 
+    def test_mixed_inline_input_anchors_writeback_after_last_canonical_user(self):
+        from openai.types.realtime.realtime_conversation_item_function_call import (
+            RealtimeConversationItemFunctionCall,
+        )
+
+        prompt_queue = Queue()
+        service = RealtimeService(text_prompt_queue=prompt_queue, cancel_scope=CancelScope())
+        conn_id = service.register()
+        service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": "msg_older_owner",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "older owner"}],
+                        }
+                    ]
+                },
+            ),
+        )
+        first_request = prompt_queue.get_nowait()
+        chat = service._state(conn_id).runtime_config.chat
+        chat.add_response_item(
+            RealtimeConversationItemFunctionCall(
+                type="function_call",
+                call_id="call_mixed",
+                name="lookup",
+                arguments="{}",
+            ),
+            after_user_id=first_request.response_user_item_id,
+        )
+        service.finish_response(conn_id)
+
+        created = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": "msg_new_prompt",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "new prompt"}],
+                        },
+                        {
+                            "id": "fco_mixed",
+                            "type": "function_call_output",
+                            "call_id": "call_mixed",
+                            "output": "result",
+                        },
+                    ]
+                },
+            ),
+        )
+
+        assert isinstance(created, ResponseCreatedEvent)
+        request = prompt_queue.get_nowait()
+        assert request.response_user_item_id == "msg_new_prompt"
+        assert request.response_user_item_ids == {"msg_older_owner", "msg_new_prompt"}
+        service.unregister(conn_id)
+
+    def test_promoted_snapshot_excludes_protocol_id_recreated_after_admission(self):
+        service = RealtimeService(text_prompt_queue=Queue(), cancel_scope=CancelScope())
+        conn_id = service.register()
+        for item_id, text in (("msg_target", "target"), ("msg_reused", "old value")):
+            events = service.handle_conversation_item_create(
+                conn_id,
+                ConversationItemCreateEvent(
+                    type="conversation.item.create",
+                    item={
+                        "id": item_id,
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": text}],
+                    },
+                ),
+            )
+            assert [event.type for event in events] == ["conversation.item.created"]
+        state = service._state(conn_id)
+        state.turn_input_item_ids["turn_target"] = "msg_target"
+        state.input_item_chat_ids["msg_target"] = "msg_target"
+        request = GenerateResponseRequest(
+            runtime_config=state.runtime_config,
+            chat_snapshot=state.runtime_config.chat.copy(),
+            response_user_item_id="msg_target",
+            response_user_item_ids={"msg_target"},
+            admitted_protocol_item_ids=set(state.protocol_item_ids),
+            admitted_protocol_sequence=state.next_protocol_item_sequence,
+            turn_id="turn_target",
+            turn_revision=0,
+        )
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="msg_reused"),
+        )
+        assert deleted[0].type == "conversation.item.deleted"
+        recreated = service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "msg_reused",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "new value"}],
+                },
+            ),
+        )
+        assert recreated[0].type == "conversation.item.created"
+
+        service.response.resume_pending_request(conn_id, request, enqueue=False)
+
+        promoted = state.pending_response_request
+        assert promoted is not None and promoted.chat_snapshot is not None
+        serialized = promoted.chat_snapshot.to_responses_api_chat()
+        serialized_text = json.dumps(serialized)
+        assert "target" in serialized_text
+        assert "new value" not in serialized_text
+        service.unregister(conn_id)
+
     def test_untranscribed_audio_delete_never_removes_the_prior_turn(self, service, conn_id):
         st = service._state(conn_id)
         first = service.dispatch_pipeline_event(

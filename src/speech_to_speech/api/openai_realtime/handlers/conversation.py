@@ -63,6 +63,8 @@ class ConversationHandler(RealtimeBaseHandler):
                 }.get(event.item.type, "sys" if getattr(event.item, "role", None) == "system" else "msg")
                 event.item.id = _generate_id(prefix)
             st.deferred_items.append(event.item)
+            if event.item.id is not None:
+                st.reserve_deferred_protocol_item(event.item.id)
             logger.debug("Deferred conversation item until the active response completes")
             return []
         return self._apply_item(conn_id, event.item)
@@ -153,12 +155,18 @@ class ConversationHandler(RealtimeBaseHandler):
         for item in items:
             item_id = getattr(item, "id", None)
             if item_id is not None and item_id in seen_ids:
+                for deferred in items:
+                    if deferred.id is not None:
+                        st.drop_deferred_protocol_item(deferred.id)
                 return [self._duplicate_item_error(conn_id)]
             if item_id is not None:
                 seen_ids.add(item_id)
         try:
             add_supported_items_atomically(st.runtime_config.chat, items)
         except ChatItemError as exc:
+            for item in items:
+                if item.id is not None:
+                    st.drop_deferred_protocol_item(item.id)
             if st.runtime_config.home_assistant_guard_operational:
                 return [self._service.poison_home_assistant_guard(conn_id, "invalid_conversation_item")]
             return [self.make_client_content_error(conn_id, str(exc), "invalid_conversation_item")]
@@ -198,6 +206,8 @@ class ConversationHandler(RealtimeBaseHandler):
                     chat_item_id,
                 }:
                     del st.deferred_items[index]
+                    if item.id is not None:
+                        st.drop_deferred_protocol_item(item.id)
                     removed = True
                     break
         if not removed:

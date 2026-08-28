@@ -234,6 +234,8 @@ class ConnState(BaseModel):
     active_response_cancel_generation: Optional[int] = None
     active_response_input_item_id: Optional[str] = None
     active_response_input_item_ids: set[str] = Field(default_factory=set)
+    last_closed_response_turn_id: Optional[str] = None
+    last_closed_response_cancel_generation: Optional[int] = None
     # A provider failure is surfaced on the text side-channel before its normal
     # terminal sentinel reaches the audio queue. Keep the active slot owned until
     # that sentinel arrives, otherwise it can close a newly promoted successor.
@@ -253,6 +255,9 @@ class ConnState(BaseModel):
     deferred_items: list[ConversationItem] = Field(default_factory=list)
     transcript_barrier_replacement_item_ids: set[str] = Field(default_factory=set)
     protocol_item_ids: list[str] = Field(default_factory=list)
+    protocol_item_sequences: dict[str, int] = Field(default_factory=dict)
+    deferred_protocol_item_sequences: dict[str, int] = Field(default_factory=dict)
+    next_protocol_item_sequence: int = 0
     audio_input_item_ids: set[str] = Field(default_factory=set)
     input_item_chat_ids: dict[str, str] = Field(default_factory=dict)
     input_item_turn_ids: dict[str, str] = Field(default_factory=dict)
@@ -263,9 +268,15 @@ class ConnState(BaseModel):
         """Record one protocol-visible conversation item in creation order."""
         newly_created = item_id not in self.protocol_item_ids
         if newly_created:
+            sequence = self.deferred_protocol_item_sequences.pop(item_id, None)
+            if sequence is None:
+                self.next_protocol_item_sequence += 1
+                sequence = self.next_protocol_item_sequence
+            self.protocol_item_sequences[item_id] = sequence
             self.protocol_item_ids.append(item_id)
         while len(self.protocol_item_ids) > MAX_TRACKED_PROTOCOL_ITEMS:
             retired_item_id = self.protocol_item_ids.pop(0)
+            self.protocol_item_sequences.pop(retired_item_id, None)
             self.audio_input_item_ids.discard(retired_item_id)
             retired_chat_id = self.input_item_chat_ids.pop(retired_item_id, retired_item_id)
             self.runtime_config.chat.retire_user_message_deletable(retired_chat_id)
@@ -275,6 +286,17 @@ class ConnState(BaseModel):
             self.deleted_input_item_ids.pop(retired_item_id, None)
         if newly_created:
             self.last_item_id = item_id
+
+    def reserve_deferred_protocol_item(self, item_id: str) -> None:
+        """Assign an immutable admission sequence before deferred chat commit."""
+
+        self.next_protocol_item_sequence += 1
+        self.deferred_protocol_item_sequences[item_id] = self.next_protocol_item_sequence
+
+    def drop_deferred_protocol_item(self, item_id: str) -> None:
+        """Release the sequence reservation for a deferred item that was rejected."""
+
+        self.deferred_protocol_item_sequences.pop(item_id, None)
 
     def record_deleted_input_item(self, item_id: str) -> None:
         """Remember a deleted audio item without allowing per-session state growth."""
@@ -293,6 +315,7 @@ class ConnState(BaseModel):
     def remove_protocol_item(self, item_id: str) -> None:
         """Remove one protocol item and expose only the surviving protocol tail."""
         self.protocol_item_ids = [existing for existing in self.protocol_item_ids if existing != item_id]
+        self.protocol_item_sequences.pop(item_id, None)
         self.last_item_id = self.protocol_item_ids[-1] if self.protocol_item_ids else None
 
 
@@ -966,6 +989,7 @@ class RealtimeService:
                     *st.protocol_item_ids,
                     *(item.id for item in st.deferred_items if item.id is not None),
                 },
+                admitted_protocol_sequence=st.next_protocol_item_sequence,
                 language_code=event.language_code,
                 turn_id=event.turn_id,
                 turn_revision=event.turn_revision,

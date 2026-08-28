@@ -1517,6 +1517,67 @@ class TestSendLoop:
         assert queued_assistant.text == "queued after boundary"
         assert text_output_queue.empty()
 
+    def test_assistant_retained_after_boundary_cannot_reopen_closed_response(self, setup):
+        _, service, input_queue, output_queue, text_output_queue, should_listen, _, response_playing, cancel_scope = (
+            setup
+        )
+        unit = PipelineUnit(
+            index=0,
+            service=service,
+            cancel_scope=cancel_scope,
+            should_listen=should_listen,
+            response_playing=response_playing,
+            input_queue=input_queue,
+            output_queue=output_queue,
+            text_output_queue=text_output_queue,
+            text_prompt_queue=Queue(),
+            handlers=[],
+        )
+        conn_id = service.register()
+        generation = cancel_scope.generation
+        service.response.resume_pending_request(
+            conn_id,
+            GenerateResponseRequest(
+                runtime_config=service._state(conn_id).runtime_config,
+                turn_id="turn_old",
+                turn_revision=0,
+                cancel_generation=generation,
+            ),
+            enqueue=False,
+        )
+        service.response._ensure_response(conn_id)
+        text_output_queue.put(
+            AssistantTextEvent(
+                text="old response before boundary",
+                turn_id="turn_old",
+                turn_revision=0,
+                cancel_generation=generation,
+            )
+        )
+        text_output_queue.put(SpeechStartedEvent(interrupt_response=False))
+        text_output_queue.put(
+            AssistantTextEvent(
+                text="old response after boundary",
+                turn_id="turn_old",
+                turn_revision=0,
+                cancel_generation=generation,
+            )
+        )
+        ws = _FakeWebSocket()
+
+        asyncio.run(router_module._drain_pending_response_events(ws, unit, conn_id))
+        service.finish_response(conn_id)
+        boundary = text_output_queue.get_nowait()
+        retained = text_output_queue.get_nowait()
+
+        assert isinstance(boundary, SpeechStartedEvent)
+        assert isinstance(retained, AssistantTextEvent)
+        assert service.dispatch_pipeline_event(conn_id, retained) == []
+        state = service._state(conn_id)
+        assert state.current_response_id is None
+        assert not state.in_response
+        service.unregister(conn_id)
+
     def test_response_completion_drain_latches_failure_before_terminal(self, setup):
         _, service, input_queue, output_queue, text_output_queue, should_listen, _, response_playing, cancel_scope = (
             setup

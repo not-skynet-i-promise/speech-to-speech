@@ -886,6 +886,34 @@ def test_turn_deletion_at_locked_writeback_fence_cannot_restore_assistant_histor
     )
 
 
+def test_transient_pending_reopen_at_writeback_fence_retries_valid_history(monkeypatch):
+    handler = _make_handler(stream=False)
+    handler.client.chat.completions.next_result = _complete_response(content="must persist")
+    tracker = SpeculativeTurnTracker()
+    tracker.observe("t", 0)
+    handler.speculative_turns = tracker
+    original_check = handler._turn_owns_writeback_now
+    calls = 0
+
+    def transient_reopen(turn_id, turn_revision):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            candidate = tracker.begin_reopen_candidate(turn_id, turn_revision)
+            tracker.cancel_reopen_candidate(turn_id, candidate)
+            return None
+        return original_check(turn_id, turn_revision)
+
+    monkeypatch.setattr(handler, "_turn_owns_writeback_now", transient_reopen)
+
+    _text, _tools, _usage, chat, _end = _drive(handler)
+
+    assert calls >= 2
+    assert any(
+        getattr(part, "text", None) == "must persist" for item in chat.buffer for part in getattr(item, "content", [])
+    )
+
+
 def test_streaming_tool_call_accumulates_arguments():
     h = _make_handler(stream=True)
     # Arguments arrive split across deltas, as real servers stream them.

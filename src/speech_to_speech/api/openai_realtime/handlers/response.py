@@ -131,6 +131,8 @@ class ResponseHandler(RealtimeBaseHandler):
 
     def _end_response(self, conn_id: str, status: _ResponseStatus = "completed") -> None:
         st = self._state(conn_id)
+        st.last_closed_response_turn_id = st.active_response_turn_id
+        st.last_closed_response_cancel_generation = st.active_response_cancel_generation
         if status == "cancelled":
             st.response_usage.responses_cancelled += 1
         else:
@@ -351,6 +353,22 @@ class ResponseHandler(RealtimeBaseHandler):
                     ]
                     accepted_primary_input_id = primary_input_ids[-1] if primary_input_ids else owner_id
 
+            def resolve_primary_input_id() -> str | None:
+                """Resolve writeback order from canonical chat order, not batch order."""
+
+                dependency_chat_ids = {
+                    st.input_item_chat_ids.get(input_id, input_id) for input_id in accepted_dependency_input_ids
+                }
+                primary_chat_id = st.runtime_config.chat.latest_user_message_id(dependency_chat_ids)
+                if primary_chat_id is None:
+                    return accepted_primary_input_id
+                protocol_candidates = [
+                    input_id
+                    for input_id in st.protocol_item_ids
+                    if st.input_item_chat_ids.get(input_id, input_id) == primary_chat_id
+                ]
+                return protocol_candidates[-1] if protocol_candidates else primary_chat_id
+
             try:
                 if st.runtime_config.sensitive_content:
                     add_supported_items_atomically(st.runtime_config.chat, input_items)
@@ -365,7 +383,7 @@ class ResponseHandler(RealtimeBaseHandler):
                         record_accepted_item(item)
             except ChatItemError as exc:
                 if accepted_item_ids:
-                    st.response_context_input_item_id = accepted_primary_input_id
+                    st.response_context_input_item_id = resolve_primary_input_id()
                     st.response_context_input_item_ids = set(accepted_dependency_input_ids)
                     st.response_context_turn_id = None
                     st.response_context_turn_revision = None
@@ -377,7 +395,7 @@ class ResponseHandler(RealtimeBaseHandler):
             # every accepted user dependency because deletion of any one
             # invalidates the response that serialized the batch. Tool outputs
             # inherit the complete dependency set of their originating call.
-            st.response_context_input_item_id = accepted_primary_input_id
+            st.response_context_input_item_id = resolve_primary_input_id()
             st.response_context_input_item_ids = set(accepted_dependency_input_ids)
             st.response_context_turn_id = None
             st.response_context_turn_revision = None
@@ -431,6 +449,7 @@ class ResponseHandler(RealtimeBaseHandler):
                         *st.protocol_item_ids,
                         *(item.id for item in st.deferred_items if item.id is not None),
                     },
+                    admitted_protocol_sequence=st.next_protocol_item_sequence,
                     response=event.response,
                     turn_id=None if out_of_band else st.response_context_turn_id,
                     turn_revision=None if out_of_band else st.response_context_turn_revision,
@@ -595,11 +614,18 @@ class ResponseHandler(RealtimeBaseHandler):
             later_chat_id = st.input_item_chat_ids.get(later_input_id)
             if later_chat_id is not None:
                 later_chat_ids.add(later_chat_id)
-        future_protocol_ids = (
-            set(st.protocol_item_ids) - request.admitted_protocol_item_ids
-            if request.admitted_protocol_item_ids is not None
-            else set()
-        )
+        if request.admitted_protocol_sequence is not None:
+            future_protocol_ids = {
+                item_id
+                for item_id in st.protocol_item_ids
+                if st.protocol_item_sequences.get(item_id, 0) > request.admitted_protocol_sequence
+            }
+        else:
+            future_protocol_ids = (
+                set(st.protocol_item_ids) - request.admitted_protocol_item_ids
+                if request.admitted_protocol_item_ids is not None
+                else set()
+            )
         future_chat_ids = {st.input_item_chat_ids.get(item_id, item_id) for item_id in future_protocol_ids}
         refreshed_chat = (
             st.runtime_config.chat.snapshot_for_response_turn(
@@ -663,12 +689,51 @@ class ResponseHandler(RealtimeBaseHandler):
             if not commit_result:
                 logger.debug("Dropping stale assistant text for turn=%s rev=%s", event.turn_id, event.turn_revision)
                 return []
+        st = self._state(conn_id)
+        if st.in_response:
+            owner_turn_id = st.active_response_turn_id
+            owner_generation = st.active_response_cancel_generation
+        elif st.response_pending and st.pending_response_request is not None:
+            owner_turn_id = st.pending_response_turn_id
+            owner_generation = st.pending_response_request.cancel_generation
+        else:
+            owner_turn_id = None
+            owner_generation = None
+        if not st.in_response and not st.response_pending:
+            closed_owner = (
+                event.turn_id == st.last_closed_response_turn_id
+                if event.turn_id is not None
+                else (
+                    event.cancel_generation is not None
+                    and event.cancel_generation == st.last_closed_response_cancel_generation
+                )
+            )
+            if closed_owner:
+                logger.debug("Dropping assistant output after its response slot closed")
+                return []
+        if event.turn_id is not None and owner_turn_id is not None and event.turn_id != owner_turn_id:
+            logger.debug(
+                "Dropping assistant output for non-active turn=%s (owner=%s)",
+                event.turn_id,
+                owner_turn_id,
+            )
+            return []
+        if (
+            event.cancel_generation is not None
+            and owner_generation is not None
+            and event.cancel_generation != owner_generation
+        ):
+            logger.debug(
+                "Dropping assistant output for non-active generation=%s (owner=%s)",
+                event.cancel_generation,
+                owner_generation,
+            )
+            return []
         if not any(
             isinstance(part, AssistantToolCallPart) or (isinstance(part, AssistantTextPart) and bool(part.text))
             for part in event.parts
         ):
             return []
-        st = self._state(conn_id)
         events: list[ServerEvent] = []
         need_created = st.current_response_id is None
         resp_id, _ = self._ensure_response(conn_id)
