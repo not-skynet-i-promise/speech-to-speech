@@ -144,12 +144,20 @@ def test_warmup_uses_request_scoped_sdk_retries():
 def test_process_serializes_request_chat_snapshot_not_later_shared_turns():
     handler = _make_handler(stream=False)
     chat = Chat(10)
-    chat.add_item(make_user_message("queued turn"))
+    queued_turn = chat.add_item(make_user_message("queued turn"))
     snapshot = chat.copy()
     chat.add_item(make_user_message("later turn"))
     runtime = RuntimeConfig(chat=chat, session=RealtimeSessionCreateRequest(type="realtime"))
 
-    list(handler.process(GenerateResponseRequest(runtime_config=runtime, chat_snapshot=snapshot)))
+    list(
+        handler.process(
+            GenerateResponseRequest(
+                runtime_config=runtime,
+                chat_snapshot=snapshot,
+                response_user_item_id=queued_turn.id,
+            )
+        )
+    )
 
     messages = handler.client.chat.completions.last_kwargs["messages"]
     user_text = [message["content"] for message in messages if message["role"] == "user"]
@@ -158,6 +166,7 @@ def test_process_serializes_request_chat_snapshot_not_later_shared_turns():
         "queued turn",
         "later turn",
     ]
+    assert [item.role for item in chat.buffer] == ["user", "assistant", "user"]
 
 
 def test_cancelled_queued_request_cannot_start_after_private_barrier_ready():

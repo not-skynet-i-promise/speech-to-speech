@@ -32,6 +32,7 @@ from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
     PartialTranscriptionEvent,
     PipelineEvent,
+    ResponseFailedEvent,
     SpeechStartedEvent,
     SpeechStoppedEvent,
     TokenUsageEvent,
@@ -235,6 +236,11 @@ async def _drain_pending_response_events(
             if isinstance(item, TokenUsageEvent):
                 unit.service.dispatch_pipeline_event(session_id, item)
                 drained_usage += 1
+            elif isinstance(item, ResponseFailedEvent):
+                events = unit.service.dispatch_pipeline_event(session_id, item)
+                if ws is not None and events:
+                    send = _send_events_unlocked if lock_held else _send_events
+                    await send(ws, events)
             elif drain_assistant_events and isinstance(item, AssistantTextEvent):
                 drained_assistant += 1
                 if _generation_is_discardable(unit, item.cancel_generation):
@@ -817,6 +823,7 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                     if session is not None and ws is not None and session_id:
                         async with session.outbound_lock:
                             is_speech_start = isinstance(text_msg, SpeechStartedEvent)
+                            speech_start_dispatched = False
                             st = unit.service._state(session_id)
                             was_in_response = is_speech_start and st.in_response
                             was_response_pending = is_speech_start and st.response_pending
@@ -832,12 +839,13 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                                 pass
                             elif isinstance(text_msg, PipelineEvent):
                                 events = unit.service.dispatch_pipeline_event(session_id, text_msg)
+                                speech_start_dispatched = is_speech_start and bool(events)
                                 if events:
                                     await _send_events_unlocked(ws, events)
                                 if unit.service.private_protocol_failed(session_id):
                                     await ws.close(code=1008, reason="Private session failed")
 
-                            if is_speech_start and (was_in_response or was_response_pending):
+                            if speech_start_dispatched and (was_in_response or was_response_pending):
                                 active_cfg = st.runtime_config
                                 if text_msg.interrupt_response and active_cfg.interrupt_response_enabled:
                                     unit.cancel_scope.cancel()

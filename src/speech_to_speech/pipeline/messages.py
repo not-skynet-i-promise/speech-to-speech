@@ -197,6 +197,10 @@ class GenerateResponseRequest(PipelineMessage):
     tag: Literal["generate_response"] = "generate_response"
     runtime_config: RuntimeConfig
     chat_snapshot: Chat | None = Field(default=None, exclude=True, repr=False)
+    # Exact canonical user item whose response output must precede any later
+    # queued user turns.  Without this anchor, cross-thread write-back appends
+    # assistant output after users that arrived while the provider was running.
+    response_user_item_id: str | None = None
     response: RealtimeResponseCreateParams | None = None
     language_code: Optional[str] = None
     turn_id: str | None = None

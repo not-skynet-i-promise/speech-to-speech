@@ -947,6 +947,7 @@ class RealtimeService:
             request = GenerateResponseRequest(
                 runtime_config=cfg,
                 chat_snapshot=cfg.chat.copy(),
+                response_user_item_id=st.speculative_user_item_id,
                 language_code=event.language_code,
                 turn_id=event.turn_id,
                 turn_revision=event.turn_revision,
@@ -1137,13 +1138,15 @@ class RealtimeService:
             logger.info("Response failed: %s", message)
         if (not state.in_response and not state.response_pending) or state.response_failure_pending:
             return []
-        if not state.in_response:
-            self.response._ensure_response(conn_id)
-        if event.turn_id is not None and state.active_response_turn_id is not None:
-            if event.turn_id != state.active_response_turn_id or (
+        owner_turn_id = state.active_response_turn_id if state.in_response else state.pending_response_turn_id
+        owner_turn_revision = (
+            state.active_response_turn_revision if state.in_response else state.pending_response_turn_revision
+        )
+        if event.turn_id is not None:
+            if event.turn_id != owner_turn_id or (
                 event.turn_revision is not None
-                and state.active_response_turn_revision is not None
-                and event.turn_revision != state.active_response_turn_revision
+                and owner_turn_revision is not None
+                and event.turn_revision != owner_turn_revision
             ):
                 logger.debug(
                     "Ignoring response failure for non-active turn=%s rev=%s",
@@ -1151,8 +1154,21 @@ class RealtimeService:
                     event.turn_revision,
                 )
                 return []
+        created = not state.in_response
+        if created:
+            self.response._ensure_response(conn_id)
         state.response_failure_pending = True
-        return [self.make_error(message, "response_failed")]
+        events: list[ServerEvent] = []
+        if created:
+            events.append(
+                ResponseCreatedEvent(
+                    type="response.created",
+                    event_id=self.response._next_event_id(),
+                    response=self.response._build_response(conn_id, "in_progress"),
+                )
+            )
+        events.append(self.make_error(message, "response_failed"))
+        return events
 
     def get_usage(self) -> dict[str, Any]:
         """Return cumulative usage metrics across all completed responses."""

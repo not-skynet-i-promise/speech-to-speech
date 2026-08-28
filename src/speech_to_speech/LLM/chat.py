@@ -116,6 +116,7 @@ class Chat:
         # is evicted -- or, with a compactor, summarized in the background.
         self.buffer: list[SupportedItem] = []
         self._pending_tool_calls: dict[str, RealtimeConversationItemFunctionCall] = {}
+        self._pending_tool_call_anchors: dict[str, str] = {}
         self._user_turn_count: int = 0
         self._deletable_user_ids: set[str] = set()
         self._compaction_nodes: dict[str, _CompactionNode] = {}
@@ -163,6 +164,27 @@ class Chat:
                 entry.status = "completed" if status is None else status
                 return
 
+    def _response_insertion_index_locked(self, user_item_id: str) -> int | None:
+        """Return the end of one exact user turn, before the next user."""
+        user_index = next(
+            (
+                index
+                for index, item in enumerate(self.buffer)
+                if isinstance(item, RealtimeConversationItemUserMessage) and item.id == user_item_id
+            ),
+            None,
+        )
+        if user_index is None:
+            return None
+        return next(
+            (
+                index
+                for index in range(user_index + 1, len(self.buffer))
+                if isinstance(self.buffer[index], RealtimeConversationItemUserMessage)
+            ),
+            len(self.buffer),
+        )
+
     def append_tool_output(self, call_id: str, output_item: RealtimeConversationItemFunctionCallOutput) -> None:
         """Append a ``function_call_output``, re-injecting its ``function_call`` if evicted.
 
@@ -178,8 +200,14 @@ class Chat:
         """Body of :meth:`append_tool_output`. Caller must hold ``_lock``."""
         if self._has_call_id_in_buffer(call_id):
             self._pending_tool_calls.pop(call_id, None)
+            self._pending_tool_call_anchors.pop(call_id, None)
             self._mark_call_completed(call_id, output_item.status)
-            self.buffer.append(output_item)
+            call_index = next(
+                index
+                for index, item in enumerate(self.buffer)
+                if isinstance(item, RealtimeConversationItemFunctionCall) and item.call_id == call_id
+            )
+            self.buffer.insert(call_index + 1, output_item)
             return
 
         if call_id in self._pending_tool_calls:
@@ -189,8 +217,15 @@ class Chat:
                 logger.info("Re-injecting evicted function_call for call_id=%s", call_id)
             fc = self._pending_tool_calls.pop(call_id)
             fc.status = "completed" if output_item.status is None else output_item.status
-            self.buffer.append(fc)
-            self.buffer.append(output_item)
+            had_anchor = call_id in self._pending_tool_call_anchors
+            anchor = self._pending_tool_call_anchors.pop(call_id, None)
+            insertion_index = self._response_insertion_index_locked(anchor) if anchor is not None else None
+            if had_anchor and insertion_index is None:
+                raise ChatItemError("The function_call's owning user turn is no longer in conversation history.")
+            if insertion_index is None:
+                self.buffer.extend((fc, output_item))
+            else:
+                self.buffer[insertion_index:insertion_index] = [fc, output_item]
             return
 
         raise ChatItemError(f"No function_call with call_id '{call_id}' found in conversation history.")
@@ -213,11 +248,40 @@ class Chat:
         with self._lock:
             return self._add_item_locked(item)
 
+    def add_response_item(self, item: SupportedItem, *, after_user_id: str | None) -> SupportedItem | None:
+        """Commit response output inside its exact turn instead of after queued users.
+
+        A missing non-null anchor means the owning user was deleted or evicted;
+        fail closed rather than retaining orphaned assistant/tool output. Calls
+        without a turn anchor preserve the legacy append behavior.
+        """
+        with self._lock:
+            if after_user_id is None:
+                return self._add_item_locked(item)
+            insertion_index = self._response_insertion_index_locked(after_user_id)
+            if insertion_index is None:
+                logger.debug("Dropping response write-back after its user item left history")
+                return None
+            added = self._add_item_locked(item)
+            if isinstance(item, RealtimeConversationItemAssistantMessage) and any(
+                candidate is item for candidate in self.buffer
+            ):
+                self.buffer = [candidate for candidate in self.buffer if candidate is not item]
+                insertion_index = self._response_insertion_index_locked(after_user_id)
+                if insertion_index is None:
+                    return None
+                self.buffer.insert(insertion_index, item)
+            elif isinstance(item, RealtimeConversationItemFunctionCall):
+                assert item.call_id is not None
+                self._pending_tool_call_anchors[item.call_id] = after_user_id
+            return added
+
     def add_items_atomically(self, items: list[SupportedItem]) -> None:
         """Add a client-supplied batch completely or restore the prior chat state."""
         with self._lock:
             buffer_before = list(self.buffer)
             pending_before = dict(self._pending_tool_calls)
+            pending_anchors_before = dict(self._pending_tool_call_anchors)
             compaction_nodes_before = dict(self._compaction_nodes)
             turns_before = self._user_turn_count
             init_before = self.init_chat_message
@@ -233,6 +297,7 @@ class Chat:
             except ChatItemError:
                 self.buffer = buffer_before
                 self._pending_tool_calls = pending_before
+                self._pending_tool_call_anchors = pending_anchors_before
                 self._compaction_nodes = compaction_nodes_before
                 self._user_turn_count = turns_before
                 self.init_chat_message = init_before
@@ -458,6 +523,11 @@ class Chat:
             # acknowledge the exact deletion while releasing its retained marker.
             if item_id in self._deletable_user_ids:
                 self._deletable_user_ids.remove(item_id)
+                # The item may have been hard-evicted after a compactor captured
+                # it.  The successful protocol deletion must invalidate that
+                # snapshot just as deleting a still-buffered item does.
+                self._gen_counter += 1
+                self._compact_in_flight = False
                 return True
         return False
 
@@ -611,6 +681,7 @@ class Chat:
             clone.init_chat_message = self.init_chat_message
             clone.buffer = list(self.buffer)
             clone._pending_tool_calls = dict(self._pending_tool_calls)
+            clone._pending_tool_call_anchors = dict(self._pending_tool_call_anchors)
             clone._user_turn_count = self._user_turn_count
             clone._deletable_user_ids = set(self._deletable_user_ids)
             clone._compaction_nodes = dict(self._compaction_nodes)
@@ -645,6 +716,7 @@ class Chat:
                 selected.append(target)
             clone.buffer = selected
             clone._pending_tool_calls = dict(self._pending_tool_calls)
+            clone._pending_tool_call_anchors = dict(self._pending_tool_call_anchors)
             clone._user_turn_count = sum(
                 1 for item in selected if isinstance(item, RealtimeConversationItemUserMessage)
             )
@@ -669,6 +741,7 @@ class Chat:
             self.buffer = []
             self.init_chat_message = None
             self._pending_tool_calls = {}
+            self._pending_tool_call_anchors = {}
             self._user_turn_count = 0
             self._deletable_user_ids = set()
             self._compaction_nodes = {}

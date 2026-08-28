@@ -813,9 +813,12 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                         and not generation_stale
                         and self._turn_owns_writeback_now(ctx.turn_id, ctx.turn_revision)
                     ):
-                        original_chat.add_item(make_assistant_message(ctx.generated_text))
+                        original_chat.add_response_item(
+                            make_assistant_message(ctx.generated_text),
+                            after_user_id=request.response_user_item_id,
+                        )
                         for t in ctx.tools:
-                            original_chat.add_item(
+                            original_chat.add_response_item(
                                 RealtimeConversationItemFunctionCall(
                                     type="function_call",
                                     id=t.id,
@@ -823,7 +826,8 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                                     name=t.name,
                                     arguments=t.arguments,
                                     status=t.status,
-                                )
+                                ),
+                                after_user_id=request.response_user_item_id,
                             )
                         original_chat.strip_images(consumed_image_ids)
                         original_chat.trim_if_needed(self.compactor)

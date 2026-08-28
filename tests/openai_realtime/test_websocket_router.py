@@ -14,6 +14,7 @@ from queue import Empty, Queue
 from threading import Event as ThreadingEvent
 
 import pytest
+from openai.types.realtime import ResponseDoneEvent
 from openai.types.realtime.realtime_session_create_request import RealtimeSessionCreateRequest
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketState
@@ -27,12 +28,19 @@ from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.control import SESSION_END, PipelineControlMessage, is_control_message
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
+    ResponseFailedEvent,
     SpeechStartedEvent,
     TokenUsageEvent,
     TranscriptBarrierCompletedEvent,
     TranscriptionCompletedEvent,
 )
-from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, PIPELINE_END, AudioOutput
+from speech_to_speech.pipeline.messages import (
+    AUDIO_RESPONSE_DONE,
+    PIPELINE_END,
+    AudioOutput,
+    GenerateResponseRequest,
+)
+from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -1176,6 +1184,34 @@ class TestSendLoop:
                 time.sleep(0.15)
                 assert not cancel_scope.discarding
 
+    def test_stale_speech_started_cannot_cancel_unrelated_active_response(self, setup):
+        app, service, _, _, text_output_queue, _, _, response_playing, cancel_scope = setup
+        tracker = SpeculativeTurnTracker()
+        service.speculative_turns = tracker
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                conn_id = next(iter(service._conns))
+                response_id, _ = service.response._ensure_response(conn_id)
+                response_playing.set()
+                generation = cancel_scope.generation
+                tracker.discard("turn_deleted")
+
+                text_output_queue.put(
+                    SpeechStartedEvent(turn_id="turn_deleted", turn_revision=0, interrupt_response=True)
+                )
+                deadline = time.monotonic() + 1.0
+                while not text_output_queue.empty() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+
+                state = service._state(conn_id)
+                assert text_output_queue.empty()
+                assert state.in_response
+                assert state.current_response_id == response_id
+                assert cancel_scope.generation == generation
+                assert not cancel_scope.discarding
+                assert response_playing.is_set()
+
     def test_pending_barge_in_clears_deferred_turns_before_admitting_new_turn(self, setup):
         app, service, _, _, text_output_queue, *_ = setup
         with TestClient(app) as client:
@@ -1480,6 +1516,43 @@ class TestSendLoop:
         assert isinstance(queued_assistant, AssistantTextEvent)
         assert queued_assistant.text == "queued after boundary"
         assert text_output_queue.empty()
+
+    def test_response_completion_drain_latches_failure_before_terminal(self, setup):
+        _, service, input_queue, output_queue, text_output_queue, should_listen, _, response_playing, cancel_scope = (
+            setup
+        )
+        unit = PipelineUnit(
+            index=0,
+            service=service,
+            cancel_scope=cancel_scope,
+            should_listen=should_listen,
+            response_playing=response_playing,
+            input_queue=input_queue,
+            output_queue=output_queue,
+            text_output_queue=text_output_queue,
+            text_prompt_queue=service.text_prompt_queue,
+            handlers=[],
+        )
+        conn_id = service.register()
+        state = service._state(conn_id)
+        state.response_pending = True
+        state.pending_response_turn_id = "turn_failed"
+        state.pending_response_turn_revision = 0
+        state.pending_response_request = GenerateResponseRequest(
+            runtime_config=state.runtime_config,
+            turn_id="turn_failed",
+            turn_revision=0,
+        )
+        text_output_queue.put(ResponseFailedEvent(message="provider failed", turn_id="turn_failed", turn_revision=0))
+        ws = _FakeWebSocket()
+
+        asyncio.run(router_module._drain_pending_response_events(ws, unit, conn_id))
+        terminal_events = service.finish_response(conn_id)
+
+        assert [payload["type"] for payload in ws.sent] == ["response.created", "error"]
+        done = next(event for event in terminal_events if isinstance(event, ResponseDoneEvent))
+        assert done.response.status == "failed"
+        assert done.response.id == ws.sent[0]["response"]["id"]
 
     def test_speech_started_does_not_cancel_when_interrupt_disabled(self, setup):
         """With interrupt_response=False, speech during playback should NOT cancel or flush."""

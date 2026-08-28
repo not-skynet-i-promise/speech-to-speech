@@ -1151,44 +1151,66 @@ class TestHandleConversationItemDelete:
             if index == 0:
                 active_request = prompt_queue.get_nowait()
                 assert active_request.turn_id == "turn_0"
+                assert active_request.response_user_item_id is not None
                 assert [item.content[0].text for item in active_request.chat_snapshot.buffer] == ["question 0"]
                 service.dispatch_pipeline_event(
                     conn_id,
                     AssistantTextEvent(text="reply 0", turn_id="turn_0", turn_revision=0),
+                )
+                service._state(conn_id).runtime_config.chat.add_response_item(
+                    make_assistant_message("reply 0"),
+                    after_user_id=active_request.response_user_item_id,
                 )
 
         st = service._state(conn_id)
         assert st.active_response_turn_id == "turn_0"
         assert st.pending_response_turn_id == "turn_1"
         assert [request.turn_id for request in st.deferred_response_requests] == ["turn_2"]
-        assert [item.content[0].text for item in st.pending_response_request.chat_snapshot.buffer] == [
-            "question 0",
-            "question 1",
+        assert [(item.role, item.content[0].text) for item in st.pending_response_request.chat_snapshot.buffer] == [
+            ("user", "question 0"),
+            ("assistant", "reply 0"),
+            ("user", "question 1"),
         ]
-        assert [item.content[0].text for item in st.deferred_response_requests[0].chat_snapshot.buffer] == [
-            "question 0",
-            "question 1",
-            "question 2",
+        assert [
+            (item.role, item.content[0].text) for item in st.deferred_response_requests[0].chat_snapshot.buffer
+        ] == [
+            ("user", "question 0"),
+            ("assistant", "reply 0"),
+            ("user", "question 1"),
+            ("user", "question 2"),
         ]
         assert prompt_queue.empty()
 
         service.finish_response(conn_id)
         second_request = prompt_queue.get_nowait()
         assert second_request.turn_id == "turn_1"
-        assert [item.content[0].text for item in second_request.chat_snapshot.buffer] == [
-            "question 0",
-            "question 1",
+        assert [(item.role, item.content[0].text) for item in second_request.chat_snapshot.buffer] == [
+            ("user", "question 0"),
+            ("assistant", "reply 0"),
+            ("user", "question 1"),
         ]
         service.dispatch_pipeline_event(
             conn_id,
             AssistantTextEvent(text="reply 1", turn_id="turn_1", turn_revision=0),
+        )
+        st.runtime_config.chat.add_response_item(
+            make_assistant_message("reply 1"),
+            after_user_id=second_request.response_user_item_id,
         )
         assert st.active_response_turn_id == "turn_1"
         assert st.pending_response_turn_id == "turn_2"
         assert st.deferred_response_requests == []
 
         service.finish_response(conn_id)
-        assert prompt_queue.get_nowait().turn_id == "turn_2"
+        third_request = prompt_queue.get_nowait()
+        assert third_request.turn_id == "turn_2"
+        assert [(item.role, item.content[0].text) for item in third_request.chat_snapshot.buffer] == [
+            ("user", "question 0"),
+            ("assistant", "reply 0"),
+            ("user", "question 1"),
+            ("assistant", "reply 1"),
+            ("user", "question 2"),
+        ]
         service.unregister(conn_id)
 
     def test_promoted_turn_refreshes_prior_context_without_later_queued_user(self):
@@ -3847,8 +3869,10 @@ class TestDispatchPipelineEvent:
             ResponseFailedEvent(message="provider failed", turn_id="turn_failed", turn_revision=0),
         )
 
-        assert len(failure_events) == 1
-        assert isinstance(failure_events[0], RealtimeErrorEvent)
+        assert len(failure_events) == 2
+        assert isinstance(failure_events[0], ResponseCreatedEvent)
+        assert isinstance(failure_events[1], RealtimeErrorEvent)
+        created_response_id = failure_events[0].response.id
         assert state.in_response
         assert state.active_response_turn_id == "turn_failed"
         assert state.pending_response_turn_id == "turn_successor"
@@ -3858,10 +3882,53 @@ class TestDispatchPipelineEvent:
 
         done = next(event for event in terminal_events if isinstance(event, ResponseDoneEvent))
         assert done.response.status == "failed"
+        assert done.response.id == created_response_id
         successor = prompt_queue.get_nowait()
         assert successor.turn_id == "turn_successor"
         assert state.response_pending
         assert state.pending_response_request is successor
+        service.unregister(conn_id)
+
+    def test_late_failure_cannot_activate_or_poison_promoted_successor(self):
+        tracker = SpeculativeTurnTracker()
+        prompt_queue = Queue()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            speculative_turns=tracker,
+            cancel_scope=CancelScope(),
+        )
+        conn_id = service.register()
+        for turn_id in ("turn_old", "turn_successor"):
+            service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id=turn_id, turn_revision=0, interrupt_response=False),
+            )
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(transcript=turn_id, turn_id=turn_id, turn_revision=0),
+            )
+            if turn_id == "turn_old":
+                prompt_queue.get_nowait()
+                service.dispatch_pipeline_event(
+                    conn_id,
+                    AssistantTextEvent(text="old reply", turn_id=turn_id, turn_revision=0),
+                )
+
+        service.finish_response(conn_id)
+        successor = prompt_queue.get_nowait()
+        state = service._state(conn_id)
+        assert successor.turn_id == "turn_successor"
+        assert state.response_pending and not state.in_response
+
+        events = service.dispatch_pipeline_event(
+            conn_id,
+            ResponseFailedEvent(message="late old failure", turn_id="turn_old", turn_revision=0),
+        )
+
+        assert events == []
+        assert state.response_pending and not state.in_response
+        assert state.pending_response_turn_id == "turn_successor"
+        assert not state.response_failure_pending
         service.unregister(conn_id)
 
     def test_response_failed_without_active_response_is_noop(self, service, conn_id):

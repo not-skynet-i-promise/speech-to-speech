@@ -347,6 +347,14 @@ class ResponseHandler(RealtimeBaseHandler):
                 GenerateResponseRequest(
                     runtime_config=cfg,
                     chat_snapshot=cfg.chat.copy(),
+                    response_user_item_id=(
+                        st.input_item_chat_ids.get(
+                            st.response_context_input_item_id,
+                            st.response_context_input_item_id,
+                        )
+                        if not out_of_band and st.response_context_input_item_id is not None
+                        else None
+                    ),
                     response=event.response,
                     turn_id=None if out_of_band else st.response_context_turn_id,
                     turn_revision=None if out_of_band else st.response_context_turn_revision,

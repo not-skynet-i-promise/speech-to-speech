@@ -120,6 +120,7 @@ class TestChatInit:
         assert chat.buffer == []
         assert chat.init_chat_message is None
         assert chat._pending_tool_calls == {}
+        assert chat._pending_tool_call_anchors == {}
         assert chat._user_turn_count == 0
 
     def test_size_stored(self):
@@ -372,6 +373,56 @@ class TestAppendToolOutput:
 
 
 class TestAddItem:
+    def test_response_writeback_stays_before_later_queued_users(self):
+        chat = Chat(size=5)
+        first = chat.add_item(_user("first"))
+        chat.add_item(_user("second"))
+        chat.add_item(_user("third"))
+
+        chat.add_response_item(_assistant("first answer"), after_user_id=first.id)
+
+        assert [(item.role, item.content[0].text) for item in chat.buffer] == [
+            ("user", "first"),
+            ("assistant", "first answer"),
+            ("user", "second"),
+            ("user", "third"),
+        ]
+
+    def test_anchored_tool_pair_stays_inside_its_response_turn(self):
+        chat = Chat(size=5)
+        first = chat.add_item(_user("first"))
+        chat.add_item(_user("second"))
+
+        chat.add_response_item(_fc("anchored"), after_user_id=first.id)
+        chat.add_item(_fco("anchored", "result"))
+
+        assert [type(item) for item in chat.buffer] == [
+            RealtimeConversationItemUserMessage,
+            RealtimeConversationItemFunctionCall,
+            RealtimeConversationItemFunctionCallOutput,
+            RealtimeConversationItemUserMessage,
+        ]
+
+    def test_response_writeback_drops_when_exact_user_left_history(self):
+        chat = Chat(size=5)
+        user = chat.add_item(_user("delete me"))
+        assert user.id is not None
+        assert chat.remove_user_message(user.id)
+
+        assert chat.add_response_item(_assistant("orphan"), after_user_id=user.id) is None
+        assert chat.buffer == []
+
+    def test_anchored_tool_output_is_rejected_after_owning_user_deletion(self):
+        chat = Chat(size=5)
+        user = chat.add_item(_user("delete me"))
+        assert user.id is not None
+        chat.add_response_item(_fc("orphan"), after_user_id=user.id)
+        assert chat.remove_user_message(user.id)
+
+        with pytest.raises(ChatItemError, match="owning user turn"):
+            chat.add_item(_fco("orphan", "must not survive"))
+        assert chat.buffer == []
+
     # -- System message --
 
     def test_system_message_routed_to_init_chat(self):
@@ -792,9 +843,11 @@ class TestCopyAndReset:
 
     def test_copy_preserves_pending_tool_calls_independently(self):
         chat = Chat(size=5)
-        chat.add_item(_fc("c1"))
+        user = chat.add_item(_user("anchor"))
+        chat.add_response_item(_fc("c1"), after_user_id=user.id)
         clone = chat.copy()
         assert "call_c1" in clone._pending_tool_calls
+        assert clone._pending_tool_call_anchors == {"call_c1": user.id}
         clone._pending_tool_calls.pop("call_c1")
         assert "call_c1" in chat._pending_tool_calls
 
@@ -824,6 +877,7 @@ class TestCopyAndReset:
         assert chat.buffer == []
         assert chat.init_chat_message is None
         assert chat._pending_tool_calls == {}
+        assert chat._pending_tool_call_anchors == {}
         assert chat._user_turn_count == 0
 
     def test_reset_preserves_size(self):
@@ -1239,6 +1293,43 @@ class TestCompaction:
 
         assert all(
             getattr(part, "text", None) != "summary containing deleted content"
+            for item in chat.buffer
+            for part in getattr(item, "content", [])
+        )
+
+    def test_marker_only_deletion_invalidates_snapshot_after_hard_eviction(self):
+        chat = Chat(size=2)
+        gate = threading.Event()
+        started = threading.Event()
+
+        def compactor(_snapshot):
+            started.set()
+            assert gate.wait(timeout=2.0)
+            return CompactionResult(
+                user_summary="summary containing hard-evicted deleted content",
+                assistant_summary="summary",
+            )
+
+        first = _user("delete after hard eviction")
+        first.id = "msg_hard_evicted"
+        for index, user in enumerate((first, _user("one"), _user("two"))):
+            chat.add_item(user)
+            chat.mark_user_message_deletable(user.id)
+            chat.add_item(_assistant(f"assistant {index}"))
+        chat.trim_if_needed(compactor)
+        assert started.wait(timeout=2.0)
+
+        for index in range(3, 5):
+            chat.add_item(_user(f"user {index}"))
+            chat.add_item(_assistant(f"assistant {index}"))
+        assert all(item.id != first.id for item in chat.buffer)
+
+        assert chat.remove_user_message(first.id)
+        gate.set()
+        _wait_thread(chat)
+
+        assert all(
+            getattr(part, "text", None) != "summary containing hard-evicted deleted content"
             for item in chat.buffer
             for part in getattr(item, "content", [])
         )

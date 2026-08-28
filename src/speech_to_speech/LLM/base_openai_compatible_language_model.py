@@ -107,6 +107,7 @@ class _Turn(BaseModel):
     response: Any
     turn_id: str | None
     turn_revision: int | None
+    response_user_item_id: str | None
     speech_stopped_at_s: float | None
     wants_audio: bool
 
@@ -441,9 +442,9 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 # all before the chunk leaves for the client.
                 chat = turn.runtime_config.chat
                 for pending_item in state.pending:
-                    chat.add_item(pending_item)
+                    chat.add_response_item(pending_item, after_user_id=turn.response_user_item_id)
                 state.pending.clear()
-                chat.add_item(fc_item)
+                chat.add_response_item(fc_item, after_user_id=turn.response_user_item_id)
         yield self._chunk(turn, tools=[item])
 
     # ── consumption ─────────────────────────────────────────────────────────--
@@ -712,7 +713,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                         # Tool calls (and any assistant text preceding them) were already
                         # written eagerly in _record_tool_call; only trailing items remain.
                         for item in state.pending:
-                            original_chat.add_item(item)
+                            original_chat.add_response_item(item, after_user_id=turn.response_user_item_id)
                         original_chat.strip_images(consumed_image_ids)
                         original_chat.trim_if_needed(self.compactor)
             if state.input_tokens or state.output_tokens:
@@ -824,6 +825,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             response=response,
             turn_id=turn_id,
             turn_revision=turn_revision,
+            response_user_item_id=request.response_user_item_id,
             speech_stopped_at_s=speech_stopped_at_s,
             wants_audio=wants_audio,
         )
