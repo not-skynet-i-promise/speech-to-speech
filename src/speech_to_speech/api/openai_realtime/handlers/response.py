@@ -86,16 +86,26 @@ class ResponseHandler(RealtimeBaseHandler):
                 return request
         return None
 
+    def _release_request_leases(
+        self,
+        conn_id: str,
+        requests: list[GenerateResponseRequest],
+    ) -> None:
+        """Release chat-history leases owned by queued response requests."""
+
+        st = self._state(conn_id)
+        for request in requests:
+            for user_item_id in request.response_user_item_ids:
+                st.runtime_config.chat.release_response_turn(user_item_id, force=True)
+            st.runtime_config.chat.release_response_turn(request.response_user_item_id, force=True)
+
     def clear_pending_requests(self, conn_id: str) -> None:
         """Forget every queued response admission after cancellation/barge-in."""
         st = self._state(conn_id)
         pending_requests = [
             request for request in (st.pending_response_request, *st.deferred_response_requests) if request is not None
         ]
-        for request in pending_requests:
-            for user_item_id in request.response_user_item_ids:
-                st.runtime_config.chat.release_response_turn(user_item_id, force=True)
-            st.runtime_config.chat.release_response_turn(request.response_user_item_id, force=True)
+        self._release_request_leases(conn_id, pending_requests)
         st.response_pending = False
         st.pending_response_turn_id = None
         st.pending_response_turn_revision = None
@@ -509,6 +519,12 @@ class ResponseHandler(RealtimeBaseHandler):
         st = self._state(conn_id)
         if status == "completed" and st.response_failure_pending:
             status = "failed"
+        if not preserve_pending:
+            if st.in_response:
+                self.clear_pending_requests(conn_id)
+            elif st.response_pending and st.deferred_response_requests:
+                self._release_request_leases(conn_id, st.deferred_response_requests)
+                st.deferred_response_requests.clear()
         deferred_requests: list[GenerateResponseRequest] = []
         if preserve_pending:
             if st.in_response:

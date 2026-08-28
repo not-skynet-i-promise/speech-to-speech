@@ -1592,6 +1592,56 @@ class TestHandleConversationItemDelete:
         assert st.deferred_response_requests == []
         service.unregister(conn_id)
 
+    def test_barge_in_releases_successor_promoted_by_queued_delete(self):
+        tracker = SpeculativeTurnTracker()
+        cancel_scope = CancelScope()
+        prompt_queue = Queue()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            speculative_turns=tracker,
+            cancel_scope=cancel_scope,
+        )
+        conn_id = service.register()
+        created_items = {}
+        for turn_id in ("turn_active", "turn_deleted", "turn_promoted"):
+            created_items[turn_id] = service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id=turn_id, turn_revision=0, interrupt_response=False),
+            )[0]
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(transcript=turn_id, turn_id=turn_id, turn_revision=0),
+            )
+            if turn_id == "turn_active":
+                prompt_queue.get_nowait()
+                service.dispatch_pipeline_event(
+                    conn_id,
+                    AssistantTextEvent(text="active reply", turn_id=turn_id, turn_revision=0),
+                )
+
+        state = service._state(conn_id)
+        promoted_chat_id = state.input_item_chat_ids[created_items["turn_promoted"].item_id]
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(
+                type="conversation.item.delete",
+                item_id=created_items["turn_deleted"].item_id,
+            ),
+        )
+
+        assert state.pending_response_turn_id == "turn_promoted"
+        assert promoted_chat_id in state.runtime_config.chat._protected_response_user_ids
+
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_interrupt", turn_revision=0, interrupt_response=True),
+        )
+
+        assert not state.in_response
+        assert not state.response_pending
+        assert promoted_chat_id not in state.runtime_config.chat._protected_response_user_ids
+        service.unregister(conn_id)
+
     def test_delete_restores_compacted_history_and_removes_only_exact_user(self, service, conn_id):
         from speech_to_speech.LLM.chat import Chat, CompactionResult, make_assistant_message
 
@@ -2564,6 +2614,70 @@ class TestHandleConversationItemDelete:
             for item in state.runtime_config.chat.buffer
             for part in getattr(item, "content", [])
         )
+        service.unregister(conn_id)
+
+    def test_protocol_index_retains_pending_and_active_response_owner(self, monkeypatch):
+        import speech_to_speech.api.openai_realtime.service as service_module
+
+        monkeypatch.setattr(service_module, "MAX_TRACKED_PROTOCOL_ITEMS", 2)
+        tracker = SpeculativeTurnTracker()
+        prompt_queue = Queue()
+        service = RealtimeService(text_prompt_queue=prompt_queue, speculative_turns=tracker)
+        conn_id = service.register()
+        owner = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_owner", turn_revision=0, interrupt_response=False),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="keep my turn", turn_id="turn_owner", turn_revision=0),
+        )
+        request = prompt_queue.get_nowait()
+        state = service._state(conn_id)
+
+        for item_id in ("msg_ordinary_a", "msg_ordinary_b"):
+            service.handle_conversation_item_create(
+                conn_id,
+                ConversationItemCreateEvent(
+                    type="conversation.item.create",
+                    item={
+                        "id": item_id,
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": item_id}],
+                    },
+                ),
+            )
+
+        assert owner.item_id in state.protocol_item_ids
+        assert "msg_ordinary_a" not in state.protocol_item_ids
+        assert state.turn_input_item_ids["turn_owner"] == owner.item_id
+        assert tracker.is_latest("turn_owner", 0)
+
+        service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(
+                parts=[
+                    AssistantTextPart(text="answer"),
+                    AssistantToolCallPart(
+                        tool={"type": "function_call", "call_id": "call_owner", "name": "lookup", "arguments": "{}"}
+                    ),
+                ],
+                turn_id=request.turn_id,
+                turn_revision=request.turn_revision,
+            ),
+        )
+
+        assert state.in_response
+        assert state.active_response_turn_id == "turn_owner"
+        assert owner.item_id in state.protocol_item_ids
+        assert state.input_item_turn_ids[owner.item_id] == "turn_owner"
+        assert tracker.is_latest("turn_owner", 0)
+
+        service.finish_response(conn_id)
+
+        assert not state.in_response
+        assert not state.response_pending
         service.unregister(conn_id)
 
     def test_audio_tail_delete_restores_protocol_visible_predecessor(self, service, conn_id):
@@ -5268,6 +5382,14 @@ class TestUsageMetricsTracking:
 
         cancel_scope.cancel()
         service.handle_response_cancel(conn_id)
+        service.dispatch_pipeline_event(
+            conn_id,
+            TokenUsageEvent(input_tokens=100, output_tokens=50, cancel_generation=0),
+        )
+        usage = service._state(conn_id).response_usage
+        assert usage.input_tokens == 0
+        assert usage.output_tokens == 0
+
         service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
         assert service._state(conn_id).active_response_cancel_generation == 1
 
@@ -5275,7 +5397,6 @@ class TestUsageMetricsTracking:
             conn_id,
             TokenUsageEvent(input_tokens=100, output_tokens=50, cancel_generation=0),
         )
-        usage = service._state(conn_id).response_usage
         assert usage.input_tokens == 0
         assert usage.output_tokens == 0
 

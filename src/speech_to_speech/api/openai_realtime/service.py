@@ -302,7 +302,46 @@ class ConnState(BaseModel):
             self.protocol_item_sequences[item_id] = sequence
             self.protocol_item_ids.append(item_id)
         while len(self.protocol_item_ids) > MAX_TRACKED_PROTOCOL_ITEMS:
-            retired_item_id = self.protocol_item_ids.pop(0)
+            response_owner_ids = set(self.active_response_input_item_ids)
+            if self.active_response_input_item_id is not None:
+                response_owner_ids.add(self.active_response_input_item_id)
+            owner_turn_ids = {
+                turn_id
+                for turn_id in (
+                    self.active_response_turn_id,
+                    self.pending_response_turn_id,
+                    *(request.turn_id for request in self.deferred_response_requests),
+                )
+                if turn_id is not None
+            }
+            response_owner_ids.update(
+                input_item_id
+                for turn_id in owner_turn_ids
+                if (input_item_id := self.turn_input_item_ids.get(turn_id)) is not None
+            )
+            owner_chat_ids: set[str] = set()
+            for request in (self.pending_response_request, *self.deferred_response_requests):
+                if request is None:
+                    continue
+                owner_chat_ids.update(request.response_user_item_ids)
+                if request.response_user_item_id is not None:
+                    owner_chat_ids.add(request.response_user_item_id)
+            response_owner_ids.update(
+                input_item_id
+                for input_item_id, chat_id in self.input_item_chat_ids.items()
+                if chat_id in owner_chat_ids
+            )
+            retirement_index = next(
+                (
+                    index
+                    for index, candidate_id in enumerate(self.protocol_item_ids)
+                    if candidate_id not in response_owner_ids
+                ),
+                None,
+            )
+            if retirement_index is None:
+                raise RuntimeError("Live response owners exhaust the protocol item index")
+            retired_item_id = self.protocol_item_ids.pop(retirement_index)
             self.protocol_item_sequences.pop(retired_item_id, None)
             self.audio_input_item_ids.discard(retired_item_id)
             retired_chat_id = self.input_item_chat_ids.pop(retired_item_id, retired_item_id)
@@ -1196,15 +1235,19 @@ class RealtimeService:
             owner_turn_id = None
             owner_turn_revision = None
             owner_generation = None
+        has_response_owner = st.in_response or (st.response_pending and st.pending_response_request is not None)
+        if not has_response_owner and (event.turn_id is not None or event.cancel_generation is not None):
+            logger.debug("Dropping correlated token usage without an active response owner")
+            return []
         if event.cancel_generation is not None:
-            if (st.in_response or st.response_pending) and owner_generation != event.cancel_generation:
+            if owner_generation != event.cancel_generation:
                 logger.debug(
                     "Dropping token usage for stale cancellation generation=%s (active=%s)",
                     event.cancel_generation,
                     owner_generation,
                 )
                 return []
-        if event.turn_id is not None and (st.in_response or st.response_pending):
+        if event.turn_id is not None:
             if event.turn_id != owner_turn_id or (
                 event.turn_revision is not None
                 and owner_turn_revision is not None
