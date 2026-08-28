@@ -140,6 +140,8 @@ class ConversationHandler(RealtimeBaseHandler):
         self,
         conn_id: str,
         event: ConversationItemDeleteEvent,
+        *,
+        defer_successor_enqueue: bool = False,
     ) -> list[ServerEvent]:
         """Remove one exact user item and acknowledge only after history changed."""
         st = self._state(conn_id)
@@ -195,6 +197,7 @@ class ConversationHandler(RealtimeBaseHandler):
             st.pending_response_turn_id = None
             st.pending_response_turn_revision = None
             st.pending_response_request = None
+            st.pending_response_enqueued = False
             if not st.in_response:
                 st.deferred_response_request = None
         if (active_matches or (pending_matches and not st.in_response)) and self._service.cancel_scope is not None:
@@ -209,11 +212,16 @@ class ConversationHandler(RealtimeBaseHandler):
                 conn_id,
                 status="cancelled",
                 reason="client_cancelled",
+                enqueue_pending=not defer_successor_enqueue,
             )
         elif successor_request is not None:
             tracker = self._service.speculative_turns
             if tracker is None or tracker.is_latest(successor_request.turn_id, successor_request.turn_revision):
-                self._service.response.resume_pending_request(conn_id, successor_request)
+                self._service.response.resume_pending_request(
+                    conn_id,
+                    successor_request,
+                    enqueue=not defer_successor_enqueue,
+                )
         if active_matches or pending_matches:
             should_listen = self._should_listen(conn_id)
             if should_listen is not None:

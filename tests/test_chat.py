@@ -1273,6 +1273,39 @@ class TestCompaction:
         assert "user-2" in texts
         assert "summary-user" not in texts
 
+    def test_failed_atomic_batch_restores_compaction_provenance_after_hard_eviction(self):
+        chat = Chat(size=2)
+        users = []
+        for index in range(3):
+            user = chat.add_item(make_user_message(f"user-{index}"))
+            assert user.id is not None
+            chat.mark_user_message_deletable(user.id)
+            users.append(user)
+            chat.add_item(make_assistant_message(f"assistant-{index}"))
+        chat.trim_if_needed(_make_stub_compactor("summary-user", "summary-assistant"))
+        _wait_thread(chat)
+        provenance_before = dict(chat._compaction_nodes)
+        assert provenance_before
+
+        with pytest.raises(ChatItemError):
+            chat.add_items_atomically(
+                [
+                    make_user_message("hard-cap trigger 1"),
+                    make_user_message("hard-cap trigger 2"),
+                    make_user_message("hard-cap trigger 3"),
+                    make_user_message(""),
+                ]
+            )
+
+        assert chat._compaction_nodes == provenance_before
+        assert chat.remove_user_message(users[0].id)
+        texts = [
+            part.text for item in chat.buffer for part in getattr(item, "content", []) if getattr(part, "text", None)
+        ]
+        assert "summary-user" not in texts
+        assert "user-0" not in texts
+        assert "assistant-0" in texts
+
     def test_retiring_all_ids_releases_completed_compaction_provenance(self):
         chat = Chat(size=2)
         users = []

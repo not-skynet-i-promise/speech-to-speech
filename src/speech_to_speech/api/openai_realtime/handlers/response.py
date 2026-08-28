@@ -51,11 +51,13 @@ class ResponseHandler(RealtimeBaseHandler):
                 st.pending_response_turn_id = None
                 st.pending_response_turn_revision = None
                 st.pending_response_request = None
+                st.pending_response_enqueued = False
             else:
                 st.response_pending = True
                 st.pending_response_turn_id = successor.turn_id
                 st.pending_response_turn_revision = successor.turn_revision
                 st.pending_response_request = successor
+                st.pending_response_enqueued = False
         return st.current_response_id, self._current_item_id(conn_id)
 
     def _end_response(self, conn_id: str, status: _ResponseStatus = "completed") -> None:
@@ -85,6 +87,7 @@ class ResponseHandler(RealtimeBaseHandler):
         st.pending_response_turn_id = None
         st.pending_response_turn_revision = None
         st.pending_response_request = None
+        st.pending_response_enqueued = False
         st.deferred_response_request = None
         st.active_response_turn_id = None
         st.active_response_turn_revision = None
@@ -246,6 +249,7 @@ class ResponseHandler(RealtimeBaseHandler):
         st.pending_response_turn_id = None
         st.pending_response_turn_revision = None
         st.pending_response_request = None
+        st.pending_response_enqueued = False
         st.deferred_response_request = None
         st.active_response_turn_id = None if out_of_band else st.speculative_user_turn_id
         st.active_response_turn_revision = None if out_of_band else st.speculative_user_turn_revision
@@ -298,6 +302,7 @@ class ResponseHandler(RealtimeBaseHandler):
         reason: _StatusReason | None = None,
         *,
         preserve_pending: bool = True,
+        enqueue_pending: bool = True,
     ) -> list[ServerEvent]:
         """Close the current response (audio/text done + response done).
 
@@ -354,6 +359,7 @@ class ResponseHandler(RealtimeBaseHandler):
             st.pending_response_turn_id = None
             st.pending_response_turn_revision = None
             st.pending_response_request = None
+            st.pending_response_enqueued = False
             st.deferred_response_request = None
         # Apply any client items that arrived mid-generation now that in_response
         # is cleared and the generation's own write-back has landed. Done outside
@@ -372,10 +378,16 @@ class ResponseHandler(RealtimeBaseHandler):
         if deferred_request is not None and not cfg.private_protocol_failed:
             tracker = self._service.speculative_turns
             if tracker is None or tracker.is_latest(deferred_request.turn_id, deferred_request.turn_revision):
-                self.resume_pending_request(conn_id, deferred_request)
+                self.resume_pending_request(conn_id, deferred_request, enqueue=enqueue_pending)
         return events
 
-    def resume_pending_request(self, conn_id: str, request: GenerateResponseRequest) -> None:
+    def resume_pending_request(
+        self,
+        conn_id: str,
+        request: GenerateResponseRequest,
+        *,
+        enqueue: bool = True,
+    ) -> None:
         """Re-admit one held successor after its preceding response closes."""
         st = self._state(conn_id)
         generation = self._service.cancel_scope.generation if self._service.cancel_scope else None
@@ -384,10 +396,21 @@ class ResponseHandler(RealtimeBaseHandler):
         st.pending_response_turn_id = request.turn_id
         st.pending_response_turn_revision = request.turn_revision
         st.pending_response_request = request
+        st.pending_response_enqueued = False
         st.deferred_response_request = None
+        if enqueue:
+            self.enqueue_pending_request(conn_id)
+
+    def enqueue_pending_request(self, conn_id: str) -> None:
+        """Release a held successor exactly once after cancelled output is flushed."""
+        st = self._state(conn_id)
+        request = st.pending_response_request
+        if not st.response_pending or request is None or st.pending_response_enqueued:
+            return
         queue = self._queue(conn_id)
         if queue is not None:
             queue.put(request)
+            st.pending_response_enqueued = True
 
     # ── Pipeline event handlers ───────────────────
 

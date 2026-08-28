@@ -543,14 +543,23 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
 
                 elif isinstance(event, ConversationItemDeleteEvent):
                     generation_before_delete = unit.cancel_scope.generation
-                    events = unit.service.handle_conversation_item_delete(session_id, event)
-                    if unit.cancel_scope.generation != generation_before_delete:
+                    events = unit.service.handle_conversation_item_delete(
+                        session_id,
+                        event,
+                        defer_successor_enqueue=True,
+                    )
+                    cancelled_generation = unit.cancel_scope.generation != generation_before_delete
+                    if cancelled_generation:
                         _flush_queue(unit.output_queue, preserve=_keep_audio_sentinel)
                         _flush_queue(unit.text_output_queue, preserve=_keep_user_text_event)
                         unit.response_playing.clear()
                         unit.should_listen.set()
                     if events:
                         await _send_events(ws, events)
+                    if cancelled_generation:
+                        # Release the successor only after cancelled output is
+                        # gone and the deletion acknowledgement is on the wire.
+                        unit.service.enqueue_pending_response(session_id)
                     if unit.service.private_protocol_failed(session_id):
                         await ws.close(code=1008, reason="Private session failed")
                         return

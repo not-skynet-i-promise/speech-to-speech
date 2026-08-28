@@ -222,6 +222,7 @@ class ConnState(BaseModel):
     pending_response_turn_id: Optional[str] = None
     pending_response_turn_revision: Optional[int] = None
     pending_response_request: GenerateResponseRequest | None = None
+    pending_response_enqueued: bool = False
     deferred_response_request: GenerateResponseRequest | None = None
     active_response_turn_id: Optional[str] = None
     active_response_turn_revision: Optional[int] = None
@@ -632,7 +633,13 @@ class RealtimeService:
                 return [self.poison_transcript_barrier(conn_id, "transcript_barrier_pending")]
             return self.conversation.handle_conversation_item_create(conn_id, event)
 
-    def handle_conversation_item_delete(self, conn_id: str, event: ConversationItemDeleteEvent) -> list[ServerEvent]:
+    def handle_conversation_item_delete(
+        self,
+        conn_id: str,
+        event: ConversationItemDeleteEvent,
+        *,
+        defer_successor_enqueue: bool = False,
+    ) -> list[ServerEvent]:
         """Delete one exact user item while preserving the guarded session fence."""
         cfg = self._state(conn_id).runtime_config
         with cfg.transcript_barrier_state_guard():
@@ -642,7 +649,15 @@ class RealtimeService:
                 error = self.poison_transcript_barrier(conn_id, "transcript_barrier_pending")
                 error.error.event_id = event.event_id
                 return [error]
-            return self.conversation.handle_conversation_item_delete(conn_id, event)
+            return self.conversation.handle_conversation_item_delete(
+                conn_id,
+                event,
+                defer_successor_enqueue=defer_successor_enqueue,
+            )
+
+    def enqueue_pending_response(self, conn_id: str) -> None:
+        """Release a response held across router-owned cancelled-output flushing."""
+        self.response.enqueue_pending_request(conn_id)
 
     def handle_transcript_barrier_resolve(
         self,
@@ -920,15 +935,21 @@ class RealtimeService:
                 # the turn tracker makes the older queued revision stale.
                 st.active_response_turn_revision = event.turn_revision
                 queue.put(request)
+            elif st.in_response and st.response_pending and event.turn_id == st.pending_response_turn_id:
+                st.pending_response_turn_revision = event.turn_revision
+                st.pending_response_request = request
+                st.pending_response_enqueued = False
             elif st.response_pending and event.turn_id == st.pending_response_turn_id:
                 st.pending_response_turn_revision = event.turn_revision
                 st.pending_response_request = request
                 queue.put(request)
+                st.pending_response_enqueued = True
             elif st.in_response:
                 st.response_pending = True
                 st.pending_response_turn_id = event.turn_id
                 st.pending_response_turn_revision = event.turn_revision
                 st.pending_response_request = request
+                st.pending_response_enqueued = False
             elif st.response_pending:
                 st.deferred_response_request = request
             else:
@@ -937,6 +958,7 @@ class RealtimeService:
                 st.pending_response_turn_revision = event.turn_revision
                 st.pending_response_request = request
                 queue.put(request)
+                st.pending_response_enqueued = True
 
         return events
 

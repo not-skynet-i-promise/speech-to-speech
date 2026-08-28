@@ -218,6 +218,7 @@ class Chat:
         with self._lock:
             buffer_before = list(self.buffer)
             pending_before = dict(self._pending_tool_calls)
+            compaction_nodes_before = dict(self._compaction_nodes)
             turns_before = self._user_turn_count
             init_before = self.init_chat_message
             function_calls = {
@@ -232,6 +233,7 @@ class Chat:
             except ChatItemError:
                 self.buffer = buffer_before
                 self._pending_tool_calls = pending_before
+                self._compaction_nodes = compaction_nodes_before
                 self._user_turn_count = turns_before
                 self.init_chat_message = init_before
                 for function_call, status in statuses_before:

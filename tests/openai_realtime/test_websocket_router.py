@@ -30,6 +30,7 @@ from speech_to_speech.pipeline.events import (
     SpeechStartedEvent,
     TokenUsageEvent,
     TranscriptBarrierCompletedEvent,
+    TranscriptionCompletedEvent,
 )
 from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, PIPELINE_END, AudioOutput
 
@@ -294,6 +295,60 @@ class TestClientEventDispatch:
 
         assert failure["error"]["type"] == "invalid_home_assistant_guard"
         assert failure["error"]["event_id"] == "malformed_delete_before_guard"
+
+    def test_delete_flushes_cancelled_output_before_releasing_successor(self, setup, monkeypatch):
+        app, service, _, output_queue, text_output_queue, *_ = setup
+        flush_observations = []
+        original_flush = router_module._flush_queue
+
+        def observing_flush(queue, *, preserve=None):
+            if queue in {output_queue, text_output_queue}:
+                flush_observations.append(service.text_prompt_queue.empty())
+            original_flush(queue, preserve=preserve)
+
+        monkeypatch.setattr(router_module, "_flush_queue", observing_flush)
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                flush_observations.clear()
+                conn_id = next(iter(service._conns))
+                active = service.dispatch_pipeline_event(
+                    conn_id,
+                    SpeechStartedEvent(turn_id="turn_active", turn_revision=0),
+                )[0]
+                service.dispatch_pipeline_event(
+                    conn_id,
+                    TranscriptionCompletedEvent(
+                        transcript="first",
+                        turn_id="turn_active",
+                        turn_revision=0,
+                    ),
+                )
+                assert service.text_prompt_queue.get_nowait().turn_id == "turn_active"
+                service.dispatch_pipeline_event(
+                    conn_id,
+                    AssistantTextEvent(text="first reply", turn_id="turn_active", turn_revision=0),
+                )
+                service.dispatch_pipeline_event(
+                    conn_id,
+                    SpeechStartedEvent(turn_id="turn_next", turn_revision=0, interrupt_response=False),
+                )
+                service.dispatch_pipeline_event(
+                    conn_id,
+                    TranscriptionCompletedEvent(
+                        transcript="second",
+                        turn_id="turn_next",
+                        turn_revision=0,
+                    ),
+                )
+
+                ws.send_json({"type": "conversation.item.delete", "item_id": active.item_id})
+                assert ws.receive_json()["type"] == "conversation.item.deleted"
+
+                assert flush_observations == [True, True]
+                successor = service.text_prompt_queue.get_nowait()
+                assert successor.turn_id == "turn_next"
+                assert successor.cancel_generation == service.cancel_scope.generation
 
     def test_audio_append_forwarded_to_input_queue(self, setup):
         app, _, input_queue, *_ = setup
