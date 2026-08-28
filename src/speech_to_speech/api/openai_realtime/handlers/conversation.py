@@ -163,7 +163,8 @@ class ConversationHandler(RealtimeBaseHandler):
 
         found = event.item_id in st.conversation_item_order
         chat_item_id = st.conversation_item_chat_ids.get(event.item_id, event.item_id)
-        if st.runtime_config.chat.remove_item(chat_item_id):
+        history_was_bound = st.runtime_config.chat.remove_item(chat_item_id)
+        if history_was_bound:
             found = True
 
         removed_call_ids: set[str] = set()
@@ -175,7 +176,8 @@ class ConversationHandler(RealtimeBaseHandler):
                 pending for pending in st.pending_text_outputs if pending["item_id"] != event.item_id
             ]
             if removed_text_outputs:
-                st.deleted_response_text_outputs[event.item_id] = dict(removed_text_outputs[0])
+                if not history_was_bound:
+                    st.deleted_response_text_outputs[event.item_id] = dict(removed_text_outputs[0])
 
             for output_index, call in tuple(st.pending_function_calls.items()):
                 if call.id != event.item_id:
@@ -184,7 +186,8 @@ class ConversationHandler(RealtimeBaseHandler):
                     removed_call_ids.add(call.call_id)
                 del st.pending_function_calls[output_index]
                 st.finished_function_call_indices.discard(output_index)
-                st.deleted_response_function_calls[event.item_id] = (output_index, call.call_id)
+                if not history_was_bound:
+                    st.deleted_response_function_calls[event.item_id] = (output_index, call.call_id)
         for call_ids in st.generation_done_tool_calls.values():
             call_ids.difference_update(removed_call_ids)
 
@@ -224,6 +227,7 @@ class ConversationHandler(RealtimeBaseHandler):
             st.current_item_id = None
             st.current_output_index = None
             st.current_output_kind = None
+        self._service.retract_queued_input_response(conn_id, event.item_id)
         st.forget_conversation_item(event.item_id)
         st.tombstone_conversation_item(event.item_id)
         return [

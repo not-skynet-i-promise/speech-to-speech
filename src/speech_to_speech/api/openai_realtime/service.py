@@ -207,11 +207,16 @@ class ConnState(BaseModel):
     # to their originating protocol item and keep append-only state per item.
     input_item_by_turn_revision: dict[tuple[str, int | None], str] = Field(default_factory=dict)
     input_items: dict[str, InputItemState] = Field(default_factory=dict)
+    # Bind a wire-visible input item to the implicit generation it queued. This
+    # lets a later conversation.item.delete retract work that has not reached
+    # the LM yet and tombstone work the LM already owns.
+    queued_input_response_keys: dict[str, str] = Field(default_factory=dict)
     # A client can delete an input item before either the transcription or
     # direct-audio terminal reaches the realtime service. Keep the originating
     # turn identity tombstoned so neither terminal can recreate or queue the
     # acknowledged-deleted input. ``(None, None)`` covers metadata-free
-    # pipelines and is cleared when the next speech lifecycle starts.
+    # pipelines and remains fail-closed because later terminals cannot be
+    # correlated safely; a new connection starts with fresh state.
     deleted_input_turn_revisions: dict[tuple[str | None, int | None], None] = Field(default_factory=dict)
     # Protocol-visible conversation order is distinct from the model Chat's
     # storage IDs (notably for generated messages and transcribed audio).
@@ -305,7 +310,7 @@ class ConnState(BaseModel):
             self.deleted_input_turn_revisions.pop(next(iter(self.deleted_input_turn_revisions)))
 
     def input_terminal_was_deleted(self, turn_id: str | None, turn_revision: int | None) -> bool:
-        """Return whether a pipeline terminal belongs to a deleted input."""
+        """Return whether an ambiguous pipeline terminal must remain suppressed."""
         return (turn_id, turn_revision) in self.deleted_input_turn_revisions
 
     def mark_response_pending(self, response_key: str) -> None:
@@ -322,12 +327,27 @@ class ConnState(BaseModel):
             self.pending_response_keys.discard(response_key)
         self.response_pending = bool(self.pending_response_keys)
 
+    def bind_queued_input_response(self, item_id: str, response_key: str) -> None:
+        """Associate one protocol input item with its queued response."""
+        self.queued_input_response_keys[item_id] = response_key
+        while len(self.queued_input_response_keys) > 256:
+            self.queued_input_response_keys.pop(next(iter(self.queued_input_response_keys)))
+
+    def forget_queued_input_response(self, response_key: str) -> None:
+        """Release input bindings after their response starts or closes."""
+        self.queued_input_response_keys = {
+            item_id: queued_key
+            for item_id, queued_key in self.queued_input_response_keys.items()
+            if queued_key != response_key
+        }
+
     def close_response_key(self, response_key: str | None) -> None:
         """Tombstone a finished key so output arriving after cancellation stays stale."""
         if response_key is None:
             self.response_pending = bool(self.pending_response_keys)
             return
         self.pending_response_keys.discard(response_key)
+        self.forget_queued_input_response(response_key)
         self.pending_token_usage.pop(response_key, None)
         self.closed_response_keys[response_key] = None
         while len(self.closed_response_keys) > 128:
@@ -538,6 +558,36 @@ class RealtimeService:
             self.total_usage.output_tokens += output_tokens
         st.close_response_key(response_key)
 
+    def retract_queued_input_response(self, conn_id: str, item_id: str) -> None:
+        """Cancel the implicit generation queued by a deleted input item."""
+        st = self._state(conn_id)
+        response_key = st.queued_input_response_keys.pop(item_id, None)
+        if response_key is None:
+            return
+
+        queue = self.text_prompt_queue
+        if queue is not None:
+            removed_request: GenerateResponseRequest | None = None
+            with queue.mutex:
+                removed_request = next(
+                    (
+                        candidate
+                        for candidate in queue.queue
+                        if isinstance(candidate, GenerateResponseRequest) and candidate.response_key == response_key
+                    ),
+                    None,
+                )
+                if removed_request is not None:
+                    queue.queue.remove(removed_request)
+                    queue.not_full.notify()
+            if removed_request is not None:
+                # Release direct audio immediately after the queue relinquishes
+                # ownership. A worker-owned request is instead suppressed by
+                # the response-key tombstone below.
+                removed_request.audio = None
+
+        self.close_response_key(conn_id, response_key)
+
     def handle_conversation_item_create(self, conn_id: str, event: ConversationItemCreateEvent) -> list[ServerEvent]:
         if self._state(conn_id).tool_followup_prefetch_request is not None:
             # Any item after the final tool output changes the context captured
@@ -736,6 +786,7 @@ class RealtimeService:
                 speech_stopped_at_s=event.speech_stopped_at_s,
             )
             st.mark_response_pending(request.response_key)
+            st.bind_queued_input_response(completed_events[0].item_id, request.response_key)
             queue.put(request)
 
         return [*completed_events]
@@ -760,7 +811,7 @@ class RealtimeService:
                 event.turn_revision,
             )
             return []
-        self.audio.release_input_item_state(conn_id, event.turn_id, event.turn_revision)
+        input_item_id = self.audio.release_input_item_state(conn_id, event.turn_id, event.turn_revision)
         self.response.discard_tool_followup_prefetch(conn_id)
         st.generation_done_tool_calls.clear()
         st.completed_tool_response_keys.clear()
@@ -789,6 +840,8 @@ class RealtimeService:
                 speech_stopped_at_s=event.speech_stopped_at_s,
             )
             st.mark_response_pending(request.response_key)
+            if input_item_id is not None:
+                st.bind_queued_input_response(input_item_id, request.response_key)
             queue.put(request)
         return []
 

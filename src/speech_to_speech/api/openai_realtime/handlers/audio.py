@@ -84,12 +84,13 @@ class AudioHandler(RealtimeBaseHandler):
         conn_id: str,
         turn_id: str | None,
         turn_revision: int | None,
-    ) -> None:
-        """Drop routing state for a direct-audio item without publishing a transcription terminal."""
+    ) -> str | None:
+        """Drop direct-audio routing state and return its protocol item ID."""
         item_id = self._input_item_id(conn_id, turn_id, turn_revision)
         if item_id is None:
-            return
+            return None
         self._release_input_item_state_by_id(conn_id, item_id)
+        return item_id
 
     def _release_input_item_state_by_id(self, conn_id: str, item_id: str) -> None:
         st = self._state(conn_id)
@@ -167,11 +168,13 @@ class AudioHandler(RealtimeBaseHandler):
         response = self._service.response
         events: list[ServerEvent] = []
         st = self._state(conn_id)
-        # A new speech lifecycle owns any subsequent metadata-free terminal,
-        # and reusing an explicit turn identity starts a fresh revision rather
-        # than inheriting an older item's deletion tombstone.
-        st.deleted_input_turn_revisions.pop((None, None), None)
-        st.deleted_input_turn_revisions.pop((event.turn_id, event.turn_revision), None)
+        # Reusing an explicit turn identity starts a fresh revision rather than
+        # inheriting an older item's deletion tombstone. Metadata-free late
+        # terminals cannot be correlated, so their tombstone remains fail-closed
+        # for the session; clearing it here can bind deleted turn A to the newly
+        # active turn B.
+        if event.turn_id is not None:
+            st.deleted_input_turn_revisions.pop((event.turn_id, event.turn_revision), None)
         interrupt_enabled = event.interrupt_response and st.runtime_config.interrupt_response_enabled
         if st.in_response and interrupt_enabled:
             events.extend(response.finish_response(conn_id, status="cancelled", reason="turn_detected"))

@@ -602,7 +602,64 @@ class TestHandleConversationItemDelete:
 
         assert "PRIVATE_DELAYED_TEXT" not in "\n".join(item.model_dump_json() for item in st.runtime_config.chat.buffer)
 
-    def test_transcribed_audio_deletes_by_wire_visible_id(self, service, conn_id):
+    def test_deleted_function_descriptor_survives_unrelated_output_until_writeback(self, service, conn_id):
+        st = service._state(conn_id)
+        st.mark_response_pending("response_delayed_call")
+        call = ResponseFunctionToolCall(
+            id="fc_private_delayed",
+            type="function_call",
+            call_id="call_private_delayed",
+            name="lookup",
+            arguments='{"query":"PRIVATE_DELAYED_ARGUMENT"}',
+        )
+        call_events = service.dispatch_pipeline_event(
+            conn_id,
+            AssistantOutputEvent(
+                parts=[AssistantToolCallPart(tool=call)],
+                response_key="response_delayed_call",
+            ),
+        )
+        wire_item_id = next(
+            event.item_id for event in call_events if isinstance(event, ResponseFunctionCallArgumentsDoneEvent)
+        )
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=wire_item_id),
+        )
+
+        service.dispatch_pipeline_event(
+            conn_id,
+            AssistantOutputEvent(
+                parts=[AssistantTextPart(text="surviving answer")],
+                response_key="response_delayed_call",
+            ),
+        )
+        assert wire_item_id in st.deleted_response_function_calls
+        st.runtime_config.chat.add_provisional_generation_items(
+            "response_delayed_call",
+            [
+                RealtimeConversationItemFunctionCall(
+                    id="fc_private_delayed",
+                    type="function_call",
+                    call_id="call_private_delayed",
+                    name="lookup",
+                    arguments='{"query":"PRIVATE_DELAYED_ARGUMENT"}',
+                ),
+                RealtimeConversationItemAssistantMessage(
+                    type="message",
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "surviving answer"}],
+                ),
+            ],
+        )
+
+        service.finish_response(conn_id)
+
+        history = "\n".join(item.model_dump_json() for item in st.runtime_config.chat.buffer)
+        assert "PRIVATE_DELAYED_ARGUMENT" not in history
+        assert "surviving answer" in history
+
+    def test_transcribed_audio_deletes_by_wire_visible_id(self, service, conn_id, text_prompt_queue):
         started = service.dispatch_pipeline_event(
             conn_id,
             SpeechStartedEvent(turn_id="turn_delete", turn_revision=0),
@@ -625,6 +682,45 @@ class TestHandleConversationItemDelete:
 
         assert isinstance(deleted[0], ConversationItemDeletedEvent)
         assert service._state(conn_id).runtime_config.chat.buffer == []
+        assert text_prompt_queue.empty()
+        assert service._state(conn_id).response_pending is False
+
+    def test_direct_audio_delete_retracts_already_queued_generation(
+        self,
+        service,
+        conn_id,
+        text_prompt_queue,
+    ):
+        started = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_direct_delete", turn_revision=0),
+        )
+        wire_item_id = next(event.item_id for event in started if isinstance(event, InputAudioBufferSpeechStartedEvent))
+        service.dispatch_pipeline_event(
+            conn_id,
+            AudioInputCompletedEvent(
+                audio=np.zeros(1600, dtype=np.float32),
+                audio_sample_rate=16000,
+                audio_duration_s=0.1,
+                turn_id="turn_direct_delete",
+                turn_revision=0,
+            ),
+        )
+        with text_prompt_queue.mutex:
+            queued_request = text_prompt_queue.queue[0]
+        assert isinstance(queued_request, GenerateResponseRequest)
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=wire_item_id),
+        )
+
+        st = service._state(conn_id)
+        assert isinstance(deleted[-1], ConversationItemDeletedEvent)
+        assert text_prompt_queue.empty()
+        assert st.response_pending is False
+        assert queued_request.response_key in st.closed_response_keys
+        assert queued_request.audio is None
 
     def test_active_input_deleted_before_transcription_stays_deleted(self, service, conn_id):
         st = service._state(conn_id)
@@ -686,7 +782,12 @@ class TestHandleConversationItemDelete:
         assert text_prompt_queue.empty()
         assert st.response_pending is False
 
-    def test_new_speech_clears_metadata_free_input_delete_tombstone(self, service, conn_id):
+    def test_metadata_free_input_deletion_fails_closed_for_later_ambiguous_terminals(
+        self,
+        service,
+        conn_id,
+        text_prompt_queue,
+    ):
         first_started = service.dispatch_pipeline_event(conn_id, SpeechStartedEvent())
         first_item_id = next(
             event.item_id for event in first_started if isinstance(event, InputAudioBufferSpeechStartedEvent)
@@ -697,15 +798,22 @@ class TestHandleConversationItemDelete:
         )
 
         second_started = service.dispatch_pipeline_event(conn_id, SpeechStartedEvent())
-        completed = service.dispatch_pipeline_event(
+        delayed = service.dispatch_pipeline_event(
             conn_id,
-            TranscriptionCompletedEvent(transcript="new input"),
+            TranscriptionCompletedEvent(transcript="PRIVATE_LATE_DELETED_INPUT"),
         )
+        ambiguous_new = service.dispatch_pipeline_event(conn_id, TranscriptionCompletedEvent(transcript="new input"))
 
         second_item_id = next(
             event.item_id for event in second_started if isinstance(event, InputAudioBufferSpeechStartedEvent)
         )
-        assert completed[0].item_id == second_item_id
+        assert delayed == []
+        assert ambiguous_new == []
+        assert second_item_id == service._state(conn_id).current_input_item_id
+        history = "\n".join(item.model_dump_json() for item in service._state(conn_id).runtime_config.chat.buffer)
+        assert "PRIVATE_LATE_DELETED_INPUT" not in history
+        assert "new input" not in history
+        assert text_prompt_queue.empty()
 
     def test_history_binding_skips_nonvisible_whitespace_item(self, service, conn_id):
         st = service._state(conn_id)
@@ -765,6 +873,12 @@ class TestHandleConversationItemDelete:
         history = "\n".join(item.model_dump_json() for item in st.runtime_config.chat.buffer)
         assert '"after"' not in history
         assert "fc_known" in history
+
+        service.finish_response(conn_id)
+
+        finished_history = "\n".join(item.model_dump_json() for item in st.runtime_config.chat.buffer)
+        assert '"after"' not in finished_history
+        assert "fc_known" in finished_history
 
     def test_tail_delete_preserves_protocol_order_for_pending_calls(self, service, conn_id):
         def create(item_id: str, call_id: str) -> ConversationItemCreatedEvent:

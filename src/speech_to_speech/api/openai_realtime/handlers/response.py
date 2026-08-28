@@ -74,6 +74,8 @@ class ResponseHandler(RealtimeBaseHandler):
         elif st.current_response_key is None:
             st.current_response_key = response_key
         st.clear_pending_response(effective_response_key)
+        if effective_response_key is not None:
+            st.forget_queued_input_response(effective_response_key)
         return st.current_response_id, self._current_item_id(conn_id)
 
     def _end_response(self, conn_id: str, status: _ResponseStatus = "completed") -> None:
@@ -518,7 +520,7 @@ class ResponseHandler(RealtimeBaseHandler):
             return " ".join(str(part).strip() for part in parts if str(part).strip())
         return "".join(str(part) for part in parts)
 
-    def _bind_response_history_items(self, conn_id: str) -> None:
+    def _bind_response_history_items(self, conn_id: str, *, final: bool = False) -> None:
         """Bind wire IDs to response-owned history by output structure.
 
         The language model keeps its original text in ``Chat`` while the
@@ -531,17 +533,40 @@ class ResponseHandler(RealtimeBaseHandler):
         if is_out_of_band(st.current_response_params):
             return
         wants_audio = response_wants_audio(st.current_response_params)
-        history_items = [
-            item
-            for item in st.runtime_config.chat.provisional_items(st.current_response_key)
-            if (
-                isinstance(item, RealtimeConversationItemFunctionCall)
-                or (
-                    isinstance(item, RealtimeConversationItemAssistantMessage)
-                    and self._history_assistant_is_visible(item, wants_audio)
+
+        def visible_history_items() -> list[
+            RealtimeConversationItemAssistantMessage | RealtimeConversationItemFunctionCall
+        ]:
+            return [
+                item
+                for item in st.runtime_config.chat.provisional_items(st.current_response_key)
+                if (
+                    isinstance(item, RealtimeConversationItemFunctionCall)
+                    or (
+                        isinstance(item, RealtimeConversationItemAssistantMessage)
+                        and self._history_assistant_is_visible(item, wants_audio)
+                    )
                 )
-            )
-        ]
+            ]
+
+        history_items = visible_history_items()
+        # Function calls have a stable cross-layer identity. Remove acknowledged
+        # deletions wherever their delayed writeback appears, even if unrelated
+        # response output temporarily makes the overall structures differ.
+        for protocol_id, (_output_index, call_id) in tuple(st.deleted_response_function_calls.items()):
+            if call_id is None:
+                continue
+            matching_calls = [
+                item
+                for item in history_items
+                if isinstance(item, RealtimeConversationItemFunctionCall) and item.call_id == call_id
+            ]
+            for match in matching_calls:
+                if match.id is not None:
+                    st.runtime_config.chat.remove_item(match.id)
+            if matching_calls:
+                st.deleted_response_function_calls.pop(protocol_id, None)
+        history_items = visible_history_items()
         text_outputs = [*st.pending_text_outputs, *st.deleted_response_text_outputs.values()]
         protocol_items: list[tuple[int, str, str, object | None]] = [
             (
@@ -572,25 +597,43 @@ class ResponseHandler(RealtimeBaseHandler):
             for (_, _, kind, identity), candidate in zip(ordered_protocol_items, history_items)
         )
         if not structure_matches:
-            # An acknowledged deletion is a privacy boundary. If response-owned
-            # history and wire structure ever diverge, remove the entire
-            # provisional generation rather than risk retaining deleted text.
-            if any(protocol_id in st.deleted_conversation_item_ids for _, protocol_id, _, _ in ordered_protocol_items):
-                for item in history_items:
-                    if item.id is not None:
+            # Partial output/history arrival is normal. Preserve descriptors so
+            # a later writeback cannot escape an acknowledged deletion. At the
+            # terminal boundary all writeback is present; if deleted text is
+            # still structurally ambiguous, remove only response-owned assistant
+            # messages while preserving independently identifiable tool calls.
+            if not final:
+                return
+            if st.deleted_response_text_outputs:
+                for item in st.runtime_config.chat.provisional_items(st.current_response_key):
+                    if isinstance(item, RealtimeConversationItemAssistantMessage) and item.id is not None:
                         st.runtime_config.chat.remove_item(item.id)
-                for _, protocol_id, _, _ in ordered_protocol_items:
-                    st.deleted_response_text_outputs.pop(protocol_id, None)
-                    st.deleted_response_function_calls.pop(protocol_id, None)
+                st.deleted_response_text_outputs.clear()
+            if any(call_id is None for _output_index, call_id in st.deleted_response_function_calls.values()):
+                for item in visible_history_items():
+                    if isinstance(item, RealtimeConversationItemFunctionCall) and item.id is not None:
+                        st.runtime_config.chat.remove_item(item.id)
+            st.deleted_response_function_calls.clear()
+            for call in st.pending_function_calls.values():
+                matched_call = next(
+                    (
+                        item
+                        for item in visible_history_items()
+                        if isinstance(item, RealtimeConversationItemFunctionCall) and item.call_id == call.call_id
+                    ),
+                    None,
+                )
+                if call.id is not None and matched_call is not None and matched_call.id is not None:
+                    st.record_conversation_item(call.id, matched_call.id)
             return
 
-        for (_, protocol_id, _, _), match in zip(ordered_protocol_items, history_items):
-            if match.id is None:
+        for (_, protocol_id, _, _), matched_history in zip(ordered_protocol_items, history_items):
+            if matched_history.id is None:
                 continue
             if protocol_id in st.deleted_conversation_item_ids:
-                st.runtime_config.chat.remove_item(match.id)
+                st.runtime_config.chat.remove_item(matched_history.id)
             else:
-                st.record_conversation_item(protocol_id, match.id)
+                st.record_conversation_item(protocol_id, matched_history.id)
             st.deleted_response_text_outputs.pop(protocol_id, None)
             st.deleted_response_function_calls.pop(protocol_id, None)
 
@@ -812,7 +855,7 @@ class ResponseHandler(RealtimeBaseHandler):
                         )
                     )
             terminal_response = self._build_response(conn_id, status, reason)
-            self._bind_response_history_items(conn_id)
+            self._bind_response_history_items(conn_id, final=True)
             function_outputs = {
                 getattr(item, "call_id", None): item
                 for item in (terminal_response.output or [])
