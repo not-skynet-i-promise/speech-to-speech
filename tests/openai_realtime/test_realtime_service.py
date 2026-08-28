@@ -54,6 +54,7 @@ from speech_to_speech.api.openai_realtime.service import (
     CHUNK_SIZE_BYTES,
     RealtimeService,
 )
+from speech_to_speech.LLM.chat import make_user_audio_message
 from speech_to_speech.pipeline.events import (
     AssistantOutputEvent,
     AssistantResponseDoneEvent,
@@ -745,6 +746,54 @@ class TestHandleConversationItemDelete:
         assert queued_request.response_key in st.closed_response_keys
         assert queued_request.audio is None
         assert queued_request.is_cancelled
+
+    def test_direct_audio_delete_after_output_begins_retracts_worker_history(
+        self,
+        service,
+        conn_id,
+        text_prompt_queue,
+    ):
+        started = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_direct_output_delete", turn_revision=0),
+        )
+        wire_item_id = next(event.item_id for event in started if isinstance(event, InputAudioBufferSpeechStartedEvent))
+        service.dispatch_pipeline_event(
+            conn_id,
+            AudioInputCompletedEvent(
+                audio=np.zeros(1600, dtype=np.float32),
+                audio_sample_rate=16000,
+                audio_duration_s=0.1,
+                turn_id="turn_direct_output_delete",
+                turn_revision=0,
+            ),
+        )
+        worker_owned_request = text_prompt_queue.get_nowait()
+        st = service._state(conn_id)
+        raw_audio = "PRIVATE_DIRECT_AUDIO_SENTINEL"
+        recorded = st.runtime_config.chat.add_provisional_generation_items(
+            worker_owned_request.response_key,
+            [make_user_audio_message(raw_audio)],
+        )
+        assert recorded is not None
+
+        service.dispatch_pipeline_event(
+            conn_id,
+            AssistantOutputEvent(text="started", response_key=worker_owned_request.response_key),
+        )
+        assert wire_item_id in st.queued_input_responses
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=wire_item_id),
+        )
+
+        history = "\n".join(item.model_dump_json() for item in st.runtime_config.chat.buffer)
+        assert isinstance(deleted[-1], ConversationItemDeletedEvent)
+        assert raw_audio not in history
+        assert worker_owned_request.is_cancelled
+        assert worker_owned_request.response_key in st.closed_response_keys
+        assert wire_item_id not in st.queued_input_responses
 
     @pytest.mark.parametrize("direct_audio", [False, True])
     def test_delete_cancels_worker_owned_generation_and_late_writeback(

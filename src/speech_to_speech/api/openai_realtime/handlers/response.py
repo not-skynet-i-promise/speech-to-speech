@@ -74,8 +74,6 @@ class ResponseHandler(RealtimeBaseHandler):
         elif st.current_response_key is None:
             st.current_response_key = response_key
         st.clear_pending_response(effective_response_key)
-        if effective_response_key is not None:
-            st.forget_queued_input_response(effective_response_key)
         return st.current_response_id, self._current_item_id(conn_id)
 
     def _end_response(self, conn_id: str, status: _ResponseStatus = "completed") -> None:

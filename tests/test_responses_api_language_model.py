@@ -1289,6 +1289,33 @@ def test_cancelled_audio_request_releases_payload_without_calling_provider():
     create.assert_not_called()
 
 
+def test_audio_cancelled_during_serialization_does_not_reach_provider():
+    handler = _make_handler(stream=False)
+    create = MagicMock()
+    handler.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+    )
+    request = _make_audio_request()
+    original_serialize = handler._serialize_audio
+
+    def cancel_during_serialize(chat):
+        serialized = original_serialize(chat)
+        request.cancel()
+        return serialized
+
+    handler._serialize_audio = cancel_during_serialize
+
+    outputs = list(handler.process(request))
+
+    assert request.is_cancelled
+    assert request.audio is None
+    assert len(outputs) == 1
+    assert isinstance(outputs[0], EndOfResponse)
+    assert outputs[0].response_key == request.response_key
+    assert request.runtime_config.chat.buffer == []
+    create.assert_not_called()
+
+
 def test_audio_second_turn_retains_recent_audio_then_compacts_older_turn():
     handler = _make_handler(stream=False)
     captured_calls = []

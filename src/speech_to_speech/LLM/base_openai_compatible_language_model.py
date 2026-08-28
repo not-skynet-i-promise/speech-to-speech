@@ -782,6 +782,12 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     # the default conversation, or the out-of-band context). The provider
                     # would reject this; fail with a clear message instead of an opaque error.
                     error_message = "Cannot generate a response: no instructions and no input were provided."
+                elif self._turn_is_cancelled(turn):
+                    # Serialization (especially WAV/base64 conversion) can be
+                    # expensive enough for conversation.item.delete to cancel
+                    # the worker-owned request while it is in progress. Recheck
+                    # immediately before crossing the provider boundary.
+                    pass
                 else:
                     provider_request_started = True
 
