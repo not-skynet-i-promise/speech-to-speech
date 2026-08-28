@@ -39,14 +39,23 @@ class ResponseHandler(RealtimeBaseHandler):
         """Ensure a response and output item exist, creating them if needed."""
         st = self._state(conn_id)
         if st.current_response_id is None:
+            successor = st.deferred_response_request
             st.current_response_id = _generate_id("resp")
             self._start_item(conn_id)
             st.in_response = True
             st.active_response_turn_id = st.pending_response_turn_id
             st.active_response_turn_revision = st.pending_response_turn_revision
-        st.response_pending = False
-        st.pending_response_turn_id = None
-        st.pending_response_turn_revision = None
+            st.deferred_response_request = None
+            if successor is None:
+                st.response_pending = False
+                st.pending_response_turn_id = None
+                st.pending_response_turn_revision = None
+                st.pending_response_request = None
+            else:
+                st.response_pending = True
+                st.pending_response_turn_id = successor.turn_id
+                st.pending_response_turn_revision = successor.turn_revision
+                st.pending_response_request = successor
         return st.current_response_id, self._current_item_id(conn_id)
 
     def _end_response(self, conn_id: str, status: _ResponseStatus = "completed") -> None:
@@ -75,6 +84,8 @@ class ResponseHandler(RealtimeBaseHandler):
         st.response_pending = False
         st.pending_response_turn_id = None
         st.pending_response_turn_revision = None
+        st.pending_response_request = None
+        st.deferred_response_request = None
         st.active_response_turn_id = None
         st.active_response_turn_revision = None
         st.current_response_params = None
@@ -234,6 +245,8 @@ class ResponseHandler(RealtimeBaseHandler):
         st.response_pending = False
         st.pending_response_turn_id = None
         st.pending_response_turn_revision = None
+        st.pending_response_request = None
+        st.deferred_response_request = None
         st.active_response_turn_id = None if out_of_band else st.speculative_user_turn_id
         st.active_response_turn_revision = None if out_of_band else st.speculative_user_turn_revision
 
@@ -266,7 +279,12 @@ class ResponseHandler(RealtimeBaseHandler):
 
     def handle_response_cancel(self, conn_id: str) -> list[ServerEvent]:
         """Cancel the in-progress response and re-enable listening."""
-        events = self.finish_response(conn_id, status="cancelled", reason="client_cancelled")
+        events = self.finish_response(
+            conn_id,
+            status="cancelled",
+            reason="client_cancelled",
+            preserve_pending=False,
+        )
         should_listen = self._should_listen(conn_id)
         if should_listen:
             should_listen.set()
@@ -278,6 +296,8 @@ class ResponseHandler(RealtimeBaseHandler):
         conn_id: str,
         status: _ResponseStatus = "completed",
         reason: _StatusReason | None = None,
+        *,
+        preserve_pending: bool = True,
     ) -> list[ServerEvent]:
         """Close the current response (audio/text done + response done).
 
@@ -288,6 +308,12 @@ class ResponseHandler(RealtimeBaseHandler):
         with ``response.done``.
         """
         st = self._state(conn_id)
+        deferred_request = None
+        if preserve_pending:
+            if st.in_response:
+                deferred_request = st.pending_response_request
+            elif st.response_pending:
+                deferred_request = st.deferred_response_request
         events: list[ServerEvent] = []
         if st.in_response:
             resp_id, item_id = self._ensure_response(conn_id)
@@ -327,6 +353,8 @@ class ResponseHandler(RealtimeBaseHandler):
             st.response_pending = False
             st.pending_response_turn_id = None
             st.pending_response_turn_revision = None
+            st.pending_response_request = None
+            st.deferred_response_request = None
         # Apply any client items that arrived mid-generation now that in_response
         # is cleared and the generation's own write-back has landed. Done outside
         # the in_response guard so a stray terminal call still drains the buffer.
@@ -341,7 +369,25 @@ class ResponseHandler(RealtimeBaseHandler):
             # serialized against its response lease, so do not wait here.
             if not cfg.private_protocol_failed:
                 events.extend(self._service.conversation.flush_deferred_items(conn_id))
+        if deferred_request is not None and not cfg.private_protocol_failed:
+            tracker = self._service.speculative_turns
+            if tracker is None or tracker.is_latest(deferred_request.turn_id, deferred_request.turn_revision):
+                self.resume_pending_request(conn_id, deferred_request)
         return events
+
+    def resume_pending_request(self, conn_id: str, request: GenerateResponseRequest) -> None:
+        """Re-admit one held successor after its preceding response closes."""
+        st = self._state(conn_id)
+        generation = self._service.cancel_scope.generation if self._service.cancel_scope else None
+        request = request.model_copy(update={"cancel_generation": generation})
+        st.response_pending = True
+        st.pending_response_turn_id = request.turn_id
+        st.pending_response_turn_revision = request.turn_revision
+        st.pending_response_request = request
+        st.deferred_response_request = None
+        queue = self._queue(conn_id)
+        if queue is not None:
+            queue.put(request)
 
     # ── Pipeline event handlers ───────────────────
 

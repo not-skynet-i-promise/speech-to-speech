@@ -189,10 +189,14 @@ class ConversationHandler(RealtimeBaseHandler):
 
         pending_matches = turn_id is not None and st.pending_response_turn_id == turn_id
         active_matches = turn_id is not None and st.active_response_turn_id == turn_id
+        successor_request = st.deferred_response_request if pending_matches and not st.in_response else None
         if pending_matches:
             st.response_pending = False
             st.pending_response_turn_id = None
             st.pending_response_turn_revision = None
+            st.pending_response_request = None
+            if not st.in_response:
+                st.deferred_response_request = None
         if (active_matches or (pending_matches and not st.in_response)) and self._service.cancel_scope is not None:
             self._service.cancel_scope.cancel()
         # Retire the deleted item before closing its response.  Closing flushes
@@ -206,6 +210,10 @@ class ConversationHandler(RealtimeBaseHandler):
                 status="cancelled",
                 reason="client_cancelled",
             )
+        elif successor_request is not None:
+            tracker = self._service.speculative_turns
+            if tracker is None or tracker.is_latest(successor_request.turn_id, successor_request.turn_revision):
+                self._service.response.resume_pending_request(conn_id, successor_request)
         if active_matches or pending_matches:
             should_listen = self._should_listen(conn_id)
             if should_listen is not None:

@@ -146,7 +146,6 @@ class Chat:
             removed.append(self.buffer.pop(0))
         for item in removed:
             if item.id is not None:
-                self._deletable_user_ids.discard(item.id)
                 self._compaction_nodes.pop(item.id, None)
 
     def _has_call_id_in_buffer(self, call_id: str) -> bool:

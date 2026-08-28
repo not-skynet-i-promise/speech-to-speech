@@ -221,6 +221,8 @@ class ConnState(BaseModel):
     speculative_audio_duration_s: float = 0.0
     pending_response_turn_id: Optional[str] = None
     pending_response_turn_revision: Optional[int] = None
+    pending_response_request: GenerateResponseRequest | None = None
+    deferred_response_request: GenerateResponseRequest | None = None
     active_response_turn_id: Optional[str] = None
     active_response_turn_revision: Optional[int] = None
     # Client conversation.item.create items that arrived while a response was
@@ -902,19 +904,39 @@ class RealtimeService:
 
         queue = self.text_prompt_queue
         if queue and transcript and cfg.create_response_enabled:
-            st.response_pending = True
-            st.pending_response_turn_id = event.turn_id
-            st.pending_response_turn_revision = event.turn_revision
-            queue.put(
-                GenerateResponseRequest(
-                    runtime_config=cfg,
-                    language_code=event.language_code,
-                    turn_id=event.turn_id,
-                    turn_revision=event.turn_revision,
-                    speech_stopped_at_s=event.speech_stopped_at_s,
-                    cancel_generation=(self.cancel_scope.generation if self.cancel_scope else None),
-                )
+            request = GenerateResponseRequest(
+                runtime_config=cfg,
+                language_code=event.language_code,
+                turn_id=event.turn_id,
+                turn_revision=event.turn_revision,
+                speech_stopped_at_s=event.speech_stopped_at_s,
+                cancel_generation=(self.cancel_scope.generation if self.cancel_scope else None),
             )
+            # One protocol response is active at a time.  Hold a later turn at
+            # this boundary until the active response closes so its model output
+            # cannot be folded into the prior response or cancelled with it.
+            if st.in_response and event.turn_id == st.active_response_turn_id:
+                # A speculative revision continues the same protocol response;
+                # the turn tracker makes the older queued revision stale.
+                st.active_response_turn_revision = event.turn_revision
+                queue.put(request)
+            elif st.response_pending and event.turn_id == st.pending_response_turn_id:
+                st.pending_response_turn_revision = event.turn_revision
+                st.pending_response_request = request
+                queue.put(request)
+            elif st.in_response:
+                st.response_pending = True
+                st.pending_response_turn_id = event.turn_id
+                st.pending_response_turn_revision = event.turn_revision
+                st.pending_response_request = request
+            elif st.response_pending:
+                st.deferred_response_request = request
+            else:
+                st.response_pending = True
+                st.pending_response_turn_id = event.turn_id
+                st.pending_response_turn_revision = event.turn_revision
+                st.pending_response_request = request
+                queue.put(request)
 
         return events
 

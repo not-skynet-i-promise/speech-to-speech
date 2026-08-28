@@ -1065,6 +1065,109 @@ class TestHandleConversationItemDelete:
         assert service._state(conn_id).last_item_id == "msg_deferred"
         service.unregister(conn_id)
 
+    def test_active_delete_requeues_an_unrelated_pending_turn(self):
+        tracker = SpeculativeTurnTracker()
+        cancel_scope = CancelScope()
+        prompt_queue = Queue()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            should_listen=Event(),
+            speculative_turns=tracker,
+            cancel_scope=cancel_scope,
+        )
+        conn_id = service.register()
+        active = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_active", turn_revision=0),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="first", turn_id="turn_active", turn_revision=0),
+        )
+        active_request = prompt_queue.get_nowait()
+        assert active_request.turn_id == "turn_active"
+        service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(text="first reply", turn_id="turn_active", turn_revision=0),
+        )
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_next", turn_revision=0, interrupt_response=False),
+        )
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="second", turn_id="turn_next", turn_revision=0),
+        )
+        st = service._state(conn_id)
+        assert prompt_queue.empty()
+        assert st.pending_response_turn_id == "turn_next"
+
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=active.item_id),
+        )
+
+        resumed = prompt_queue.get_nowait()
+        assert resumed.turn_id == "turn_next"
+        assert resumed.cancel_generation == cancel_scope.generation == 1
+        assert st.response_pending
+        assert st.pending_response_turn_id == "turn_next"
+        assert st.pending_response_request is resumed
+        service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(text="second reply", turn_id="turn_next", turn_revision=0),
+        )
+        assert st.in_response
+        assert st.active_response_turn_id == "turn_next"
+        assert not st.response_pending
+        assert st.pending_response_request is None
+        service.unregister(conn_id)
+
+    def test_queued_delete_promotes_a_held_successor_turn(self):
+        tracker = SpeculativeTurnTracker()
+        cancel_scope = CancelScope()
+        prompt_queue = Queue()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            speculative_turns=tracker,
+            cancel_scope=cancel_scope,
+        )
+        conn_id = service.register()
+        queued = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_queued", turn_revision=0),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="first", turn_id="turn_queued", turn_revision=0),
+        )
+        assert prompt_queue.get_nowait().turn_id == "turn_queued"
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_successor", turn_revision=0, interrupt_response=False),
+        )
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="second", turn_id="turn_successor", turn_revision=0),
+        )
+        st = service._state(conn_id)
+        assert st.pending_response_turn_id == "turn_queued"
+        assert st.deferred_response_request is not None
+        assert st.deferred_response_request.turn_id == "turn_successor"
+        assert prompt_queue.empty()
+
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=queued.item_id),
+        )
+
+        successor = prompt_queue.get_nowait()
+        assert successor.turn_id == "turn_successor"
+        assert successor.cancel_generation == cancel_scope.generation == 1
+        assert st.pending_response_turn_id == "turn_successor"
+        assert st.deferred_response_request is None
+        service.unregister(conn_id)
+
     def test_delete_restores_compacted_history_and_removes_only_exact_user(self, service, conn_id):
         from speech_to_speech.LLM.chat import Chat, CompactionResult, make_assistant_message
 
@@ -1109,6 +1212,36 @@ class TestHandleConversationItemDelete:
         assert "user-1" in texts
         assert "user-2" in texts
         assert "summary-user" not in texts
+
+    def test_lossy_eviction_keeps_protocol_visible_item_deletable(self):
+        service = RealtimeService(chat_size=1)
+        conn_id = service.register()
+        for item_id, text in (("msg_old", "old"), ("msg_new", "new")):
+            service.handle_conversation_item_create(
+                conn_id,
+                ConversationItemCreateEvent(
+                    type="conversation.item.create",
+                    item={
+                        "id": item_id,
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": text}],
+                    },
+                ),
+            )
+        st = service._state(conn_id)
+        st.runtime_config.chat.trim_if_needed()
+        assert [item.id for item in st.runtime_config.chat.buffer] == ["msg_new"]
+
+        events = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="msg_old"),
+        )
+
+        assert isinstance(events[0], ConversationItemDeletedEvent)
+        assert st.protocol_item_ids == ["msg_new"]
+        assert [item.id for item in st.runtime_config.chat.buffer] == ["msg_new"]
+        service.unregister(conn_id)
 
     def test_missing_item_returns_correlated_error(self, service, conn_id):
         events = service.handle_conversation_item_delete(
