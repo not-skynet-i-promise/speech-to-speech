@@ -98,8 +98,36 @@ class AudioHandler(RealtimeBaseHandler):
         response = self._service.response
         events: list[ServerEvent] = []
         st = self._state(conn_id)
-        if st.in_response and event.interrupt_response and st.runtime_config.interrupt_response_enabled:
-            events.extend(response.finish_response(conn_id, status="cancelled", reason="turn_detected"))
+        deleted_reopen_item_id = st.turn_input_item_ids.get(event.turn_id) if event.turn_id is not None else None
+        if event.reopened and (
+            deleted_reopen_item_id in st.deleted_input_item_ids
+            or (
+                self._service.speculative_turns is not None
+                and not self._service.speculative_turns.is_latest(event.turn_id, event.turn_revision)
+            )
+        ):
+            logger.debug("Ignoring a reopened discarded speculative turn")
+            return []
+        interrupting_response = bool(
+            (st.in_response or st.response_pending)
+            and event.interrupt_response
+            and st.runtime_config.interrupt_response_enabled
+        )
+        if interrupting_response and self._service.cancel_scope is not None:
+            # dispatch_pipeline_event holds the transcript-state guard here.
+            # Advance the generation before closing the response so a provider
+            # writer waiting on that same guard cannot commit unheard output in
+            # the gap between response closure and router-side queue cleanup.
+            self._service.cancel_scope.cancel()
+        if st.in_response and interrupting_response:
+            events.extend(
+                response.finish_response(
+                    conn_id,
+                    status="cancelled",
+                    reason="turn_detected",
+                    preserve_pending=False,
+                )
+            )
         is_reopen = bool(event.reopened and event.turn_id is not None and event.turn_id == st.speculative_turn_id)
         preserve_active_response = st.in_response
         if is_reopen:
@@ -124,7 +152,11 @@ class AudioHandler(RealtimeBaseHandler):
             st.response_usage.turns += 1
         st.speculative_turn_id = event.turn_id
         st.speculative_turn_revision = event.turn_revision
-        st.last_item_id = input_item_id
+        st.audio_input_item_ids.add(input_item_id)
+        if event.turn_id is not None:
+            st.input_item_turn_ids[input_item_id] = event.turn_id
+            st.turn_input_item_ids[event.turn_id] = input_item_id
+        st.record_protocol_item(input_item_id)
         events.append(
             InputAudioBufferSpeechStartedEvent(
                 type="input_audio_buffer.speech_started",

@@ -50,6 +50,30 @@ def test_tracker_prunes_old_turn_revisions():
     assert "turn_1" not in tracker._committed_revision
 
 
+def test_evicted_discard_tombstone_never_revives_late_turn_events():
+    tracker = SpeculativeTurnTracker(max_tracked_turns=1)
+    tracker.observe("turn_deleted_1", 0)
+    tracker.discard("turn_deleted_1")
+    tracker.observe("turn_deleted_2", 0)
+    tracker.discard("turn_deleted_2")
+
+    assert "turn_deleted_1" not in tracker._discarded_turn_ids
+    assert "turn_deleted_1" not in tracker._latest_revision
+    assert not tracker.is_latest("turn_deleted_1", 0)
+    assert not tracker.is_latest("turn_deleted_1", 99)
+    assert tracker.begin_reopen_candidate("turn_deleted_1", 0) is None
+
+
+def test_reset_clears_per_session_discard_filter():
+    tracker = SpeculativeTurnTracker(max_tracked_turns=1)
+    tracker.discard("turn_reusable_after_reset")
+
+    tracker.reset()
+    tracker.observe("turn_reusable_after_reset", 0)
+
+    assert tracker.is_latest("turn_reusable_after_reset", 0)
+
+
 def test_tracker_keeps_pending_reopen_while_pruning():
     tracker = SpeculativeTurnTracker(max_tracked_turns=1)
     tracker.observe("turn_1", 0)

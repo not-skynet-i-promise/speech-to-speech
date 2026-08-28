@@ -214,6 +214,12 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             return True
         return self.speculative_turns.is_latest_after_reopen_grace(turn_id, turn_revision)
 
+    def _turn_commits_writeback_now(self, turn_id: str | None, turn_revision: int | None) -> bool | None:
+        """Commit writeback ownership without waiting; ``None`` asks for a retry."""
+        if self.speculative_turns is None:
+            return True
+        return self.speculative_turns.try_commit_if_latest_after_reopen_grace(turn_id, turn_revision)
+
     @abstractmethod
     def _load_model(
         self,
@@ -697,6 +703,9 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         ctx.turn_revision = request.turn_revision
         ctx.speech_stopped_at_s = request.speech_stopped_at_s
         request_generation = request.cancel_generation
+        owner_generation = request_generation
+        if owner_generation is None and self.cancel_scope is not None:
+            owner_generation = self.cancel_scope.generation
         if (
             request_generation is not None
             and self.cancel_scope is not None
@@ -717,10 +726,11 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         runtime_config = request.runtime_config
         response = request.response
         original_chat = runtime_config.chat
+        request_chat = request.chat_snapshot or original_chat
         out_of_band = is_out_of_band(response)
         if out_of_band:
             try:
-                active_chat = build_active_chat(original_chat, response)
+                active_chat = build_active_chat(request_chat, response)
             except ChatItemError as exc:
                 with runtime_config.transcript_barrier_content_guard() as private_content:
                     if private_content:
@@ -732,11 +742,12 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     yield EndOfResponse(
                         turn_id=ctx.turn_id,
                         turn_revision=ctx.turn_revision,
+                        cancel_generation=owner_generation,
                         error=error_message,
                     )
                 return
         else:
-            active_chat = original_chat.copy()
+            active_chat = request_chat.copy()
         language_code = request.language_code
         instructions = (
             response.instructions if response and response.instructions else runtime_config.session.instructions
@@ -755,9 +766,7 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         if lang_name and self.enable_lang_prompt:
             active_chat.add_item(make_user_message(f"Please reply to my message in {lang_name}."))
 
-        gen = request_generation
-        if gen is None and self.cancel_scope is not None:
-            gen = self.cancel_scope.generation
+        gen = owner_generation
         ctx.cancel_generation = gen
         # Images the model sees this turn; only these are stripped on write-back,
         # so an image a fast client injects mid-generation for the next turn
@@ -795,22 +804,44 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             # conversation (their context was a throwaway chat).
             commit_allowed = turn_output_allowed and not out_of_band
             if commit_allowed:
-                with runtime_config.transcript_barrier_state_guard():
-                    if not runtime_config.transcript_barrier_failed:
-                        original_chat.add_item(make_assistant_message(ctx.generated_text))
-                        for t in ctx.tools:
-                            original_chat.add_item(
-                                RealtimeConversationItemFunctionCall(
-                                    type="function_call",
-                                    id=t.id,
-                                    call_id=t.call_id,
-                                    name=t.name,
-                                    arguments=t.arguments,
-                                    status=t.status,
+                while True:
+                    with runtime_config.transcript_barrier_state_guard():
+                        generation_stale = (
+                            ctx.cancel_generation is not None
+                            and self.cancel_scope is not None
+                            and self.cancel_scope.is_stale(ctx.cancel_generation)
+                        )
+                        if runtime_config.transcript_barrier_failed or generation_stale:
+                            break
+                        commits_writeback = self._turn_commits_writeback_now(ctx.turn_id, ctx.turn_revision)
+                        if commits_writeback is not None:
+                            if commits_writeback:
+                                original_chat.add_response_item(
+                                    make_assistant_message(ctx.generated_text),
+                                    after_user_id=request.response_user_item_id,
+                                    owner_user_ids=request.response_user_item_ids,
                                 )
-                            )
-                        original_chat.strip_images(consumed_image_ids)
-                        original_chat.trim_if_needed(self.compactor)
+                                for t in ctx.tools:
+                                    original_chat.add_response_item(
+                                        RealtimeConversationItemFunctionCall(
+                                            type="function_call",
+                                            id=t.id,
+                                            call_id=t.call_id,
+                                            name=t.name,
+                                            arguments=t.arguments,
+                                            status=t.status,
+                                        ),
+                                        after_user_id=request.response_user_item_id,
+                                        owner_user_ids=request.response_user_item_ids,
+                                    )
+                                original_chat.strip_images(consumed_image_ids)
+                                original_chat.trim_if_needed(self.compactor)
+                            break
+                    # A reopen began between the blocking output check and the
+                    # guarded writeback fence. Wait only outside the content lock,
+                    # then retry if the original revision still owns the turn.
+                    if not self._turn_output_allowed(ctx.turn_id, ctx.turn_revision):
+                        break
             with runtime_config.transcript_barrier_content_guard() as private_content:
                 if private_content:
                     logger.debug("Generated text redacted (characters=%d)", len(ctx.generated_text))
@@ -838,6 +869,7 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     output_tokens=output_tokens,
                     turn_id=ctx.turn_id,
                     turn_revision=ctx.turn_revision,
+                    cancel_generation=ctx.cancel_generation,
                 )
         except GeneratorExit:
             raise

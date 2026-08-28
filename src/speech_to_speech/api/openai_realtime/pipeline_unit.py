@@ -28,6 +28,11 @@ class SessionState(BaseModel):
     websocket: Any
     session_id: str = ""
     pending_output_item: Any = None
+    # The route and pipeline send loop are separate asyncio tasks.  Holding one
+    # lock across state transition + transport batch gives destructive client
+    # events (delete/cancel) a strict boundary: old output is either sent before
+    # the acknowledgement or rechecked and discarded afterward.
+    outbound_lock: asyncio.Lock = Field(default_factory=asyncio.Lock)
     drained: asyncio.Event = Field(default_factory=asyncio.Event)
     # Wall-clock time when the ws disconnected (route handler released its claim).
     # `None` while the client is still active. Used by /v1/pool to surface stuck

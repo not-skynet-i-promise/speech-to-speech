@@ -1,4 +1,5 @@
 import logging
+from collections import OrderedDict
 from collections.abc import Mapping
 from contextlib import contextmanager
 from queue import Queue
@@ -9,6 +10,8 @@ from openai.types.realtime import (
     ConversationItem,
     ConversationItemCreatedEvent,
     ConversationItemCreateEvent,
+    ConversationItemDeletedEvent,
+    ConversationItemDeleteEvent,
     ConversationItemInputAudioTranscriptionCompletedEvent,
     ConversationItemInputAudioTranscriptionDeltaEvent,
     InputAudioBufferAppendEvent,
@@ -78,6 +81,8 @@ PIPELINE_SAMPLE_RATE = 16000
 CHUNK_SAMPLES = 512
 BYTES_PER_SAMPLE = 2
 CHUNK_SIZE_BYTES = CHUNK_SAMPLES * BYTES_PER_SAMPLE
+MAX_TRACKED_PROTOCOL_ITEMS = 2048
+MAX_DEFERRED_RESPONSE_REQUESTS = 8
 
 _ResponseStatus = Literal["completed", "cancelled", "failed", "incomplete", "in_progress"]
 _StatusReason = Literal["turn_detected", "client_cancelled", "max_output_tokens", "content_filter"]
@@ -86,6 +91,7 @@ _EVENT_TYPE_TO_MODEL: dict[str, type[BaseModel]] = {
     "input_audio_buffer.append": InputAudioBufferAppendEvent,
     "session.update": SessionUpdateEvent,
     "conversation.item.create": ConversationItemCreateEvent,
+    "conversation.item.delete": ConversationItemDeleteEvent,
     "response.create": ResponseCreateEvent,
     "response.cancel": ResponseCancelEvent,
     "reachy.transcript_barrier.resolve": TranscriptBarrierResolveEvent,
@@ -95,6 +101,7 @@ ClientEvent = Union[
     InputAudioBufferAppendEvent,
     SessionUpdateEvent,
     ConversationItemCreateEvent,
+    ConversationItemDeleteEvent,
     ResponseCreateEvent,
     ResponseCancelEvent,
     TranscriptBarrierResolveEvent,
@@ -106,6 +113,7 @@ ServerEvent = Union[
     InputAudioBufferSpeechStartedEvent,
     InputAudioBufferSpeechStoppedEvent,
     ConversationItemCreatedEvent,
+    ConversationItemDeletedEvent,
     ConversationItemInputAudioTranscriptionDeltaEvent,
     ConversationItemInputAudioTranscriptionCompletedEvent,
     ResponseCreatedEvent,
@@ -212,12 +220,231 @@ class ConnState(BaseModel):
     speculative_user_item_id: Optional[str] = None
     speculative_input_item_id: Optional[str] = None
     speculative_audio_duration_s: float = 0.0
+    pending_response_turn_id: Optional[str] = None
+    pending_response_turn_revision: Optional[int] = None
+    pending_response_request: GenerateResponseRequest | None = None
+    pending_response_enqueued: bool = False
+    # Later distinct turns wait here in arrival order while the current/pending
+    # response owns the model lane.  The bound prevents an unattended client
+    # from growing per-connection memory indefinitely; overflow is reported to
+    # the client instead of silently replacing an accepted turn.
+    deferred_response_requests: list[GenerateResponseRequest] = Field(default_factory=list)
+    active_response_turn_id: Optional[str] = None
+    active_response_turn_revision: Optional[int] = None
+    active_response_cancel_generation: Optional[int] = None
+    active_response_input_item_id: Optional[str] = None
+    active_response_input_item_ids: set[str] = Field(default_factory=set)
+    last_closed_response_turn_id: Optional[str] = None
+    last_closed_response_cancel_generation: Optional[int] = None
+    # A provider failure is surfaced on the text side-channel before its normal
+    # terminal sentinel reaches the audio queue. Keep the active slot owned until
+    # that sentinel arrives, otherwise it can close a newly promoted successor.
+    response_failure_pending: bool = False
+    # Exact default-conversation tail that an explicit in-band
+    # ``response.create`` may own. Client-created/input items clear the audio
+    # turn fields so an old audio deletion cannot cancel an unrelated response.
+    response_context_input_item_id: Optional[str] = None
+    response_context_input_item_ids: set[str] = Field(default_factory=set)
+    response_context_turn_id: Optional[str] = None
+    response_context_turn_revision: Optional[int] = None
+    response_context_speech_stopped_at_s: Optional[float] = None
+    # Dependency IDs preflighted for a response.input batch. They protect the
+    # batch's earlier owners while later items are still entering the bounded
+    # protocol index; the response handler clears this transient set on exit.
+    admitting_response_input_item_ids: set[str] = Field(default_factory=set)
     # Client conversation.item.create items that arrived while a response was
     # generating. Applying them mid-generation races the LLM handler's chat
     # write-back (cross-thread), so they are buffered here and flushed in order
     # once the response completes. See ConversationHandler.flush_deferred_items.
     deferred_items: list[ConversationItem] = Field(default_factory=list)
     transcript_barrier_replacement_item_ids: set[str] = Field(default_factory=set)
+    protocol_item_ids: list[str] = Field(default_factory=list)
+    protocol_item_sequences: dict[str, int] = Field(default_factory=dict)
+    deferred_protocol_item_sequences: dict[str, int] = Field(default_factory=dict)
+    next_protocol_item_sequence: int = 0
+    audio_input_item_ids: set[str] = Field(default_factory=set)
+    input_item_chat_ids: dict[str, str] = Field(default_factory=dict)
+    input_item_turn_ids: dict[str, str] = Field(default_factory=dict)
+    turn_input_item_ids: dict[str, str] = Field(default_factory=dict)
+    deleted_input_item_ids: OrderedDict[str, None] = Field(default_factory=OrderedDict)
+    speculative_turn_tracker: SpeculativeTurnTracker | None = Field(default=None, exclude=True)
+
+    @staticmethod
+    def response_dependency_count_is_bounded(count: int) -> bool:
+        """Whether dependencies leave room for the supported speech FIFO.
+
+        Keep slots for one pending turn, every supported deferred turn, and
+        one provisional turn whose transcription may report a full queue.
+        """
+
+        return count + MAX_DEFERRED_RESPONSE_REQUESTS + 2 <= MAX_TRACKED_PROTOCOL_ITEMS
+
+    def remove_response_context_input(self, item_id: str) -> None:
+        """Remove one retired dependency while preserving any surviving owner."""
+
+        if item_id not in self.response_context_input_item_ids:
+            return
+        self.response_context_input_item_ids.discard(item_id)
+        self.response_context_turn_id = None
+        self.response_context_turn_revision = None
+        self.response_context_speech_stopped_at_s = None
+        if not self.response_context_input_item_ids:
+            self.response_context_input_item_id = None
+            return
+
+        dependency_chat_ids = {
+            self.input_item_chat_ids.get(input_id, input_id) for input_id in self.response_context_input_item_ids
+        }
+        primary_chat_id = self.runtime_config.chat.latest_user_message_id(dependency_chat_ids)
+        if primary_chat_id is not None:
+            protocol_candidates = [
+                input_id
+                for input_id in self.protocol_item_ids
+                if input_id in self.response_context_input_item_ids
+                and self.input_item_chat_ids.get(input_id, input_id) == primary_chat_id
+            ]
+            self.response_context_input_item_id = (
+                protocol_candidates[-1]
+                if protocol_candidates
+                else next(
+                    (
+                        input_id
+                        for input_id in self.response_context_input_item_ids
+                        if self.input_item_chat_ids.get(input_id, input_id) == primary_chat_id
+                    ),
+                    primary_chat_id,
+                )
+            )
+            return
+
+        self.response_context_input_item_id = max(
+            self.response_context_input_item_ids,
+            key=lambda input_id: self.protocol_item_sequences.get(input_id, 0),
+        )
+
+    def retire_reused_audio_item_id(self, item_id: str) -> None:
+        """Drop stale audio identity before a deleted protocol ID is reused.
+
+        Deleted audio IDs intentionally remain tombstoned so late STT events
+        cannot recreate them.  A later client-created item may legally reuse
+        the protocol ID, however, and must then be treated as that new item on
+        deletion rather than as an unmapped audio placeholder.
+        """
+
+        if item_id not in self.audio_input_item_ids and item_id not in self.deleted_input_item_ids:
+            return
+        self.audio_input_item_ids.discard(item_id)
+        self.deleted_input_item_ids.pop(item_id, None)
+        retired_chat_id = self.input_item_chat_ids.pop(item_id, None)
+        if retired_chat_id is not None:
+            self.runtime_config.chat.retire_user_message_deletable(retired_chat_id)
+        retired_turn_id = self.input_item_turn_ids.pop(item_id, None)
+        if retired_turn_id is not None and self.speculative_turn_tracker is not None:
+            self.speculative_turn_tracker.discard(retired_turn_id)
+        if retired_turn_id is not None and self.turn_input_item_ids.get(retired_turn_id) == item_id:
+            self.turn_input_item_ids.pop(retired_turn_id, None)
+        if self.speculative_input_item_id == item_id:
+            self.speculative_input_item_id = None
+        if retired_chat_id is not None and self.speculative_user_item_id == retired_chat_id:
+            self.speculative_user_item_id = None
+
+    def record_protocol_item(self, item_id: str) -> None:
+        """Record one protocol-visible conversation item in creation order."""
+        newly_created = item_id not in self.protocol_item_ids
+        if newly_created:
+            sequence = self.deferred_protocol_item_sequences.pop(item_id, None)
+            if sequence is None:
+                self.next_protocol_item_sequence += 1
+                sequence = self.next_protocol_item_sequence
+            self.protocol_item_sequences[item_id] = sequence
+            self.protocol_item_ids.append(item_id)
+        while len(self.protocol_item_ids) > MAX_TRACKED_PROTOCOL_ITEMS:
+            response_owner_ids = set(self.active_response_input_item_ids)
+            response_owner_ids.update(self.admitting_response_input_item_ids)
+            if self.active_response_input_item_id is not None:
+                response_owner_ids.add(self.active_response_input_item_id)
+            owner_turn_ids = {
+                turn_id
+                for turn_id in (
+                    self.active_response_turn_id,
+                    self.pending_response_turn_id,
+                    *(request.turn_id for request in self.deferred_response_requests),
+                )
+                if turn_id is not None
+            }
+            response_owner_ids.update(
+                input_item_id
+                for turn_id in owner_turn_ids
+                if (input_item_id := self.turn_input_item_ids.get(turn_id)) is not None
+            )
+            owner_chat_ids: set[str] = set()
+            for request in (self.pending_response_request, *self.deferred_response_requests):
+                if request is None:
+                    continue
+                owner_chat_ids.update(request.response_user_item_ids)
+                if request.response_user_item_id is not None:
+                    owner_chat_ids.add(request.response_user_item_id)
+            response_owner_ids.update(
+                input_item_id
+                for input_item_id, chat_id in self.input_item_chat_ids.items()
+                if chat_id in owner_chat_ids
+            )
+            retirement_index = next(
+                (
+                    index
+                    for index, candidate_id in enumerate(self.protocol_item_ids)
+                    if candidate_id not in response_owner_ids
+                ),
+                None,
+            )
+            if retirement_index is None:
+                raise RuntimeError("Live response owners exhaust the protocol item index")
+            retired_item_id = self.protocol_item_ids.pop(retirement_index)
+            self.remove_response_context_input(retired_item_id)
+            self.protocol_item_sequences.pop(retired_item_id, None)
+            self.audio_input_item_ids.discard(retired_item_id)
+            retired_chat_id = self.input_item_chat_ids.pop(retired_item_id, retired_item_id)
+            self.runtime_config.chat.retire_user_message_deletable(retired_chat_id)
+            retired_turn_id = self.input_item_turn_ids.pop(retired_item_id, None)
+            if retired_turn_id is not None and self.speculative_turn_tracker is not None:
+                self.speculative_turn_tracker.discard(retired_turn_id)
+            if retired_turn_id is not None and self.turn_input_item_ids.get(retired_turn_id) == retired_item_id:
+                self.turn_input_item_ids.pop(retired_turn_id, None)
+            self.deleted_input_item_ids.pop(retired_item_id, None)
+        if newly_created:
+            self.last_item_id = item_id
+
+    def reserve_deferred_protocol_item(self, item_id: str) -> None:
+        """Assign an immutable admission sequence before deferred chat commit."""
+
+        self.next_protocol_item_sequence += 1
+        self.deferred_protocol_item_sequences[item_id] = self.next_protocol_item_sequence
+
+    def drop_deferred_protocol_item(self, item_id: str) -> None:
+        """Release the sequence reservation for a deferred item that was rejected."""
+
+        self.deferred_protocol_item_sequences.pop(item_id, None)
+
+    def record_deleted_input_item(self, item_id: str) -> None:
+        """Remember a deleted audio item without allowing per-session state growth."""
+        self.deleted_input_item_ids[item_id] = None
+        self.deleted_input_item_ids.move_to_end(item_id)
+        while len(self.deleted_input_item_ids) > MAX_TRACKED_PROTOCOL_ITEMS:
+            retired_item_id, _ = self.deleted_input_item_ids.popitem(last=False)
+            self.audio_input_item_ids.discard(retired_item_id)
+            retired_chat_id = self.input_item_chat_ids.pop(retired_item_id, None)
+            if retired_chat_id is not None:
+                self.runtime_config.chat.retire_user_message_deletable(retired_chat_id)
+            retired_turn_id = self.input_item_turn_ids.pop(retired_item_id, None)
+            if retired_turn_id is not None and self.turn_input_item_ids.get(retired_turn_id) == retired_item_id:
+                self.turn_input_item_ids.pop(retired_turn_id, None)
+
+    def remove_protocol_item(self, item_id: str) -> None:
+        """Remove one protocol item and expose only the surviving protocol tail."""
+        self.protocol_item_ids = [existing for existing in self.protocol_item_ids if existing != item_id]
+        self.remove_response_context_input(item_id)
+        self.protocol_item_sequences.pop(item_id, None)
+        self.last_item_id = self.protocol_item_ids[-1] if self.protocol_item_ids else None
 
 
 class RealtimeService:
@@ -285,7 +512,10 @@ class RealtimeService:
         """Register a new connection and return its session_id."""
         if self.speculative_turns:
             self.speculative_turns.reset()
-        state = ConnState(runtime_config=RuntimeConfig(chat=Chat(self._chat_size)))
+        state = ConnState(
+            runtime_config=RuntimeConfig(chat=Chat(self._chat_size)),
+            speculative_turn_tracker=self.speculative_turns,
+        )
         self._conns[state.session_id] = state
         self.total_usage.connections += 1
         return state.session_id
@@ -577,6 +807,32 @@ class RealtimeService:
                 return [self.poison_transcript_barrier(conn_id, "transcript_barrier_pending")]
             return self.conversation.handle_conversation_item_create(conn_id, event)
 
+    def handle_conversation_item_delete(
+        self,
+        conn_id: str,
+        event: ConversationItemDeleteEvent,
+        *,
+        defer_successor_enqueue: bool = False,
+    ) -> list[ServerEvent]:
+        """Delete one exact user item while preserving the guarded session fence."""
+        cfg = self._state(conn_id).runtime_config
+        with cfg.transcript_barrier_state_guard():
+            if cfg.private_protocol_failed:
+                return []
+            if cfg.transcript_barrier_pending:
+                error = self.poison_transcript_barrier(conn_id, "transcript_barrier_pending")
+                error.error.event_id = event.event_id
+                return [error]
+            return self.conversation.handle_conversation_item_delete(
+                conn_id,
+                event,
+                defer_successor_enqueue=defer_successor_enqueue,
+            )
+
+    def enqueue_pending_response(self, conn_id: str) -> None:
+        """Release a response held across router-owned cancelled-output flushing."""
+        self.response.enqueue_pending_request(conn_id)
+
     def handle_transcript_barrier_resolve(
         self,
         conn_id: str,
@@ -751,8 +1007,11 @@ class RealtimeService:
                 TranscriptionCompletedEvent,
                 TranscriptBarrierCompletedEvent,
                 TranscriptBarrierDiscardedEvent,
+                SpeechStartedEvent,
+                SpeechStoppedEvent,
                 AssistantTextEvent,
                 TokenUsageEvent,
+                ResponseFailedEvent,
             ),
         ):
             return False
@@ -782,13 +1041,27 @@ class RealtimeService:
     def _on_transcription_completed(self, conn_id: str, event: TranscriptionCompletedEvent) -> list[ServerEvent]:
         """Emit and store a final transcription, then trigger LM when configured."""
         st = self._state(conn_id)
+        input_item_id = (
+            st.turn_input_item_ids.get(event.turn_id) if event.turn_id is not None else st.speculative_input_item_id
+        )
+        if input_item_id is None:
+            input_item_id = self.response._current_item_id(conn_id)
+            st.speculative_input_item_id = input_item_id
+            st.audio_input_item_ids.add(input_item_id)
+            st.record_protocol_item(input_item_id)
+            if event.turn_id is not None:
+                st.input_item_turn_ids[input_item_id] = event.turn_id
+                st.turn_input_item_ids[event.turn_id] = input_item_id
+        if input_item_id in st.deleted_input_item_ids:
+            logger.debug("Ignoring transcription for a deleted input item")
+            return []
         same_speculative_turn = event.turn_id is not None and event.turn_id == st.speculative_user_turn_id
         if same_speculative_turn:
             st.response_usage.audio_duration_s -= st.speculative_audio_duration_s
         else:
             st.speculative_audio_duration_s = 0.0
 
-        events = self.conversation.on_transcription_completed(conn_id, event)
+        events = self.conversation.on_transcription_completed(conn_id, event, item_id=input_item_id)
         if event.turn_id is not None:
             st.speculative_audio_duration_s = st.input_audio_duration_s
 
@@ -803,9 +1076,23 @@ class RealtimeService:
             else:
                 item = cfg.chat.add_item(make_user_message(transcript))
                 st.speculative_user_item_id = item.id
+            if st.speculative_user_item_id is not None:
+                st.input_item_chat_ids[input_item_id] = st.speculative_user_item_id
+                cfg.chat.mark_user_message_deletable(st.speculative_user_item_id)
         elif same_speculative_turn and st.speculative_user_item_id:
             cfg.chat.remove_user_message(st.speculative_user_item_id)
+            st.input_item_chat_ids.pop(input_item_id, None)
             st.speculative_user_item_id = None
+            if input_item_id in st.response_context_input_item_ids:
+                st.response_context_input_item_id = None
+                st.response_context_input_item_ids.clear()
+                st.response_context_turn_id = None
+                st.response_context_turn_revision = None
+                st.response_context_speech_stopped_at_s = None
+            if event.turn_id is not None:
+                events.extend(self.response.discard_turn(conn_id, event.turn_id))
+                if not st.in_response and not st.response_pending and self.should_listen is not None:
+                    self.should_listen.set()
         elif event.turn_id is not None and event.turn_id != st.speculative_user_turn_id:
             st.speculative_user_item_id = None
 
@@ -813,20 +1100,87 @@ class RealtimeService:
             st.speculative_user_turn_id = event.turn_id
             st.speculative_user_turn_revision = event.turn_revision
             st.speculative_user_speech_stopped_at_s = event.speech_stopped_at_s
+        if transcript:
+            st.response_context_input_item_id = input_item_id
+            st.response_context_input_item_ids = {input_item_id}
+            st.response_context_turn_id = event.turn_id
+            st.response_context_turn_revision = event.turn_revision
+            st.response_context_speech_stopped_at_s = event.speech_stopped_at_s
 
         queue = self.text_prompt_queue
         if queue and transcript and cfg.create_response_enabled:
-            st.response_pending = True
-            queue.put(
-                GenerateResponseRequest(
-                    runtime_config=cfg,
-                    language_code=event.language_code,
-                    turn_id=event.turn_id,
-                    turn_revision=event.turn_revision,
-                    speech_stopped_at_s=event.speech_stopped_at_s,
-                    cancel_generation=(self.cancel_scope.generation if self.cancel_scope else None),
-                )
+            request = GenerateResponseRequest(
+                runtime_config=cfg,
+                chat_snapshot=cfg.chat.copy(),
+                response_user_item_id=st.speculative_user_item_id,
+                response_user_item_ids=(
+                    {st.speculative_user_item_id} if st.speculative_user_item_id is not None else set()
+                ),
+                admitted_protocol_item_ids={
+                    *st.protocol_item_ids,
+                    *(item.id for item in st.deferred_items if item.id is not None),
+                },
+                admitted_protocol_sequence=st.next_protocol_item_sequence,
+                language_code=event.language_code,
+                turn_id=event.turn_id,
+                turn_revision=event.turn_revision,
+                speech_stopped_at_s=event.speech_stopped_at_s,
+                cancel_generation=(self.cancel_scope.generation if self.cancel_scope else None),
             )
+            # One protocol response is active at a time.  Hold a later turn at
+            # this boundary until the active response closes so its model output
+            # cannot be folded into the prior response or cancelled with it.
+            if st.in_response and event.turn_id == st.active_response_turn_id:
+                # A speculative revision continues the same protocol response;
+                # the turn tracker makes the older queued revision stale.
+                st.active_response_turn_revision = event.turn_revision
+                queue.put(request)
+            elif st.in_response and st.response_pending and event.turn_id == st.pending_response_turn_id:
+                st.pending_response_turn_revision = event.turn_revision
+                st.pending_response_request = request
+                st.pending_response_enqueued = False
+            elif st.response_pending and event.turn_id == st.pending_response_turn_id:
+                st.pending_response_turn_revision = event.turn_revision
+                st.pending_response_request = request
+                queue.put(request)
+                st.pending_response_enqueued = True
+            else:
+                deferred_index = next(
+                    (
+                        index
+                        for index, candidate in enumerate(st.deferred_response_requests)
+                        if candidate.turn_id == event.turn_id
+                    ),
+                    None,
+                )
+                if deferred_index is not None:
+                    # Coalesce a speculative revision without changing the
+                    # distinct turn's place in the FIFO.
+                    st.deferred_response_requests[deferred_index] = request
+                elif st.in_response and not st.response_pending:
+                    st.response_pending = True
+                    st.pending_response_turn_id = event.turn_id
+                    st.pending_response_turn_revision = event.turn_revision
+                    st.pending_response_request = request
+                    st.pending_response_enqueued = False
+                elif st.response_pending:
+                    if len(st.deferred_response_requests) >= MAX_DEFERRED_RESPONSE_REQUESTS:
+                        events.append(
+                            self.make_error(
+                                "Too many responses are waiting to run.",
+                                "response_queue_full",
+                            )
+                        )
+                    else:
+                        st.deferred_response_requests.append(request)
+                else:
+                    st.response_pending = True
+                    st.pending_response_turn_id = event.turn_id
+                    st.pending_response_turn_revision = event.turn_revision
+                    st.pending_response_request = request
+                    cfg.chat.protect_response_turn(request.response_user_item_id)
+                    queue.put(request)
+                    st.pending_response_enqueued = True
 
         return events
 
@@ -929,6 +1283,42 @@ class RealtimeService:
             logger.debug("Dropping stale token usage for turn=%s rev=%s", event.turn_id, event.turn_revision)
             return []
         st = self._state(conn_id)
+        if st.in_response:
+            owner_turn_id = st.active_response_turn_id
+            owner_turn_revision = st.active_response_turn_revision
+            owner_generation = st.active_response_cancel_generation
+        elif st.response_pending and st.pending_response_request is not None:
+            owner_turn_id = st.pending_response_turn_id
+            owner_turn_revision = st.pending_response_turn_revision
+            owner_generation = st.pending_response_request.cancel_generation
+        else:
+            owner_turn_id = None
+            owner_turn_revision = None
+            owner_generation = None
+        has_response_owner = st.in_response or (st.response_pending and st.pending_response_request is not None)
+        if not has_response_owner and (event.turn_id is not None or event.cancel_generation is not None):
+            logger.debug("Dropping correlated token usage without an active response owner")
+            return []
+        if event.cancel_generation is not None:
+            if owner_generation != event.cancel_generation:
+                logger.debug(
+                    "Dropping token usage for stale cancellation generation=%s (active=%s)",
+                    event.cancel_generation,
+                    owner_generation,
+                )
+                return []
+        if event.turn_id is not None:
+            if event.turn_id != owner_turn_id or (
+                event.turn_revision is not None
+                and owner_turn_revision is not None
+                and event.turn_revision != owner_turn_revision
+            ):
+                logger.debug(
+                    "Dropping token usage for non-active turn=%s rev=%s",
+                    event.turn_id,
+                    event.turn_revision,
+                )
+                return []
         st.response_usage.input_tokens += event.input_tokens
         st.response_usage.output_tokens += event.output_tokens
         logger.info(
@@ -944,11 +1334,9 @@ class RealtimeService:
         Emitted when generation failed (e.g. invalid out-of-band input, or the
         provider rejecting an empty context). A top-level ``error`` event carries
         the human-readable reason — ``response.done.status_details.error`` only
-        has code/type, no message — then ``finish_response`` closes the slot.
-
-        Idempotent: gated on an active response, and ``finish_response`` is itself
-        a no-op once the slot is closed, so a later EndOfResponse-driven close does
-        nothing.
+        has code/type, no message. The active slot stays owned until the matching
+        EndOfResponse reaches the audio queue; closing it here would promote a
+        successor that the failed response's later terminal sentinel could erase.
         """
         state = self._state(conn_id)
         private_barrier = state.runtime_config.transcript_barrier_private
@@ -958,10 +1346,55 @@ class RealtimeService:
         else:
             message = event.message
             logger.info("Response failed: %s", message)
-        if not state.in_response:
+        if (not state.in_response and not state.response_pending) or state.response_failure_pending:
             return []
-        events: list[ServerEvent] = [self.make_error(message, "response_failed")]
-        events.extend(self.response.finish_response(conn_id, status="failed"))
+        owner_turn_id = state.active_response_turn_id if state.in_response else state.pending_response_turn_id
+        owner_turn_revision = (
+            state.active_response_turn_revision if state.in_response else state.pending_response_turn_revision
+        )
+        owner_generation = (
+            state.active_response_cancel_generation
+            if state.in_response
+            else (
+                state.pending_response_request.cancel_generation if state.pending_response_request is not None else None
+            )
+        )
+        if event.cancel_generation is not None and event.cancel_generation != owner_generation:
+            logger.debug(
+                "Ignoring response failure for non-active generation=%s (owner=%s)",
+                event.cancel_generation,
+                owner_generation,
+            )
+            return []
+        if event.cancel_generation is None and self.cancel_scope is not None:
+            logger.debug("Ignoring uncorrelated response failure while generation tracking is active")
+            return []
+        if event.turn_id is not None:
+            if event.turn_id != owner_turn_id or (
+                event.turn_revision is not None
+                and owner_turn_revision is not None
+                and event.turn_revision != owner_turn_revision
+            ):
+                logger.debug(
+                    "Ignoring response failure for non-active turn=%s rev=%s",
+                    event.turn_id,
+                    event.turn_revision,
+                )
+                return []
+        created = not state.in_response
+        if created:
+            self.response._ensure_response(conn_id)
+        state.response_failure_pending = True
+        events: list[ServerEvent] = []
+        if created:
+            events.append(
+                ResponseCreatedEvent(
+                    type="response.created",
+                    event_id=self.response._next_event_id(),
+                    response=self.response._build_response(conn_id, "in_progress"),
+                )
+            )
+        events.append(self.make_error(message, "response_failed"))
         return events
 
     def get_usage(self) -> dict[str, Any]:

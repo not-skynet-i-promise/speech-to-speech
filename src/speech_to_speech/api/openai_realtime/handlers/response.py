@@ -4,6 +4,7 @@ import logging
 from typing import TYPE_CHECKING, Optional
 
 from openai.types.realtime import (
+    ConversationItem,
     RealtimeResponse,
     ResponseAudioDoneEvent,
     ResponseAudioTranscriptDoneEvent,
@@ -13,6 +14,10 @@ from openai.types.realtime import (
     ResponseFunctionCallArgumentsDoneEvent,
     ResponseTextDeltaEvent,
     ResponseTextDoneEvent,
+)
+from openai.types.realtime.conversation_item import (
+    RealtimeConversationItemFunctionCallOutput,
+    RealtimeConversationItemUserMessage,
 )
 from openai.types.realtime.realtime_response import Audio, AudioOutput
 from openai.types.realtime.realtime_response_status import RealtimeResponseStatus
@@ -39,14 +44,112 @@ class ResponseHandler(RealtimeBaseHandler):
         """Ensure a response and output item exist, creating them if needed."""
         st = self._state(conn_id)
         if st.current_response_id is None:
+            active_request = st.pending_response_request
+            successor = self.pop_next_deferred_request(conn_id)
             st.current_response_id = _generate_id("resp")
             self._start_item(conn_id)
             st.in_response = True
-        st.response_pending = False
+            st.active_response_turn_id = st.pending_response_turn_id
+            st.active_response_turn_revision = st.pending_response_turn_revision
+            st.active_response_cancel_generation = (
+                active_request.cancel_generation if active_request is not None else None
+            )
+            st.active_response_input_item_id = (
+                st.turn_input_item_ids.get(st.active_response_turn_id)
+                if st.active_response_turn_id is not None
+                else None
+            )
+            st.active_response_input_item_ids = (
+                {st.active_response_input_item_id} if st.active_response_input_item_id is not None else set()
+            )
+            if successor is None:
+                st.response_pending = False
+                st.pending_response_turn_id = None
+                st.pending_response_turn_revision = None
+                st.pending_response_request = None
+                st.pending_response_enqueued = False
+            else:
+                st.response_pending = True
+                st.pending_response_turn_id = successor.turn_id
+                st.pending_response_turn_revision = successor.turn_revision
+                st.pending_response_request = successor
+                st.pending_response_enqueued = False
         return st.current_response_id, self._current_item_id(conn_id)
+
+    def pop_next_deferred_request(self, conn_id: str) -> GenerateResponseRequest | None:
+        """Pop the next still-current distinct turn from the response FIFO."""
+        st = self._state(conn_id)
+        tracker = self._service.speculative_turns
+        while st.deferred_response_requests:
+            request = st.deferred_response_requests.pop(0)
+            if tracker is None or tracker.is_latest(request.turn_id, request.turn_revision):
+                return request
+        return None
+
+    def _release_request_leases(
+        self,
+        conn_id: str,
+        requests: list[GenerateResponseRequest],
+    ) -> None:
+        """Release chat-history leases owned by queued response requests."""
+
+        st = self._state(conn_id)
+        for request in requests:
+            for user_item_id in request.response_user_item_ids:
+                st.runtime_config.chat.release_response_turn(user_item_id, force=True)
+            st.runtime_config.chat.release_response_turn(request.response_user_item_id, force=True)
+
+    def clear_pending_requests(self, conn_id: str) -> None:
+        """Forget every queued response admission after cancellation/barge-in."""
+        st = self._state(conn_id)
+        pending_requests = [
+            request for request in (st.pending_response_request, *st.deferred_response_requests) if request is not None
+        ]
+        self._release_request_leases(conn_id, pending_requests)
+        st.response_pending = False
+        st.pending_response_turn_id = None
+        st.pending_response_turn_revision = None
+        st.pending_response_request = None
+        st.pending_response_enqueued = False
+        st.deferred_response_requests.clear()
+
+    def discard_turn(self, conn_id: str, turn_id: str) -> list[ServerEvent]:
+        """Discard one superseded speculative turn without stranding the FIFO."""
+
+        st = self._state(conn_id)
+        st.deferred_response_requests = [
+            request for request in st.deferred_response_requests if request.turn_id != turn_id
+        ]
+        active_matches = st.in_response and st.active_response_turn_id == turn_id
+        pending_matches = st.response_pending and st.pending_response_turn_id == turn_id
+        if not active_matches and not pending_matches:
+            return []
+        if self._service.cancel_scope is not None and (active_matches or not st.in_response):
+            self._service.cancel_scope.cancel()
+        if active_matches or not st.in_response:
+            return self.finish_response(
+                conn_id,
+                status="cancelled",
+                reason="client_cancelled",
+            )
+
+        # A different response is active and this turn only owns the held slot.
+        # Remove it without cancelling the active generation, then preserve FIFO
+        # by moving the next still-current turn into the held slot.
+        st.response_pending = False
+        st.pending_response_turn_id = None
+        st.pending_response_turn_revision = None
+        st.pending_response_request = None
+        st.pending_response_enqueued = False
+        successor = self.pop_next_deferred_request(conn_id)
+        if successor is not None:
+            self.resume_pending_request(conn_id, successor, enqueue=False)
+        return []
 
     def _end_response(self, conn_id: str, status: _ResponseStatus = "completed") -> None:
         st = self._state(conn_id)
+        st.last_closed_response_turn_id = st.active_response_turn_id
+        st.last_closed_response_cancel_generation = st.active_response_cancel_generation
         if status == "cancelled":
             st.response_usage.responses_cancelled += 1
         else:
@@ -69,6 +172,17 @@ class ResponseHandler(RealtimeBaseHandler):
         st.content_index = 0
         st.in_response = False
         st.response_pending = False
+        st.pending_response_turn_id = None
+        st.pending_response_turn_revision = None
+        st.pending_response_request = None
+        st.pending_response_enqueued = False
+        st.deferred_response_requests.clear()
+        st.active_response_turn_id = None
+        st.active_response_turn_revision = None
+        st.active_response_cancel_generation = None
+        st.active_response_input_item_id = None
+        st.active_response_input_item_ids.clear()
+        st.response_failure_pending = False
         st.current_response_params = None
         st.next_output_index = 0
         st.current_output_index = None
@@ -196,7 +310,7 @@ class ResponseHandler(RealtimeBaseHandler):
                     message="Only string tool_choice values are supported for now (auto, required, none).",
                     _type="tool_choice_not_supported",
                 )
-        if st.in_response or (st.response_pending and st.runtime_config.home_assistant_guard_operational):
+        if st.in_response or st.response_pending:
             return self.make_error(
                 message="Cannot create response while another response is in progress.",
                 _type="conversation_already_has_active_response",
@@ -208,22 +322,145 @@ class ResponseHandler(RealtimeBaseHandler):
         # they appear in history. Out-of-band: leave the default conversation untouched —
         # the input rides along on the request and seeds a throwaway chat in the LM.
         if not out_of_band and event.response and event.response.input:
+            input_items = list(event.response.input)
+            seen_ids = st.runtime_config.chat.live_item_ids()
+            seen_ids.update(st.protocol_item_ids)
+            seen_ids.update(item_id for item in st.deferred_items if (item_id := getattr(item, "id", None)) is not None)
+            for item in input_items:
+                item_id = getattr(item, "id", None)
+                if item_id is None:
+                    continue
+                if item_id in seen_ids:
+                    if st.runtime_config.home_assistant_guard_operational:
+                        return self._service.poison_home_assistant_guard(conn_id, "invalid_input_item")
+                    return self.make_client_content_error(
+                        conn_id,
+                        "Conversation item ID already exists.",
+                        "duplicate_item_id",
+                    )
+                seen_ids.add(item_id)
+            prospective_dependency_input_ids: set[str] = set()
+            for item in input_items:
+                if isinstance(item, RealtimeConversationItemUserMessage):
+                    if item.id is None:
+                        item.id = _generate_id("msg")
+                    prospective_dependency_input_ids.add(item.id)
+                elif isinstance(item, RealtimeConversationItemFunctionCallOutput):
+                    dependency_ids = st.runtime_config.chat.response_dependencies_for_call(item.call_id)
+                    mapped_input_ids = {
+                        input_id
+                        for input_id in st.protocol_item_ids
+                        if st.input_item_chat_ids.get(input_id, input_id) in dependency_ids
+                    }
+                    prospective_dependency_input_ids.update(mapped_input_ids or dependency_ids)
+            if not st.response_dependency_count_is_bounded(len(prospective_dependency_input_ids)):
+                if st.runtime_config.home_assistant_guard_operational:
+                    return self._service.poison_home_assistant_guard(conn_id, "invalid_input_item")
+                return self.make_client_content_error(
+                    conn_id,
+                    "Response input has too many retained user dependencies.",
+                    "invalid_input_item",
+                )
+            st.admitting_response_input_item_ids = set(prospective_dependency_input_ids)
+            accepted_dependency_input_ids: set[str] = set()
+            accepted_primary_input_id: str | None = None
+            accepted_item_ids: list[str] = []
+
+            def record_accepted_item(item: ConversationItem) -> None:
+                nonlocal accepted_primary_input_id
+                if item.id is None:
+                    return
+                st.retire_reused_audio_item_id(item.id)
+                st.record_protocol_item(item.id)
+                accepted_item_ids.append(item.id)
+                if isinstance(item, RealtimeConversationItemUserMessage):
+                    st.runtime_config.chat.mark_user_message_deletable(item.id)
+                    accepted_dependency_input_ids.add(item.id)
+                    accepted_primary_input_id = item.id
+                elif isinstance(item, RealtimeConversationItemFunctionCallOutput):
+                    owner_id = st.runtime_config.chat.response_owner_for_item(item.id)
+                    if owner_id is None:
+                        return
+                    dependency_ids = st.runtime_config.chat.response_dependencies_for_item(item.id) or {owner_id}
+                    mapped_input_ids = {
+                        input_id
+                        for input_id in st.protocol_item_ids
+                        if st.input_item_chat_ids.get(input_id, input_id) in dependency_ids
+                    }
+                    accepted_dependency_input_ids.update(mapped_input_ids or dependency_ids)
+                    primary_input_ids = [
+                        input_id
+                        for input_id in st.protocol_item_ids
+                        if st.input_item_chat_ids.get(input_id, input_id) == owner_id
+                    ]
+                    accepted_primary_input_id = primary_input_ids[-1] if primary_input_ids else owner_id
+
+            def resolve_primary_input_id() -> str | None:
+                """Resolve writeback order from canonical chat order, not batch order."""
+
+                dependency_chat_ids = {
+                    st.input_item_chat_ids.get(input_id, input_id) for input_id in accepted_dependency_input_ids
+                }
+                primary_chat_id = st.runtime_config.chat.latest_user_message_id(dependency_chat_ids)
+                if primary_chat_id is None:
+                    return accepted_primary_input_id
+                protocol_candidates = [
+                    input_id
+                    for input_id in st.protocol_item_ids
+                    if st.input_item_chat_ids.get(input_id, input_id) == primary_chat_id
+                ]
+                return protocol_candidates[-1] if protocol_candidates else primary_chat_id
+
             try:
                 if st.runtime_config.sensitive_content:
-                    add_supported_items_atomically(st.runtime_config.chat, list(event.response.input))
+                    add_supported_items_atomically(st.runtime_config.chat, input_items)
+                    for item in input_items:
+                        record_accepted_item(item)
                 else:
                     # Preserve the default Realtime behavior: accepted prefix items
                     # remain in ordinary history if a later item is rejected. Private
                     # sessions need the stronger all-or-nothing retention boundary.
-                    for item in event.response.input:
+                    for item in input_items:
                         add_supported_item(st.runtime_config.chat, item)
+                        record_accepted_item(item)
             except ChatItemError as exc:
+                if accepted_item_ids:
+                    st.response_context_input_item_id = resolve_primary_input_id()
+                    st.response_context_input_item_ids = set(accepted_dependency_input_ids)
+                    st.response_context_turn_id = None
+                    st.response_context_turn_revision = None
+                    st.response_context_speech_stopped_at_s = None
                 if st.runtime_config.home_assistant_guard_operational:
                     return self._service.poison_home_assistant_guard(conn_id, "invalid_input_item")
                 return self.make_client_content_error(conn_id, str(exc), "invalid_input_item")
+            finally:
+                st.admitting_response_input_item_ids.clear()
+            # response.input is newer context than any prior audio turn. Track
+            # every accepted user dependency because deletion of any one
+            # invalidates the response that serialized the batch. Tool outputs
+            # inherit the complete dependency set of their originating call.
+            st.response_context_input_item_id = resolve_primary_input_id()
+            st.response_context_input_item_ids = set(accepted_dependency_input_ids)
+            st.response_context_turn_id = None
+            st.response_context_turn_revision = None
+            st.response_context_speech_stopped_at_s = None
 
         st.in_response = True
         st.response_pending = False
+        st.pending_response_turn_id = None
+        st.pending_response_turn_revision = None
+        st.pending_response_request = None
+        st.pending_response_enqueued = False
+        st.deferred_response_requests.clear()
+        active_generation = self._service.cancel_scope.generation if self._service.cancel_scope else None
+        st.active_response_turn_id = None if out_of_band else st.response_context_turn_id
+        st.active_response_turn_revision = None if out_of_band else st.response_context_turn_revision
+        st.active_response_cancel_generation = active_generation
+        st.active_response_input_item_id = None if out_of_band else st.response_context_input_item_id
+        st.active_response_input_item_ids = set() if out_of_band else set(st.response_context_input_item_ids)
+        if not out_of_band:
+            for input_item_id in st.active_response_input_item_ids:
+                st.runtime_config.chat.protect_response_turn(st.input_item_chat_ids.get(input_item_id, input_item_id))
 
         st.current_response_params = event.response
         st.current_response_id = _generate_id("resp")
@@ -238,11 +475,33 @@ class ResponseHandler(RealtimeBaseHandler):
             queue.put(
                 GenerateResponseRequest(
                     runtime_config=cfg,
+                    chat_snapshot=cfg.chat.copy(),
+                    response_user_item_id=(
+                        st.input_item_chat_ids.get(
+                            st.response_context_input_item_id,
+                            st.response_context_input_item_id,
+                        )
+                        if not out_of_band and st.response_context_input_item_id is not None
+                        else None
+                    ),
+                    response_user_item_ids=(
+                        {
+                            st.input_item_chat_ids.get(input_id, input_id)
+                            for input_id in st.response_context_input_item_ids
+                        }
+                        if not out_of_band
+                        else set()
+                    ),
+                    admitted_protocol_item_ids={
+                        *st.protocol_item_ids,
+                        *(item.id for item in st.deferred_items if item.id is not None),
+                    },
+                    admitted_protocol_sequence=st.next_protocol_item_sequence,
                     response=event.response,
-                    turn_id=None if out_of_band else st.speculative_user_turn_id,
-                    turn_revision=None if out_of_band else st.speculative_user_turn_revision,
-                    speech_stopped_at_s=None if out_of_band else st.speculative_user_speech_stopped_at_s,
-                    cancel_generation=(self._service.cancel_scope.generation if self._service.cancel_scope else None),
+                    turn_id=None if out_of_band else st.response_context_turn_id,
+                    turn_revision=None if out_of_band else st.response_context_turn_revision,
+                    speech_stopped_at_s=None if out_of_band else st.response_context_speech_stopped_at_s,
+                    cancel_generation=active_generation,
                 )
             )
         logger.debug("response.create received, LLM generation triggered")
@@ -254,7 +513,12 @@ class ResponseHandler(RealtimeBaseHandler):
 
     def handle_response_cancel(self, conn_id: str) -> list[ServerEvent]:
         """Cancel the in-progress response and re-enable listening."""
-        events = self.finish_response(conn_id, status="cancelled", reason="client_cancelled")
+        events = self.finish_response(
+            conn_id,
+            status="cancelled",
+            reason="client_cancelled",
+            preserve_pending=False,
+        )
         should_listen = self._should_listen(conn_id)
         if should_listen:
             should_listen.set()
@@ -266,6 +530,9 @@ class ResponseHandler(RealtimeBaseHandler):
         conn_id: str,
         status: _ResponseStatus = "completed",
         reason: _StatusReason | None = None,
+        *,
+        preserve_pending: bool = True,
+        enqueue_pending: bool = True,
     ) -> list[ServerEvent]:
         """Close the current response (audio/text done + response done).
 
@@ -276,8 +543,37 @@ class ResponseHandler(RealtimeBaseHandler):
         with ``response.done``.
         """
         st = self._state(conn_id)
+        if status == "completed" and st.response_failure_pending:
+            status = "failed"
+        if not preserve_pending:
+            if st.in_response:
+                self.clear_pending_requests(conn_id)
+            elif st.response_pending and st.deferred_response_requests:
+                self._release_request_leases(conn_id, st.deferred_response_requests)
+                st.deferred_response_requests.clear()
+        deferred_requests: list[GenerateResponseRequest] = []
+        if preserve_pending:
+            if st.in_response:
+                if st.pending_response_request is not None:
+                    deferred_requests.append(st.pending_response_request)
+                deferred_requests.extend(st.deferred_response_requests)
+            elif st.response_pending:
+                deferred_requests.extend(st.deferred_response_requests)
         events: list[ServerEvent] = []
+        if not st.in_response and st.response_pending:
+            self._ensure_response(conn_id)
+            events.append(
+                ResponseCreatedEvent(
+                    type="response.created",
+                    event_id=self._next_event_id(),
+                    response=self._build_response(conn_id, "in_progress"),
+                )
+            )
         if st.in_response:
+            active_response_user_ids = {
+                st.input_item_chat_ids.get(input_item_id, input_item_id)
+                for input_item_id in st.active_response_input_item_ids
+            }
             resp_id, item_id = self._ensure_response(conn_id)
             if response_wants_audio(st.current_response_params) and st.audio_output_started:
                 events.append(
@@ -311,8 +607,18 @@ class ResponseHandler(RealtimeBaseHandler):
                 )
             )
             self._end_response(conn_id, status)
+            for active_response_user_id in active_response_user_ids:
+                st.runtime_config.chat.release_response_turn(
+                    active_response_user_id,
+                    force=status != "completed",
+                )
         elif st.response_pending:
-            st.response_pending = False
+            self.clear_pending_requests(conn_id)
+        if deferred_requests:
+            # Keep every accepted successor visible to protocol-index retirement
+            # while client items deferred behind the closing response are flushed.
+            # The list is consumed in place by the promotion loop below.
+            st.deferred_response_requests = deferred_requests
         # Apply any client items that arrived mid-generation now that in_response
         # is cleared and the generation's own write-back has landed. Done outside
         # the in_response guard so a stray terminal call still drains the buffer.
@@ -327,7 +633,93 @@ class ResponseHandler(RealtimeBaseHandler):
             # serialized against its response lease, so do not wait here.
             if not cfg.private_protocol_failed:
                 events.extend(self._service.conversation.flush_deferred_items(conn_id))
+        if cfg.private_protocol_failed:
+            self._release_request_leases(conn_id, deferred_requests)
+            st.deferred_response_requests.clear()
+        else:
+            tracker = self._service.speculative_turns
+            while deferred_requests:
+                deferred_request = deferred_requests.pop(0)
+                if tracker is not None and not tracker.is_latest(
+                    deferred_request.turn_id,
+                    deferred_request.turn_revision,
+                ):
+                    self._release_request_leases(conn_id, [deferred_request])
+                    continue
+                st.deferred_response_requests = deferred_requests
+                self.resume_pending_request(conn_id, deferred_request, enqueue=enqueue_pending)
+                break
         return events
+
+    def resume_pending_request(
+        self,
+        conn_id: str,
+        request: GenerateResponseRequest,
+        *,
+        enqueue: bool = True,
+    ) -> None:
+        """Re-admit one held successor after its preceding response closes."""
+        st = self._state(conn_id)
+        generation = self._service.cancel_scope.generation if self._service.cancel_scope else None
+        target_input_id = st.turn_input_item_ids.get(request.turn_id) if request.turn_id is not None else None
+        target_chat_id = st.input_item_chat_ids.get(target_input_id) if target_input_id is not None else None
+        later_chat_ids: set[str] = set()
+        for later_request in st.deferred_response_requests:
+            if later_request.turn_id is None:
+                continue
+            later_input_id = st.turn_input_item_ids.get(later_request.turn_id)
+            if later_input_id is None:
+                continue
+            later_chat_id = st.input_item_chat_ids.get(later_input_id)
+            if later_chat_id is not None:
+                later_chat_ids.add(later_chat_id)
+        if request.admitted_protocol_sequence is not None:
+            future_protocol_ids = {
+                item_id
+                for item_id in st.protocol_item_ids
+                if st.protocol_item_sequences.get(item_id, 0) > request.admitted_protocol_sequence
+            }
+        else:
+            future_protocol_ids = (
+                set(st.protocol_item_ids) - request.admitted_protocol_item_ids
+                if request.admitted_protocol_item_ids is not None
+                else set()
+            )
+        future_chat_ids = {st.input_item_chat_ids.get(item_id, item_id) for item_id in future_protocol_ids}
+        refreshed_chat = (
+            st.runtime_config.chat.snapshot_for_response_turn(
+                target_chat_id,
+                later_chat_ids,
+                fallback_user=(
+                    request.chat_snapshot.user_message(target_chat_id) if request.chat_snapshot is not None else None
+                ),
+                fallback_init_message=(
+                    request.chat_snapshot.init_chat_message if request.chat_snapshot is not None else None
+                ),
+                excluded_item_ids=future_chat_ids,
+            )
+            if target_chat_id is not None
+            else request.chat_snapshot
+        )
+        request = request.model_copy(update={"cancel_generation": generation, "chat_snapshot": refreshed_chat})
+        st.response_pending = True
+        st.pending_response_turn_id = request.turn_id
+        st.pending_response_turn_revision = request.turn_revision
+        st.pending_response_request = request
+        st.pending_response_enqueued = False
+        if enqueue:
+            self.enqueue_pending_request(conn_id)
+
+    def enqueue_pending_request(self, conn_id: str) -> None:
+        """Release a held successor exactly once after cancelled output is flushed."""
+        st = self._state(conn_id)
+        request = st.pending_response_request
+        if not st.response_pending or request is None or st.pending_response_enqueued:
+            return
+        queue = self._queue(conn_id)
+        if queue is not None:
+            queue.put(request)
+            st.pending_response_enqueued = True
 
     # ── Pipeline event handlers ───────────────────
 
@@ -356,16 +748,54 @@ class ResponseHandler(RealtimeBaseHandler):
             if not commit_result:
                 logger.debug("Dropping stale assistant text for turn=%s rev=%s", event.turn_id, event.turn_revision)
                 return []
+        st = self._state(conn_id)
+        if st.in_response:
+            owner_turn_id = st.active_response_turn_id
+            owner_generation = st.active_response_cancel_generation
+        elif st.response_pending and st.pending_response_request is not None:
+            owner_turn_id = st.pending_response_turn_id
+            owner_generation = st.pending_response_request.cancel_generation
+        else:
+            owner_turn_id = None
+            owner_generation = None
+        if not st.in_response and not st.response_pending:
+            closed_owner = (
+                event.turn_id == st.last_closed_response_turn_id
+                if event.turn_id is not None
+                else (
+                    event.cancel_generation is not None
+                    and event.cancel_generation == st.last_closed_response_cancel_generation
+                )
+            )
+            if closed_owner:
+                logger.debug("Dropping assistant output after its response slot closed")
+                return []
+        if event.turn_id is not None and owner_turn_id is not None and event.turn_id != owner_turn_id:
+            logger.debug(
+                "Dropping assistant output for non-active turn=%s (owner=%s)",
+                event.turn_id,
+                owner_turn_id,
+            )
+            return []
+        if (
+            event.cancel_generation is not None
+            and owner_generation is not None
+            and event.cancel_generation != owner_generation
+        ):
+            logger.debug(
+                "Dropping assistant output for non-active generation=%s (owner=%s)",
+                event.cancel_generation,
+                owner_generation,
+            )
+            return []
         if not any(
             isinstance(part, AssistantToolCallPart) or (isinstance(part, AssistantTextPart) and bool(part.text))
             for part in event.parts
         ):
             return []
-        st = self._state(conn_id)
         events: list[ServerEvent] = []
         need_created = st.current_response_id is None
-        resp_id, initial_item_id = self._ensure_response(conn_id)
-        last_item_id = initial_item_id
+        resp_id, _ = self._ensure_response(conn_id)
         if need_created:
             events.append(
                 ResponseCreatedEvent(
@@ -426,6 +856,5 @@ class ResponseHandler(RealtimeBaseHandler):
                         response_id=resp_id,
                     )
                 )
-            last_item_id = item_id
-        st.last_item_id = last_item_id
+            st.record_protocol_item(item_id)
         return events

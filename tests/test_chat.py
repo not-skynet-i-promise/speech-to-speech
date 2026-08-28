@@ -120,6 +120,7 @@ class TestChatInit:
         assert chat.buffer == []
         assert chat.init_chat_message is None
         assert chat._pending_tool_calls == {}
+        assert chat._pending_tool_call_anchors == {}
         assert chat._user_turn_count == 0
 
     def test_size_stored(self):
@@ -372,6 +373,188 @@ class TestAppendToolOutput:
 
 
 class TestAddItem:
+    def test_response_writeback_stays_before_later_queued_users(self):
+        chat = Chat(size=5)
+        first = chat.add_item(_user("first"))
+        chat.add_item(_user("second"))
+        chat.add_item(_user("third"))
+
+        chat.add_response_item(_assistant("first answer"), after_user_id=first.id)
+
+        assert [(item.role, item.content[0].text) for item in chat.buffer] == [
+            ("user", "first"),
+            ("assistant", "first answer"),
+            ("user", "second"),
+            ("user", "third"),
+        ]
+
+    def test_anchored_tool_pair_stays_inside_its_response_turn(self):
+        chat = Chat(size=5)
+        first = chat.add_item(_user("first"))
+        chat.add_item(_user("second"))
+
+        chat.add_response_item(_fc("anchored"), after_user_id=first.id)
+        chat.add_item(_fco("anchored", "result"))
+
+        assert [type(item) for item in chat.buffer] == [
+            RealtimeConversationItemUserMessage,
+            RealtimeConversationItemFunctionCall,
+            RealtimeConversationItemFunctionCallOutput,
+            RealtimeConversationItemUserMessage,
+        ]
+
+    def test_multi_input_response_leases_survive_until_shared_tool_result(self):
+        chat = Chat(size=5)
+        first = chat.add_item(_user("first dependency"))
+        second = chat.add_item(_user("second dependency"))
+        assert first.id is not None and second.id is not None
+        chat.protect_response_turn(first.id)
+        chat.protect_response_turn(second.id)
+        chat.add_response_item(
+            _fc("shared_lease"),
+            after_user_id=second.id,
+            owner_user_ids={first.id, second.id},
+        )
+
+        chat.release_response_turn(first.id)
+        chat.release_response_turn(second.id)
+        assert {first.id, second.id} <= chat._protected_response_user_ids
+
+        chat.add_item(_fco("shared_lease", "resolved"))
+        assert first.id not in chat._protected_response_user_ids
+        assert second.id not in chat._protected_response_user_ids
+
+    def test_response_writeback_drops_when_exact_user_left_history(self):
+        chat = Chat(size=5)
+        user = chat.add_item(_user("delete me"))
+        assert user.id is not None
+        assert chat.remove_user_message(user.id)
+
+        assert chat.add_response_item(_assistant("orphan"), after_user_id=user.id) is None
+        assert chat.buffer == []
+
+    def test_anchored_tool_output_is_rejected_after_owning_user_deletion(self):
+        chat = Chat(size=5)
+        user = chat.add_item(_user("delete me"))
+        assert user.id is not None
+        chat.add_response_item(_fc("orphan"), after_user_id=user.id)
+        assert chat.remove_user_message(user.id)
+
+        with pytest.raises(ChatItemError, match="No function_call"):
+            chat.add_item(_fco("orphan", "must not survive"))
+        assert chat.buffer == []
+
+    def test_user_deletion_removes_already_committed_owned_response_items(self):
+        chat = Chat(size=5)
+        user = chat.add_item(_user("rejected self echo"))
+        assert user.id is not None
+        chat.add_response_item(_assistant("derived answer"), after_user_id=user.id)
+        chat.add_response_item(_fc("derived"), after_user_id=user.id)
+        chat.add_item(_fco("derived", "derived result"))
+        chat.add_item(_user("later valid turn"))
+
+        assert chat.remove_user_message(user.id)
+
+        assert [(item.role, item.content[0].text) for item in chat.buffer] == [("user", "later valid turn")]
+        assert chat._pending_tool_calls == {}
+        assert chat._pending_tool_call_anchors == {}
+        assert chat._response_item_owners == {}
+
+    def test_deleting_any_serialized_user_removes_multi_input_response_output(self):
+        chat = Chat(size=5)
+        first = chat.add_item(_user("first input"))
+        second = chat.add_item(_user("second input"))
+        assert first.id is not None and second.id is not None
+        dependencies = {first.id, second.id}
+        chat.add_response_item(
+            _assistant("combined answer"),
+            after_user_id=second.id,
+            owner_user_ids=dependencies,
+        )
+        chat.add_response_item(
+            _fc("combined"),
+            after_user_id=second.id,
+            owner_user_ids=dependencies,
+        )
+        chat.add_item(_fco("combined", "combined result"))
+
+        assert chat.remove_user_message(first.id)
+
+        texts = [
+            part.text for item in chat.buffer for part in getattr(item, "content", []) if getattr(part, "text", None)
+        ]
+        assert texts == ["second input"]
+        assert chat._pending_tool_calls == {}
+        assert chat._pending_tool_call_anchors == {}
+        assert chat._pending_tool_call_dependencies == {}
+        assert chat._response_item_owners == {}
+        assert chat._response_item_dependencies == {}
+
+    def test_hard_eviction_preserves_a_restored_turn_through_its_tool_round_trip(self):
+        chat = Chat(size=1)
+        target = chat.add_item(_user("exact queued tool request"))
+        assert target.id is not None
+        chat.mark_user_message_deletable(target.id)
+        admission = chat.copy()
+        later_ids = set()
+        for text in ("later one", "later two"):
+            later = chat.add_item(_user(text))
+            assert later.id is not None
+            later_ids.add(later.id)
+        assert chat.user_message(target.id) is None
+
+        chat.snapshot_for_response_turn(
+            target.id,
+            later_ids,
+            fallback_user=admission.user_message(target.id),
+        )
+        chat.add_response_item(_fc("restored"), after_user_id=target.id)
+        chat.trim_if_needed()
+        chat.add_item(_fco("restored", "tool result"))
+
+        assert chat.user_message(target.id) is not None
+        assert [type(item) for item in chat.buffer] == [
+            RealtimeConversationItemUserMessage,
+            RealtimeConversationItemFunctionCall,
+            RealtimeConversationItemFunctionCallOutput,
+        ]
+
+        newest = chat.add_item(_user("newest user after tool completion"))
+        assert newest.id is not None
+        chat.trim_if_needed()
+        assert chat.user_message(newest.id) is not None
+        assert chat.user_message(target.id) is None
+
+    def test_outstanding_promoted_tool_turns_are_bounded_before_new_admission(self):
+        chat = Chat(size=1)
+        first = chat.add_item(_user("first promoted tool turn"))
+        assert first.id is not None
+        chat.snapshot_for_response_turn(first.id, set())
+        chat.add_response_item(_fc("first"), after_user_id=first.id)
+        chat.release_response_turn(first.id)
+        assert "call_first" in chat._pending_tool_calls
+
+        second = chat.add_item(_user("second promoted tool turn"))
+        assert second.id is not None
+        chat.snapshot_for_response_turn(second.id, set())
+        chat.add_response_item(_fc("second"), after_user_id=second.id)
+        chat.release_response_turn(second.id)
+
+        # Protecting the second target retires the oldest unresolved tool
+        # ownership. The next admission therefore evicts the old turn, never
+        # the user that was just accepted at the hard-cap boundary.
+        newest = chat.add_item(_user("newly admitted user"))
+        assert newest.id is not None
+        assert chat.user_message(newest.id) is not None
+        assert chat.user_message(second.id) is not None
+        assert chat.user_message(first.id) is None
+        assert "call_first" not in chat._pending_tool_calls
+        assert "call_second" in chat._pending_tool_calls
+        assert "fc_call_first" not in chat._response_item_owners
+        assert "fc_call_first" not in chat._response_item_dependencies
+        with pytest.raises(ChatItemError, match="call_first"):
+            chat.add_item(_fco("first", "late result"))
+
     # -- System message --
 
     def test_system_message_routed_to_init_chat(self):
@@ -792,9 +975,11 @@ class TestCopyAndReset:
 
     def test_copy_preserves_pending_tool_calls_independently(self):
         chat = Chat(size=5)
-        chat.add_item(_fc("c1"))
+        user = chat.add_item(_user("anchor"))
+        chat.add_response_item(_fc("c1"), after_user_id=user.id)
         clone = chat.copy()
         assert "call_c1" in clone._pending_tool_calls
+        assert clone._pending_tool_call_anchors == {"call_c1": user.id}
         clone._pending_tool_calls.pop("call_c1")
         assert "call_c1" in chat._pending_tool_calls
 
@@ -824,6 +1009,7 @@ class TestCopyAndReset:
         assert chat.buffer == []
         assert chat.init_chat_message is None
         assert chat._pending_tool_calls == {}
+        assert chat._pending_tool_call_anchors == {}
         assert chat._user_turn_count == 0
 
     def test_reset_preserves_size(self):
@@ -1031,6 +1217,29 @@ class TestCompaction:
         assert fco_indices[0] == fc_indices[0] + 1
         assert "call_c1" not in chat._pending_tool_calls
 
+    def test_compaction_restores_anchored_user_before_delayed_tool_output(self):
+        chat = Chat(size=2)
+        compactor = _make_stub_compactor()
+        owner = chat.add_item(_user("anchored delayed tool owner"))
+        assert owner.id is not None
+        chat.mark_user_message_deletable(owner.id)
+        chat.add_response_item(_fc("anchored"), after_user_id=owner.id)
+        chat.release_response_turn(owner.id)
+        for index in range(1, 4):
+            chat.add_item(_user(f"u{index}"))
+            chat.add_item(_assistant(f"a{index}"))
+
+        chat.trim_if_needed(compactor)
+        _wait_thread(chat)
+        assert chat.user_message(owner.id) is None
+
+        chat.add_item(_fco("anchored", "delayed result"))
+
+        assert chat.user_message(owner.id) is not None
+        owner_index = next(index for index, item in enumerate(chat.buffer) if item.id == owner.id)
+        assert isinstance(chat.buffer[owner_index + 1], RealtimeConversationItemFunctionCall)
+        assert isinstance(chat.buffer[owner_index + 2], RealtimeConversationItemFunctionCallOutput)
+
     def test_compaction_preserves_appends_during_compaction(self):
         chat = Chat(size=2)
         gate = threading.Event()
@@ -1210,6 +1419,249 @@ class TestCompaction:
 
         assert chat.buffer == before
         assert chat._shutdown.is_set() is False
+
+    def test_user_deletion_invalidates_an_inflight_compaction_snapshot(self):
+        chat = Chat(size=2)
+        gate = threading.Event()
+        started = threading.Event()
+
+        def compactor(_snapshot):
+            started.set()
+            assert gate.wait(timeout=2.0)
+            return CompactionResult(
+                user_summary="summary containing deleted content",
+                assistant_summary="summary",
+            )
+
+        for index in range(3):
+            item = _user(f"user {index}")
+            item.id = f"msg_{index}"
+            chat.add_item(item)
+            chat.add_item(_assistant(f"assistant {index}"))
+        chat.add_item(_user("latest"))
+        chat.trim_if_needed(compactor)
+        assert started.wait(timeout=2.0)
+
+        assert chat.remove_user_message("msg_0")
+        gate.set()
+        _wait_thread(chat)
+
+        assert all(
+            getattr(part, "text", None) != "summary containing deleted content"
+            for item in chat.buffer
+            for part in getattr(item, "content", [])
+        )
+
+    def test_marker_only_deletion_invalidates_snapshot_after_hard_eviction(self):
+        chat = Chat(size=2)
+        gate = threading.Event()
+        started = threading.Event()
+
+        def compactor(_snapshot):
+            started.set()
+            assert gate.wait(timeout=2.0)
+            return CompactionResult(
+                user_summary="summary containing hard-evicted deleted content",
+                assistant_summary="summary",
+            )
+
+        first = _user("delete after hard eviction")
+        first.id = "msg_hard_evicted"
+        for index, user in enumerate((first, _user("one"), _user("two"))):
+            chat.add_item(user)
+            chat.mark_user_message_deletable(user.id)
+            chat.add_item(_assistant(f"assistant {index}"))
+        chat.trim_if_needed(compactor)
+        assert started.wait(timeout=2.0)
+
+        for index in range(3, 5):
+            chat.add_item(_user(f"user {index}"))
+            chat.add_item(_assistant(f"assistant {index}"))
+        assert all(item.id != first.id for item in chat.buffer)
+
+        assert chat.remove_user_message(first.id)
+        gate.set()
+        _wait_thread(chat)
+
+        assert all(
+            getattr(part, "text", None) != "summary containing hard-evicted deleted content"
+            for item in chat.buffer
+            for part in getattr(item, "content", [])
+        )
+
+    def test_queued_response_snapshot_restores_exact_user_after_hard_eviction(self):
+        chat = Chat(size=1)
+        target = chat.add_item(make_user_message("exact queued request"))
+        assert target.id is not None
+        chat.mark_user_message_deletable(target.id)
+        admission = chat.copy()
+        later_ids = set()
+        for text in ("later one", "later two"):
+            later = chat.add_item(make_user_message(text))
+            assert later.id is not None
+            later_ids.add(later.id)
+
+        assert chat.user_message(target.id) is None
+
+        snapshot = chat.snapshot_for_response_turn(
+            target.id,
+            later_ids,
+            fallback_user=admission.user_message(target.id),
+        )
+
+        assert chat.user_message(target.id) is not None
+        assert [item.content[0].text for item in snapshot.buffer if item.role == "user"] == ["exact queued request"]
+
+    def test_queued_response_snapshot_excludes_both_sides_of_future_tool_result(self):
+        chat = Chat(size=10)
+        owner = chat.add_item(_user("older tool owner"))
+        target = chat.add_item(_user("queued target"))
+        assert owner.id is not None and target.id is not None
+        function_call = chat.add_response_item(_fc("future_pair"), after_user_id=owner.id)
+        assert isinstance(function_call, RealtimeConversationItemFunctionCall)
+        output = _fco("future_pair", "future result")
+        chat.add_item(output)
+        assert output.id is not None
+
+        snapshot = chat.snapshot_for_response_turn(
+            target.id,
+            set(),
+            excluded_item_ids={output.id},
+        )
+
+        assert not any(
+            isinstance(item, (RealtimeConversationItemFunctionCall, RealtimeConversationItemFunctionCallOutput))
+            and item.call_id == "call_future_pair"
+            for item in snapshot.buffer
+        )
+
+    def test_completed_compaction_can_restore_and_delete_one_exact_user(self):
+        chat = Chat(size=2)
+        users = []
+        for index in range(3):
+            user = chat.add_item(make_user_message(f"user-{index}"))
+            assert user.id is not None
+            chat.mark_user_message_deletable(user.id)
+            users.append(user)
+            chat.add_item(make_assistant_message(f"assistant-{index}"))
+
+        chat.trim_if_needed(_make_stub_compactor("summary-user", "summary-assistant"))
+        _wait_thread(chat)
+        assert any(
+            getattr(part, "text", None) == "summary-user"
+            for item in chat.buffer
+            for part in getattr(item, "content", [])
+        )
+
+        assert chat.remove_user_message(users[0].id)
+
+        texts = [
+            part.text for item in chat.buffer for part in getattr(item, "content", []) if getattr(part, "text", None)
+        ]
+        assert "user-0" not in texts
+        assert "assistant-0" in texts
+        assert "user-1" in texts
+        assert "assistant-1" in texts
+        assert "user-2" in texts
+        assert "summary-user" not in texts
+
+    def test_compacted_deletion_removes_owned_response_output(self):
+        chat = Chat(size=2)
+        users = []
+        for index in range(3):
+            user = chat.add_item(make_user_message(f"user-{index}"))
+            assert user.id is not None
+            chat.mark_user_message_deletable(user.id)
+            users.append(user)
+            chat.add_response_item(make_assistant_message(f"assistant-{index}"), after_user_id=user.id)
+
+        chat.trim_if_needed(_make_stub_compactor("summary-user", "summary-assistant"))
+        _wait_thread(chat)
+
+        assert chat.remove_user_message(users[0].id)
+
+        texts = [
+            part.text for item in chat.buffer for part in getattr(item, "content", []) if getattr(part, "text", None)
+        ]
+        assert "user-0" not in texts
+        assert "assistant-0" not in texts
+        assert "user-1" in texts
+        assert "assistant-1" in texts
+
+    def test_nested_compaction_delete_reapplies_chat_bound_before_next_snapshot(self):
+        chat = Chat(size=2)
+        user_ids = []
+        for index in range(20):
+            user = chat.add_item(make_user_message(f"user-{index}"))
+            assert user.id is not None
+            user_ids.append(user.id)
+            chat.mark_user_message_deletable(user.id)
+            chat.add_item(make_assistant_message(f"assistant-{index}"))
+            chat.trim_if_needed(_make_stub_compactor())
+            _wait_thread(chat)
+
+        assert chat._user_turn_count <= chat.size
+        assert chat.remove_user_message(user_ids[0])
+
+        assert chat._user_turn_count <= chat.size
+        assert sum(isinstance(item, RealtimeConversationItemUserMessage) for item in chat.buffer) <= chat.size
+        assert not any(
+            getattr(part, "text", None) == "user-0" for item in chat.buffer for part in getattr(item, "content", [])
+        )
+        # A sibling evicted while reapplying the bound remains exactly
+        # deletable through the retained protocol marker.
+        assert chat.remove_user_message(user_ids[1])
+
+    def test_failed_atomic_batch_restores_compaction_provenance_after_hard_eviction(self):
+        chat = Chat(size=2)
+        users = []
+        for index in range(3):
+            user = chat.add_item(make_user_message(f"user-{index}"))
+            assert user.id is not None
+            chat.mark_user_message_deletable(user.id)
+            users.append(user)
+            chat.add_item(make_assistant_message(f"assistant-{index}"))
+        chat.trim_if_needed(_make_stub_compactor("summary-user", "summary-assistant"))
+        _wait_thread(chat)
+        provenance_before = dict(chat._compaction_nodes)
+        assert provenance_before
+
+        with pytest.raises(ChatItemError):
+            chat.add_items_atomically(
+                [
+                    make_user_message("hard-cap trigger 1"),
+                    make_user_message("hard-cap trigger 2"),
+                    make_user_message("hard-cap trigger 3"),
+                    make_user_message(""),
+                ]
+            )
+
+        assert chat._compaction_nodes == provenance_before
+        assert chat.remove_user_message(users[0].id)
+        texts = [
+            part.text for item in chat.buffer for part in getattr(item, "content", []) if getattr(part, "text", None)
+        ]
+        assert "summary-user" not in texts
+        assert "user-0" not in texts
+        assert "assistant-0" in texts
+
+    def test_retiring_all_ids_releases_completed_compaction_provenance(self):
+        chat = Chat(size=2)
+        users = []
+        for index in range(3):
+            user = chat.add_item(make_user_message(f"user-{index}"))
+            assert user.id is not None
+            chat.mark_user_message_deletable(user.id)
+            users.append(user)
+            chat.add_item(make_assistant_message(f"assistant-{index}"))
+        chat.trim_if_needed(_make_stub_compactor())
+        _wait_thread(chat)
+        assert chat._compaction_nodes
+
+        chat.retire_user_message_deletable(users[0].id)
+        chat.retire_user_message_deletable(users[1].id)
+
+        assert chat._compaction_nodes == {}
 
     def test_suspended_compaction_stays_frozen_until_explicit_resume(self):
         chat = Chat(size=2)

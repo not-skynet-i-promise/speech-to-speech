@@ -4,6 +4,7 @@ import json
 import logging
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, Literal, Union
 
 from openai.types.realtime import ConversationItem
@@ -71,6 +72,21 @@ SupportedItem = Union[
 ]
 
 
+@dataclass
+class _CompactionNode:
+    """Reversible provenance for one summary pair.
+
+    Nodes nest instead of flattening older summaries. Once all protocol-visible
+    user IDs below a child retire, that child can collapse back to its two-item
+    summary and release the original content it no longer needs to delete.
+    """
+
+    user_summary: RealtimeConversationItemUserMessage
+    assistant_summary: RealtimeConversationItemAssistantMessage
+    originals: list[SupportedItem | "_CompactionNode"]
+    deletable_user_ids: set[str]
+
+
 CompactFn = Callable[[ResponseInputParam], CompactionResult]
 
 
@@ -100,7 +116,20 @@ class Chat:
         # is evicted -- or, with a compactor, summarized in the background.
         self.buffer: list[SupportedItem] = []
         self._pending_tool_calls: dict[str, RealtimeConversationItemFunctionCall] = {}
+        self._pending_tool_call_anchors: dict[str, str] = {}
+        self._pending_tool_call_dependencies: dict[str, set[str]] = {}
+        # Canonical response items are owned by the exact user item that
+        # produced them. Deleting that user must also remove already-committed
+        # assistant/tool content so rejected self-echoes cannot survive in a
+        # later provider snapshot.
+        self._response_item_owners: dict[str, str] = {}
+        self._response_item_dependencies: dict[str, set[str]] = {}
+        # A queued turn restored after compaction/eviction must survive until
+        # its response (including a possible tool round-trip) has completed.
+        self._protected_response_user_ids: set[str] = set()
         self._user_turn_count: int = 0
+        self._deletable_user_ids: set[str] = set()
+        self._compaction_nodes: dict[str, _CompactionNode] = {}
 
         # All state mutations and serializations go through _lock. Public methods
         # acquire it once; internal callers that already hold it use the
@@ -115,15 +144,85 @@ class Chat:
 
     # ── Internal mutators (caller holds _lock) ─────────────────
 
-    def _evict_oldest_turn(self) -> None:
-        """Remove items from the front until the next user message boundary."""
+    def _evict_oldest_turn(self) -> bool:
+        """Remove the oldest unprotected user turn, if one is available."""
         if not self.buffer:
+            return False
+        start = next(
+            (
+                index
+                for index, candidate in enumerate(self.buffer)
+                if isinstance(candidate, RealtimeConversationItemUserMessage)
+                and candidate.id not in self._protected_response_user_ids
+            ),
+            None,
+        )
+        if start is None:
+            return False
+        end = next(
+            (
+                index
+                for index in range(start + 1, len(self.buffer))
+                if isinstance(self.buffer[index], RealtimeConversationItemUserMessage)
+            ),
+            len(self.buffer),
+        )
+        removed = self.buffer[start:end]
+        del self.buffer[start:end]
+        self._user_turn_count -= 1
+        removed_user_id = removed[0].id
+        for item in removed:
+            if item.id is not None:
+                self._compaction_nodes.pop(item.id, None)
+                self._response_item_owners.pop(item.id, None)
+                self._response_item_dependencies.pop(item.id, None)
+        if removed_user_id is not None:
+            # Hard eviction retires any still-pending tool round-trip anchored
+            # to the lossy turn. Keeping it would permit a later tool result to
+            # revive output whose causal user context is no longer available.
+            self._remove_response_items_for_user_locked(removed_user_id)
+        return True
+
+    def _bound_protected_tool_turns_locked(self, target_user_id: str) -> None:
+        """Bound restored tool-turn retention before protecting a new target.
+
+        A promoted response with an outstanding function call stays protected
+        so its result can be placed beside the original user. If enough such
+        results never arrive, protection must not consume the whole hard cap:
+        retire the oldest outstanding tool ownership and make that turn
+        normally evictable. A late result then fails explicitly as unknown.
+        """
+
+        if self.size <= 0 or target_user_id in self._protected_response_user_ids:
             return
-        first = self.buffer.pop(0)
-        if isinstance(first, RealtimeConversationItemUserMessage):
-            self._user_turn_count -= 1
-        while self.buffer and not isinstance(self.buffer[0], RealtimeConversationItemUserMessage):
-            self.buffer.pop(0)
+        protected_limit = max(1, self.size)
+        while len(self._protected_response_user_ids) >= protected_limit:
+            oldest_protected_id = next(
+                (
+                    item.id
+                    for item in self.buffer
+                    if isinstance(item, RealtimeConversationItemUserMessage)
+                    and item.id in self._protected_response_user_ids
+                    and item.id != target_user_id
+                ),
+                None,
+            )
+            if oldest_protected_id is None:
+                break
+            for call_id in list(self._pending_tool_calls):
+                if self._pending_tool_call_anchors.get(
+                    call_id
+                ) == oldest_protected_id or oldest_protected_id in self._pending_tool_call_dependencies.get(
+                    call_id, set()
+                ):
+                    retired_call = self._pending_tool_calls.pop(call_id, None)
+                    self._pending_tool_call_anchors.pop(call_id, None)
+                    self._pending_tool_call_dependencies.pop(call_id, None)
+                    if retired_call is not None and retired_call.id is not None:
+                        self._response_item_owners.pop(retired_call.id, None)
+                        self._response_item_dependencies.pop(retired_call.id, None)
+            self._protected_response_user_ids.discard(oldest_protected_id)
+            logger.info("Retired oldest outstanding tool turn to preserve bounded conversation admission")
 
     def _has_call_id_in_buffer(self, call_id: str) -> bool:
         for entry in self.buffer:
@@ -140,6 +239,71 @@ class Chat:
                 entry.status = "completed" if status is None else status
                 return
 
+    def _response_insertion_index_locked(self, user_item_id: str) -> int | None:
+        """Return the end of one exact user turn, before the next user."""
+        user_index = next(
+            (
+                index
+                for index, item in enumerate(self.buffer)
+                if isinstance(item, RealtimeConversationItemUserMessage) and item.id == user_item_id
+            ),
+            None,
+        )
+        if user_index is None:
+            return None
+        return next(
+            (
+                index
+                for index in range(user_index + 1, len(self.buffer))
+                if isinstance(self.buffer[index], RealtimeConversationItemUserMessage)
+            ),
+            len(self.buffer),
+        )
+
+    def _restore_compacted_user_locked(self, target_user_id: str) -> bool:
+        """Restore one exact user branch from reversible compaction provenance."""
+
+        if any(
+            isinstance(item, RealtimeConversationItemUserMessage) and item.id == target_user_id for item in self.buffer
+        ):
+            return True
+        for summary_id, node in list(self._compaction_nodes.items()):
+            if target_user_id not in node.deletable_user_ids:
+                continue
+            summary_ids = {node.user_summary.id, node.assistant_summary.id}
+            indexes = [index for index, item in enumerate(self.buffer) if item.id in summary_ids]
+            if not indexes:
+                self._compaction_nodes.pop(summary_id, None)
+                continue
+            restored, surviving_nodes = self._restore_compaction_node_for_response(node, target_user_id)
+            insert_at = min(indexes)
+            self.buffer = [item for item in self.buffer if item.id not in summary_ids]
+            self.buffer[insert_at:insert_at] = restored
+            self._compaction_nodes.pop(summary_id, None)
+            for surviving in surviving_nodes:
+                assert surviving.user_summary.id is not None
+                self._compaction_nodes[surviving.user_summary.id] = surviving
+            self._user_turn_count = sum(
+                1 for item in self.buffer if isinstance(item, RealtimeConversationItemUserMessage)
+            )
+            return True
+        return False
+
+    def _release_resolved_tool_turn_locked(self, anchor: str | None, dependencies: set[str]) -> None:
+        """Release tool owners after their final outstanding call is resolved."""
+
+        candidates = set(dependencies)
+        if anchor is not None:
+            candidates.add(anchor)
+        pending_dependencies = (
+            set().union(*self._pending_tool_call_dependencies.values())
+            if self._pending_tool_call_dependencies
+            else set()
+        )
+        pending_anchors = set(self._pending_tool_call_anchors.values())
+        for item_id in candidates - pending_dependencies - pending_anchors:
+            self._protected_response_user_ids.discard(item_id)
+
     def append_tool_output(self, call_id: str, output_item: RealtimeConversationItemFunctionCallOutput) -> None:
         """Append a ``function_call_output``, re-injecting its ``function_call`` if evicted.
 
@@ -155,8 +319,23 @@ class Chat:
         """Body of :meth:`append_tool_output`. Caller must hold ``_lock``."""
         if self._has_call_id_in_buffer(call_id):
             self._pending_tool_calls.pop(call_id, None)
+            anchor = self._pending_tool_call_anchors.pop(call_id, None)
+            dependencies = self._pending_tool_call_dependencies.pop(call_id, set())
             self._mark_call_completed(call_id, output_item.status)
-            self.buffer.append(output_item)
+            call_index, function_call = next(
+                (index, item)
+                for index, item in enumerate(self.buffer)
+                if isinstance(item, RealtimeConversationItemFunctionCall) and item.call_id == call_id
+            )
+            self.buffer.insert(call_index + 1, output_item)
+            owner = self._response_item_owners.get(function_call.id or "")
+            if owner is not None and output_item.id is not None:
+                self._response_item_owners[output_item.id] = owner
+            if function_call.id is not None and output_item.id is not None:
+                inherited = self._response_item_dependencies.get(function_call.id, dependencies)
+                if inherited:
+                    self._response_item_dependencies[output_item.id] = set(inherited)
+            self._release_resolved_tool_turn_locked(anchor, dependencies)
             return
 
         if call_id in self._pending_tool_calls:
@@ -164,10 +343,32 @@ class Chat:
                 logger.info("Re-injecting private evicted function_call; content redacted")
             else:
                 logger.info("Re-injecting evicted function_call for call_id=%s", call_id)
-            fc = self._pending_tool_calls.pop(call_id)
+            fc = self._pending_tool_calls[call_id]
+            had_anchor = call_id in self._pending_tool_call_anchors
+            anchor = self._pending_tool_call_anchors.get(call_id)
+            dependencies = self._pending_tool_call_dependencies.get(call_id, set())
+            insertion_index = self._response_insertion_index_locked(anchor) if anchor is not None else None
+            if had_anchor and insertion_index is None and anchor is not None:
+                self._restore_compacted_user_locked(anchor)
+                insertion_index = self._response_insertion_index_locked(anchor)
+            if had_anchor and insertion_index is None:
+                raise ChatItemError("The function_call's owning user turn is no longer in conversation history.")
+            self._pending_tool_calls.pop(call_id)
+            self._pending_tool_call_anchors.pop(call_id, None)
+            self._pending_tool_call_dependencies.pop(call_id, None)
             fc.status = "completed" if output_item.status is None else output_item.status
-            self.buffer.append(fc)
-            self.buffer.append(output_item)
+            if insertion_index is None:
+                self.buffer.extend((fc, output_item))
+            else:
+                self.buffer[insertion_index:insertion_index] = [fc, output_item]
+            if anchor is not None:
+                assert fc.id is not None and output_item.id is not None
+                self._response_item_owners[fc.id] = anchor
+                self._response_item_owners[output_item.id] = anchor
+                inherited = dependencies or {anchor}
+                self._response_item_dependencies[fc.id] = set(inherited)
+                self._response_item_dependencies[output_item.id] = set(inherited)
+            self._release_resolved_tool_turn_locked(anchor, dependencies)
             return
 
         raise ChatItemError(f"No function_call with call_id '{call_id}' found in conversation history.")
@@ -190,11 +391,64 @@ class Chat:
         with self._lock:
             return self._add_item_locked(item)
 
+    def add_response_item(
+        self,
+        item: SupportedItem,
+        *,
+        after_user_id: str | None,
+        owner_user_ids: set[str] | None = None,
+    ) -> SupportedItem | None:
+        """Commit response output inside its exact turn instead of after queued users.
+
+        A missing non-null anchor means the owning user was deleted or evicted;
+        fail closed rather than retaining orphaned assistant/tool output. Calls
+        without a turn anchor preserve the legacy append behavior.
+        """
+        with self._lock:
+            if after_user_id is None:
+                return self._add_item_locked(item)
+            dependencies = set(owner_user_ids or {after_user_id})
+            dependencies.add(after_user_id)
+            insertion_index = self._response_insertion_index_locked(after_user_id)
+            if insertion_index is None:
+                logger.debug("Dropping response write-back after its user item left history")
+                return None
+            added = self._add_item_locked(item)
+            if isinstance(item, RealtimeConversationItemAssistantMessage) and any(
+                candidate is item for candidate in self.buffer
+            ):
+                self.buffer = [candidate for candidate in self.buffer if candidate is not item]
+                insertion_index = self._response_insertion_index_locked(after_user_id)
+                if insertion_index is None:
+                    return None
+                self.buffer.insert(insertion_index, item)
+                assert item.id is not None
+                self._response_item_owners[item.id] = after_user_id
+                self._response_item_dependencies[item.id] = dependencies
+            elif isinstance(item, RealtimeConversationItemFunctionCall):
+                assert item.id is not None and item.call_id is not None
+                self._pending_tool_call_anchors[item.call_id] = after_user_id
+                self._pending_tool_call_dependencies[item.call_id] = dependencies
+                self._response_item_owners[item.id] = after_user_id
+                self._response_item_dependencies[item.id] = dependencies
+            return added
+
     def add_items_atomically(self, items: list[SupportedItem]) -> None:
         """Add a client-supplied batch completely or restore the prior chat state."""
         with self._lock:
             buffer_before = list(self.buffer)
             pending_before = dict(self._pending_tool_calls)
+            pending_anchors_before = dict(self._pending_tool_call_anchors)
+            pending_dependencies_before = {
+                call_id: set(dependencies) for call_id, dependencies in self._pending_tool_call_dependencies.items()
+            }
+            response_owners_before = dict(self._response_item_owners)
+            response_dependencies_before = {
+                item_id: set(dependencies) for item_id, dependencies in self._response_item_dependencies.items()
+            }
+            protected_response_users_before = set(self._protected_response_user_ids)
+            deletable_users_before = set(self._deletable_user_ids)
+            compaction_nodes_before = dict(self._compaction_nodes)
             turns_before = self._user_turn_count
             init_before = self.init_chat_message
             function_calls = {
@@ -209,6 +463,13 @@ class Chat:
             except ChatItemError:
                 self.buffer = buffer_before
                 self._pending_tool_calls = pending_before
+                self._pending_tool_call_anchors = pending_anchors_before
+                self._pending_tool_call_dependencies = pending_dependencies_before
+                self._response_item_owners = response_owners_before
+                self._response_item_dependencies = response_dependencies_before
+                self._protected_response_user_ids = protected_response_users_before
+                self._deletable_user_ids = deletable_users_before
+                self._compaction_nodes = compaction_nodes_before
                 self._user_turn_count = turns_before
                 self.init_chat_message = init_before
                 for function_call, status in statuses_before:
@@ -270,7 +531,8 @@ class Chat:
                 self.size,
             )
             while self._user_turn_count > 2 * self.size:
-                self._evict_oldest_turn()
+                if not self._evict_oldest_turn():
+                    break
 
         return item
 
@@ -288,11 +550,20 @@ class Chat:
                 return
             if self._user_turn_count <= self.size:
                 return
+            if self._protected_response_user_ids:
+                # A restored FIFO turn can be older than later queued users.
+                # Do not let a background prefix compaction consume that exact
+                # turn while its response or tool round-trip still owns it.
+                while self._user_turn_count > self.size:
+                    if not self._evict_oldest_turn():
+                        break
+                return
             if compactor is not None:
                 self._maybe_trigger_compaction(compactor)
             else:
                 while self._user_turn_count > self.size:
-                    self._evict_oldest_turn()
+                    if not self._evict_oldest_turn():
+                        break
 
     def replace_user_message_text(self, item_id: str, text: str) -> bool:
         """Replace the text content of an existing user message.
@@ -314,8 +585,131 @@ class Chat:
                 return True
         return False
 
+    def mark_user_message_deletable(self, item_id: str) -> None:
+        """Preserve enough compaction provenance to delete a protocol item later."""
+
+        with self._lock:
+            self._deletable_user_ids.add(item_id)
+
+    def retire_user_message_deletable(self, item_id: str) -> None:
+        """Release provenance after a user item leaves the bounded protocol index."""
+
+        with self._lock:
+            self._deletable_user_ids.discard(item_id)
+            self._response_item_owners = {
+                response_id: owner_id
+                for response_id, owner_id in self._response_item_owners.items()
+                if owner_id != item_id
+            }
+            for response_id, dependencies in list(self._response_item_dependencies.items()):
+                dependencies.discard(item_id)
+                if not dependencies:
+                    self._response_item_dependencies.pop(response_id, None)
+            for call_id, dependencies in list(self._pending_tool_call_dependencies.items()):
+                dependencies.discard(item_id)
+                if not dependencies:
+                    self._pending_tool_call_dependencies.pop(call_id, None)
+            for summary_id, node in list(self._compaction_nodes.items()):
+                if item_id not in node.deletable_user_ids:
+                    continue
+                self._retire_from_compaction_node(node, item_id)
+                if not node.deletable_user_ids:
+                    self._compaction_nodes.pop(summary_id, None)
+
+    def _retire_from_compaction_node(self, node: _CompactionNode, item_id: str) -> None:
+        """Retire one ID and collapse child provenance that no longer serves deletes."""
+
+        node.deletable_user_ids.discard(item_id)
+        collapsed: list[SupportedItem | _CompactionNode] = []
+        for original in node.originals:
+            if not isinstance(original, _CompactionNode):
+                collapsed.append(original)
+                continue
+            if item_id in original.deletable_user_ids:
+                self._retire_from_compaction_node(original, item_id)
+            if original.deletable_user_ids:
+                collapsed.append(original)
+            else:
+                collapsed.extend((original.user_summary, original.assistant_summary))
+        node.originals = collapsed
+
+    def _restore_compaction_node_without(
+        self,
+        node: _CompactionNode,
+        item_id: str,
+    ) -> tuple[list[SupportedItem], list[_CompactionNode]]:
+        """Expand only the branch containing *item_id* and preserve all siblings."""
+
+        restored: list[SupportedItem] = []
+        surviving_nodes: list[_CompactionNode] = []
+        for original in node.originals:
+            if isinstance(original, _CompactionNode):
+                if item_id in original.deletable_user_ids:
+                    nested_items, nested_nodes = self._restore_compaction_node_without(original, item_id)
+                    restored.extend(nested_items)
+                    surviving_nodes.extend(nested_nodes)
+                else:
+                    restored.extend((original.user_summary, original.assistant_summary))
+                    surviving_nodes.append(original)
+                continue
+            if isinstance(original, RealtimeConversationItemUserMessage) and original.id == item_id:
+                continue
+            if original.id is not None and item_id in self._response_item_dependencies.get(original.id, set()):
+                continue
+            restored.append(original)
+        return restored, surviving_nodes
+
+    def _restore_compaction_node_for_response(
+        self,
+        node: _CompactionNode,
+        item_id: str,
+    ) -> tuple[list[SupportedItem], list[_CompactionNode]]:
+        """Expand the exact branch needed by a queued response turn."""
+
+        restored: list[SupportedItem] = []
+        surviving_nodes: list[_CompactionNode] = []
+        for original in node.originals:
+            if isinstance(original, _CompactionNode):
+                if item_id in original.deletable_user_ids:
+                    nested_items, nested_nodes = self._restore_compaction_node_for_response(original, item_id)
+                    restored.extend(nested_items)
+                    surviving_nodes.extend(nested_nodes)
+                else:
+                    restored.extend((original.user_summary, original.assistant_summary))
+                    surviving_nodes.append(original)
+                continue
+            restored.append(original)
+        return restored, surviving_nodes
+
+    def _remove_response_items_for_user_locked(self, item_id: str) -> None:
+        """Remove canonical response output owned by one deleted user item."""
+
+        owned_ids = {
+            response_id
+            for response_id, dependencies in self._response_item_dependencies.items()
+            if item_id in dependencies
+        }
+        owned_ids.update(
+            response_id for response_id, owner_id in self._response_item_owners.items() if owner_id == item_id
+        )
+        if owned_ids:
+            self.buffer = [item for item in self.buffer if item.id not in owned_ids]
+        for call_id, function_call in list(self._pending_tool_calls.items()):
+            if (
+                self._pending_tool_call_anchors.get(call_id) == item_id
+                or item_id in self._pending_tool_call_dependencies.get(call_id, set())
+                or function_call.id in owned_ids
+            ):
+                self._pending_tool_calls.pop(call_id, None)
+                self._pending_tool_call_anchors.pop(call_id, None)
+                self._pending_tool_call_dependencies.pop(call_id, None)
+        for response_id in owned_ids:
+            self._response_item_owners.pop(response_id, None)
+            self._response_item_dependencies.pop(response_id, None)
+        self._protected_response_user_ids.discard(item_id)
+
     def remove_user_message(self, item_id: str) -> bool:
-        """Remove an existing user message from the bounded chat buffer."""
+        """Remove an exact user message, restoring a compacted snapshot if needed."""
 
         with self._lock:
             for index, item in enumerate(self.buffer):
@@ -323,10 +717,66 @@ class Chat:
                     continue
                 del self.buffer[index]
                 self._user_turn_count -= 1
+                self._remove_response_items_for_user_locked(item_id)
+                self._deletable_user_ids.discard(item_id)
+                self._compaction_nodes.pop(item_id, None)
+                # A summary already running from an older snapshot must not
+                # splice deleted user content back into live history.
+                self._gen_counter += 1
+                self._compact_in_flight = False
                 if self._private_content_logging:
                     logger.debug("Removed private speculative user message; content redacted")
                 else:
                     logger.debug("Removed speculative user message %s", item_id)
+                return True
+            for summary_id, node in list(self._compaction_nodes.items()):
+                if item_id not in node.deletable_user_ids:
+                    continue
+                summary_ids = {node.user_summary.id, node.assistant_summary.id}
+                indexes = [index for index, item in enumerate(self.buffer) if item.id in summary_ids]
+                if not indexes:
+                    self._compaction_nodes.pop(summary_id, None)
+                    continue
+                insert_at = min(indexes)
+                restored, surviving_nodes = self._restore_compaction_node_without(node, item_id)
+                self.buffer = [item for item in self.buffer if item.id not in summary_ids]
+                self.buffer[insert_at:insert_at] = restored
+                self._remove_response_items_for_user_locked(item_id)
+                self._compaction_nodes.pop(summary_id, None)
+                for surviving in surviving_nodes:
+                    assert surviving.user_summary.id is not None
+                    self._compaction_nodes[surviving.user_summary.id] = surviving
+                self._deletable_user_ids.discard(item_id)
+                self._user_turn_count = sum(
+                    1 for item in self.buffer if isinstance(item, RealtimeConversationItemUserMessage)
+                )
+                # Restoring nested provenance can expose many historical turns
+                # at once. Enforce the normal soft bound synchronously before
+                # another provider snapshot can serialize that expanded branch.
+                # Lossily evicted protocol items remain deletable through
+                # ``_deletable_user_ids`` until their bounded index retires.
+                if self.size > 0:
+                    while self._user_turn_count > self.size:
+                        if not self._evict_oldest_turn():
+                            break
+                self._gen_counter += 1
+                self._compact_in_flight = False
+                if self._private_content_logging:
+                    logger.debug("Removed compacted private user message; content redacted")
+                else:
+                    logger.debug("Removed compacted user message %s", item_id)
+                return True
+            # Lossy eviction may already have removed the item from model context.
+            # It remains protocol-visible until its bounded index entry retires, so
+            # acknowledge the exact deletion while releasing its retained marker.
+            if item_id in self._deletable_user_ids:
+                self._deletable_user_ids.remove(item_id)
+                self._remove_response_items_for_user_locked(item_id)
+                # The item may have been hard-evicted after a compactor captured
+                # it.  The successful protocol deletion must invalidate that
+                # snapshot just as deleting a still-buffered item does.
+                self._gen_counter += 1
+                self._compact_in_flight = False
                 return True
         return False
 
@@ -480,7 +930,235 @@ class Chat:
             clone.init_chat_message = self.init_chat_message
             clone.buffer = list(self.buffer)
             clone._pending_tool_calls = dict(self._pending_tool_calls)
+            clone._pending_tool_call_anchors = dict(self._pending_tool_call_anchors)
+            clone._pending_tool_call_dependencies = {
+                call_id: set(dependencies) for call_id, dependencies in self._pending_tool_call_dependencies.items()
+            }
+            clone._response_item_owners = dict(self._response_item_owners)
+            clone._response_item_dependencies = {
+                item_id: set(dependencies) for item_id, dependencies in self._response_item_dependencies.items()
+            }
+            clone._protected_response_user_ids = set(self._protected_response_user_ids)
             clone._user_turn_count = self._user_turn_count
+            clone._deletable_user_ids = set(self._deletable_user_ids)
+            clone._compaction_nodes = dict(self._compaction_nodes)
+            clone._compaction_suspended = self._compaction_suspended
+            clone._private_content_logging = self._private_content_logging
+            return clone
+
+    def user_message(self, item_id: str) -> RealtimeConversationItemUserMessage | None:
+        """Return a detached copy of one exact user item, if it is present."""
+
+        with self._lock:
+            item = next(
+                (
+                    candidate
+                    for candidate in self.buffer
+                    if isinstance(candidate, RealtimeConversationItemUserMessage) and candidate.id == item_id
+                ),
+                None,
+            )
+            return item.model_copy(deep=True) if item is not None else None
+
+    def live_item_ids(self) -> set[str]:
+        """Return IDs still owned by canonical conversation state.
+
+        The realtime protocol index is intentionally bounded independently of
+        chat history.  Callers use this snapshot to prevent a retired protocol
+        ID from being rebound while its original item is still live here.
+        """
+
+        with self._lock:
+            item_ids = {item.id for item in self.buffer if item.id is not None}
+            item_ids.update(item.id for item in self._pending_tool_calls.values() if item.id is not None)
+            if self.init_chat_message is not None and self.init_chat_message.id is not None:
+                item_ids.add(self.init_chat_message.id)
+            return item_ids
+
+    def response_owner_for_item(self, item_id: str) -> str | None:
+        """Return the canonical user item that owns derived response output."""
+
+        with self._lock:
+            return self._response_item_owners.get(item_id)
+
+    def response_dependencies_for_item(self, item_id: str) -> set[str]:
+        """Return every canonical user item serialized by derived output."""
+
+        with self._lock:
+            return set(self._response_item_dependencies.get(item_id, set()))
+
+    def response_dependencies_for_call(self, call_id: str) -> set[str]:
+        """Return canonical user dependencies for one unresolved tool call."""
+
+        with self._lock:
+            function_call = next(
+                (
+                    item
+                    for item in self.buffer
+                    if isinstance(item, RealtimeConversationItemFunctionCall) and item.call_id == call_id
+                ),
+                self._pending_tool_calls.get(call_id),
+            )
+            if function_call is None:
+                return set()
+            dependencies = (
+                set(self._response_item_dependencies.get(function_call.id, set()))
+                if function_call.id is not None
+                else set()
+            )
+            dependencies.update(self._pending_tool_call_dependencies.get(call_id, set()))
+            owner = (
+                self._response_item_owners.get(function_call.id) if function_call.id is not None else None
+            ) or self._pending_tool_call_anchors.get(call_id)
+            if owner is not None:
+                dependencies.add(owner)
+            return dependencies
+
+    def latest_user_message_id(self, candidate_ids: set[str]) -> str | None:
+        """Return the last canonical user among *candidate_ids*."""
+
+        with self._lock:
+            return next(
+                (
+                    item.id
+                    for item in reversed(self.buffer)
+                    if isinstance(item, RealtimeConversationItemUserMessage) and item.id in candidate_ids
+                ),
+                None,
+            )
+
+    def release_response_turn(self, item_id: str | None, *, force: bool = False) -> None:
+        """Release a restored turn once no pending tool round-trip still owns it."""
+
+        if item_id is None:
+            return
+        with self._lock:
+            retained_by_tool = item_id in self._pending_tool_call_anchors.values() or any(
+                item_id in dependencies for dependencies in self._pending_tool_call_dependencies.values()
+            )
+            if force or not retained_by_tool:
+                self._protected_response_user_ids.discard(item_id)
+
+    def protect_response_turn(self, item_id: str | None) -> None:
+        """Lease one admitted in-band response owner against hard eviction."""
+
+        if item_id is None:
+            return
+        with self._lock:
+            if not any(
+                isinstance(item, RealtimeConversationItemUserMessage) and item.id == item_id for item in self.buffer
+            ):
+                return
+            self._bound_protected_tool_turns_locked(item_id)
+            self._protected_response_user_ids.add(item_id)
+
+    def snapshot_for_response_turn(
+        self,
+        target_user_id: str,
+        later_user_ids: set[str],
+        *,
+        fallback_user: RealtimeConversationItemUserMessage | None = None,
+        fallback_init_message: RealtimeConversationItemSystemMessage | None = None,
+        excluded_item_ids: set[str] | None = None,
+    ) -> Chat:
+        """Return current context with one queued target restored and last.
+
+        A prior response may have compacted or hard-evicted the queued user
+        before its turn reached the model lane. Restore the exact item from
+        reversible compaction provenance, or from its admission snapshot after
+        lossy eviction. The generation bump also prevents an older in-flight
+        compactor from consuming the target after this snapshot is prepared.
+        """
+        with self._lock:
+            self._gen_counter += 1
+            self._compact_in_flight = False
+            target_present = self._restore_compacted_user_locked(target_user_id)
+            if not target_present and fallback_user is not None and fallback_user.id == target_user_id:
+                insert_at = next(
+                    (
+                        index
+                        for index, item in enumerate(self.buffer)
+                        if isinstance(item, RealtimeConversationItemUserMessage) and item.id in later_user_ids
+                    ),
+                    len(self.buffer),
+                )
+                self.buffer.insert(insert_at, fallback_user.model_copy(deep=True))
+                self._deletable_user_ids.add(target_user_id)
+                target_present = True
+            if target_present:
+                self._bound_protected_tool_turns_locked(target_user_id)
+                self._protected_response_user_ids.add(target_user_id)
+            self._user_turn_count = sum(
+                1 for item in self.buffer if isinstance(item, RealtimeConversationItemUserMessage)
+            )
+            if not target_present:
+                logger.warning("Queued response user %s was unavailable in live and admission history", target_user_id)
+            excluded_ids = set(excluded_item_ids or set())
+            excluded_call_ids = {
+                item.call_id
+                for item in self.buffer
+                if item.id in excluded_ids
+                and isinstance(
+                    item,
+                    (RealtimeConversationItemFunctionCall, RealtimeConversationItemFunctionCallOutput),
+                )
+            }
+            excluded_ids.update(
+                item.id
+                for item in self.buffer
+                if item.id is not None
+                and isinstance(
+                    item,
+                    (RealtimeConversationItemFunctionCall, RealtimeConversationItemFunctionCallOutput),
+                )
+                and item.call_id in excluded_call_ids
+            )
+            clone = Chat(self.size)
+            clone.init_chat_message = (
+                fallback_init_message
+                if self.init_chat_message is not None
+                and self.init_chat_message.id is not None
+                and self.init_chat_message.id in excluded_ids
+                else self.init_chat_message
+            )
+            selected = [
+                item
+                for item in self.buffer
+                if not (
+                    item.id is not None
+                    and (
+                        item.id in excluded_ids
+                        or (isinstance(item, RealtimeConversationItemUserMessage) and item.id in later_user_ids)
+                    )
+                )
+            ]
+            target = next(
+                (
+                    item
+                    for item in selected
+                    if isinstance(item, RealtimeConversationItemUserMessage) and item.id == target_user_id
+                ),
+                None,
+            )
+            if target is not None:
+                selected.remove(target)
+                selected.append(target)
+            clone.buffer = selected
+            clone._pending_tool_calls = dict(self._pending_tool_calls)
+            clone._pending_tool_call_anchors = dict(self._pending_tool_call_anchors)
+            clone._pending_tool_call_dependencies = {
+                call_id: set(dependencies) for call_id, dependencies in self._pending_tool_call_dependencies.items()
+            }
+            clone._response_item_owners = dict(self._response_item_owners)
+            clone._response_item_dependencies = {
+                item_id: set(dependencies) for item_id, dependencies in self._response_item_dependencies.items()
+            }
+            clone._protected_response_user_ids = set(self._protected_response_user_ids)
+            clone._user_turn_count = sum(
+                1 for item in selected if isinstance(item, RealtimeConversationItemUserMessage)
+            )
+            clone._deletable_user_ids = set(self._deletable_user_ids)
+            clone._compaction_nodes = dict(self._compaction_nodes)
             clone._compaction_suspended = self._compaction_suspended
             clone._private_content_logging = self._private_content_logging
             return clone
@@ -500,7 +1178,14 @@ class Chat:
             self.buffer = []
             self.init_chat_message = None
             self._pending_tool_calls = {}
+            self._pending_tool_call_anchors = {}
+            self._pending_tool_call_dependencies = {}
+            self._response_item_owners = {}
+            self._response_item_dependencies = {}
+            self._protected_response_user_ids = set()
             self._user_turn_count = 0
+            self._deletable_user_ids = set()
+            self._compaction_nodes = {}
 
     def close(self) -> None:
         """Permanently shut down the chat. In-flight compaction splice is suppressed.
@@ -697,10 +1382,41 @@ class Chat:
             drop_ids = marker_ids - fc_ids_to_keep
             remaining = [x for x in self.buffer if x.id not in drop_ids]
 
+            originals: list[SupportedItem | _CompactionNode] = []
+            consumed_summary_ids: set[str] = set()
+            for item in self.buffer:
+                if item.id not in drop_ids or item.id in consumed_summary_ids:
+                    continue
+                nested = self._compaction_nodes.pop(item.id or "", None)
+                if nested is not None:
+                    originals.append(nested)
+                    if nested.assistant_summary.id is not None:
+                        consumed_summary_ids.add(nested.assistant_summary.id)
+                else:
+                    originals.append(item)
+
             user_msg = make_user_message(result.user_summary)
             user_msg.id = _generate_id("msg")
             asst_msg = make_assistant_message(result.assistant_summary)
             asst_msg.id = _generate_id("msg")
+
+            deletable_user_ids = {
+                original.id
+                for original in originals
+                if isinstance(original, RealtimeConversationItemUserMessage)
+                and original.id is not None
+                and original.id in self._deletable_user_ids
+            }
+            for original in originals:
+                if isinstance(original, _CompactionNode):
+                    deletable_user_ids.update(original.deletable_user_ids)
+            if deletable_user_ids:
+                self._compaction_nodes[user_msg.id] = _CompactionNode(
+                    user_summary=user_msg,
+                    assistant_summary=asst_msg,
+                    originals=originals,
+                    deletable_user_ids=deletable_user_ids,
+                )
 
             self.buffer = [user_msg, asst_msg, *remaining]
             self._user_turn_count = sum(1 for x in self.buffer if isinstance(x, RealtimeConversationItemUserMessage))

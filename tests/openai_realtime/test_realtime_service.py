@@ -15,6 +15,8 @@ import pytest
 from openai.types.realtime import (
     ConversationItemCreatedEvent,
     ConversationItemCreateEvent,
+    ConversationItemDeletedEvent,
+    ConversationItemDeleteEvent,
     ConversationItemInputAudioTranscriptionCompletedEvent,
     ConversationItemInputAudioTranscriptionDeltaEvent,
     InputAudioBufferAppendEvent,
@@ -53,6 +55,7 @@ from speech_to_speech.api.openai_realtime.transcript_barrier import (
     TranscriptBarrierResolvedServerEvent,
     TranscriptBarrierResolveEvent,
 )
+from speech_to_speech.LLM.chat import make_assistant_message
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
@@ -206,6 +209,12 @@ class TestParseClientEvent:
         }
         evt = service.parse_client_event(raw)
         assert isinstance(evt, ConversationItemCreateEvent)
+
+    def test_parse_valid_conversation_item_delete(self, service):
+        evt = service.parse_client_event(
+            {"type": "conversation.item.delete", "event_id": "event_delete", "item_id": "item_audio"}
+        )
+        assert isinstance(evt, ConversationItemDeleteEvent)
 
     def test_parse_valid_response_create(self, service):
         raw = {"type": "response.create"}
@@ -833,6 +842,2371 @@ class TestHandleConversationItemCreate:
         assert last.content[1].image_url == "data:image/png;base64,abc123"
 
 
+class TestHandleConversationItemDelete:
+    def test_duplicate_live_item_id_is_rejected_without_mutating_chat(self, service, conn_id):
+        event = ConversationItemCreateEvent(
+            type="conversation.item.create",
+            event_id="create_duplicate",
+            item={
+                "id": "msg_duplicate",
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "one"}],
+            },
+        )
+        service.handle_conversation_item_create(conn_id, event)
+
+        duplicate = service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                event_id="create_duplicate_again",
+                item={
+                    "id": "msg_duplicate",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "two"}],
+                },
+            ),
+        )
+
+        assert isinstance(duplicate[0], RealtimeErrorEvent)
+        assert duplicate[0].error.type == "duplicate_item_id"
+        assert duplicate[0].error.event_id == "create_duplicate_again"
+        assert [item.content[0].text for item in service._state(conn_id).runtime_config.chat.buffer] == ["one"]
+
+    def test_duplicate_deferred_item_id_is_rejected_before_flush(self, service, conn_id):
+        st = service._state(conn_id)
+        st.in_response = True
+        first = ConversationItemCreateEvent(
+            type="conversation.item.create",
+            item={
+                "id": "msg_deferred_duplicate",
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "one"}],
+            },
+        )
+        assert service.handle_conversation_item_create(conn_id, first) == []
+
+        duplicate = service.handle_conversation_item_create(conn_id, first)
+
+        assert isinstance(duplicate[0], RealtimeErrorEvent)
+        assert len(st.deferred_items) == 1
+        assert st.runtime_config.chat.buffer == []
+
+    def test_conversation_create_rejects_live_id_after_protocol_index_retirement(self, monkeypatch):
+        import speech_to_speech.api.openai_realtime.service as service_module
+
+        monkeypatch.setattr(service_module, "MAX_TRACKED_PROTOCOL_ITEMS", 2)
+        service = RealtimeService(text_prompt_queue=Queue())
+        conn_id = service.register()
+        original = ConversationItemCreateEvent(
+            type="conversation.item.create",
+            item={
+                "id": "msg_retired_live",
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "original"}],
+            },
+        )
+        service.handle_conversation_item_create(conn_id, original)
+        for index in range(2):
+            service.handle_conversation_item_create(
+                conn_id,
+                ConversationItemCreateEvent(
+                    type="conversation.item.create",
+                    item={
+                        "id": f"sys_retire_{index}",
+                        "type": "message",
+                        "role": "system",
+                        "content": [{"type": "input_text", "text": str(index)}],
+                    },
+                ),
+            )
+
+        state = service._state(conn_id)
+        assert "msg_retired_live" not in state.protocol_item_ids
+        assert "msg_retired_live" in state.runtime_config.chat.live_item_ids()
+
+        duplicate = service.handle_conversation_item_create(conn_id, original)
+
+        assert isinstance(duplicate[0], RealtimeErrorEvent)
+        assert duplicate[0].error.type == "duplicate_item_id"
+        assert [item.content[0].text for item in state.runtime_config.chat.buffer] == ["original"]
+        service.unregister(conn_id)
+
+    def test_response_input_rejects_live_id_after_protocol_index_retirement(self, monkeypatch):
+        import speech_to_speech.api.openai_realtime.service as service_module
+
+        monkeypatch.setattr(service_module, "MAX_TRACKED_PROTOCOL_ITEMS", 2)
+        service = RealtimeService(text_prompt_queue=Queue())
+        conn_id = service.register()
+        service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "msg_retired_live",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "original"}],
+                },
+            ),
+        )
+        for index in range(2):
+            service.handle_conversation_item_create(
+                conn_id,
+                ConversationItemCreateEvent(
+                    type="conversation.item.create",
+                    item={
+                        "id": f"sys_retire_{index}",
+                        "type": "message",
+                        "role": "system",
+                        "content": [{"type": "input_text", "text": str(index)}],
+                    },
+                ),
+            )
+
+        state = service._state(conn_id)
+        assert "msg_retired_live" not in state.protocol_item_ids
+        rejected = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": "msg_retired_live",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "duplicate"}],
+                        }
+                    ]
+                },
+            ),
+        )
+
+        assert isinstance(rejected, RealtimeErrorEvent)
+        assert rejected.error.type == "duplicate_item_id"
+        assert [item.content[0].text for item in state.runtime_config.chat.buffer] == ["original"]
+        service.unregister(conn_id)
+
+    def test_deletes_exact_created_user_item(self, service, conn_id):
+        created = service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "msg_echo",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "echo"}],
+                },
+            ),
+        )
+        assert isinstance(created[0], ConversationItemCreatedEvent)
+
+        events = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(
+                type="conversation.item.delete",
+                event_id="event_delete",
+                item_id="msg_echo",
+            ),
+        )
+
+        assert len(events) == 1
+        assert isinstance(events[0], ConversationItemDeletedEvent)
+        assert events[0].item_id == "msg_echo"
+        assert service._state(conn_id).runtime_config.chat.buffer == []
+
+    def test_audio_item_id_deletes_its_exact_stored_transcript(self, service, conn_id):
+        st = service._state(conn_id)
+        stored = st.runtime_config.chat.add_item(
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "assistant echo"}],
+                },
+            ).item
+        )
+        assert stored.id is not None
+        st.speculative_input_item_id = "item_audio"
+        st.speculative_user_item_id = stored.id
+        st.audio_input_item_ids.add("item_audio")
+        st.input_item_chat_ids["item_audio"] = stored.id
+        st.record_protocol_item("item_audio")
+
+        events = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(
+                type="conversation.item.delete",
+                event_id="event_delete",
+                item_id="item_audio",
+            ),
+        )
+
+        assert isinstance(events[0], ConversationItemDeletedEvent)
+        assert events[0].item_id == "item_audio"
+        assert st.runtime_config.chat.buffer == []
+        assert st.speculative_user_item_id is None
+        assert st.last_item_id is None
+
+    def test_delete_cancels_the_exact_queued_response_owner(self, service, conn_id, cancel_scope):
+        started = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_pending", turn_revision=0),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="assistant echo", turn_id="turn_pending", turn_revision=0),
+        )
+        st = service._state(conn_id)
+        assert st.response_pending
+        assert st.pending_response_turn_id == "turn_pending"
+
+        events = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=started.item_id),
+        )
+
+        assert isinstance(events[0], ConversationItemDeletedEvent)
+        assert not st.response_pending
+        assert st.pending_response_turn_id is None
+        assert cancel_scope.generation == 1
+
+    def test_delete_cancels_and_terminalizes_the_exact_active_response(self):
+        tracker = SpeculativeTurnTracker()
+        cancel_scope = CancelScope()
+        service = RealtimeService(
+            text_prompt_queue=Queue(),
+            should_listen=Event(),
+            speculative_turns=tracker,
+            cancel_scope=cancel_scope,
+        )
+        conn_id = service.register()
+        started = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_active", turn_revision=0),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="assistant echo", turn_id="turn_active", turn_revision=0),
+        )
+        service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(text="stale reply", turn_id="turn_active", turn_revision=0),
+        )
+        st = service._state(conn_id)
+        assert st.in_response
+        assert st.active_response_turn_id == "turn_active"
+
+        events = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=started.item_id),
+        )
+
+        assert isinstance(events[0], ConversationItemDeletedEvent)
+        assert any(isinstance(event, ResponseDoneEvent) and event.response.status == "cancelled" for event in events)
+        assert not st.in_response
+        assert not st.response_pending
+        assert st.active_response_turn_id is None
+        assert cancel_scope.generation == 1
+        service.unregister(conn_id)
+
+    def test_active_delete_flushes_deferred_item_after_deleted_protocol_tail(self):
+        tracker = SpeculativeTurnTracker()
+        service = RealtimeService(
+            text_prompt_queue=Queue(),
+            should_listen=Event(),
+            speculative_turns=tracker,
+            cancel_scope=CancelScope(),
+        )
+        conn_id = service.register()
+        started = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_active", turn_revision=0),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="assistant echo", turn_id="turn_active", turn_revision=0),
+        )
+        service.encode_audio_chunk(conn_id, _pcm_bytes(256))
+        assert (
+            service.handle_conversation_item_create(
+                conn_id,
+                ConversationItemCreateEvent(
+                    type="conversation.item.create",
+                    item={
+                        "id": "msg_deferred",
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "next turn"}],
+                    },
+                ),
+            )
+            == []
+        )
+
+        events = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=started.item_id),
+        )
+
+        created = next(event for event in events if isinstance(event, ConversationItemCreatedEvent))
+        assert created.item.id == "msg_deferred"
+        assert created.previous_item_id is None
+        assert service._state(conn_id).protocol_item_ids == ["msg_deferred"]
+        assert service._state(conn_id).last_item_id == "msg_deferred"
+        service.unregister(conn_id)
+
+    def test_active_delete_requeues_an_unrelated_pending_turn(self):
+        tracker = SpeculativeTurnTracker()
+        cancel_scope = CancelScope()
+        prompt_queue = Queue()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            should_listen=Event(),
+            speculative_turns=tracker,
+            cancel_scope=cancel_scope,
+        )
+        conn_id = service.register()
+        active = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_active", turn_revision=0),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="first", turn_id="turn_active", turn_revision=0),
+        )
+        active_request = prompt_queue.get_nowait()
+        assert active_request.turn_id == "turn_active"
+        service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(text="first reply", turn_id="turn_active", turn_revision=0),
+        )
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_next", turn_revision=0, interrupt_response=False),
+        )
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="second", turn_id="turn_next", turn_revision=0),
+        )
+        st = service._state(conn_id)
+        assert prompt_queue.empty()
+        assert st.pending_response_turn_id == "turn_next"
+
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=active.item_id),
+        )
+
+        resumed = prompt_queue.get_nowait()
+        assert resumed.turn_id == "turn_next"
+        assert resumed.cancel_generation == cancel_scope.generation == 1
+        assert st.response_pending
+        assert st.pending_response_turn_id == "turn_next"
+        assert st.pending_response_request is resumed
+        service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(text="second reply", turn_id="turn_next", turn_revision=0),
+        )
+        assert st.in_response
+        assert st.active_response_turn_id == "turn_next"
+        assert not st.response_pending
+        assert st.pending_response_request is None
+        service.unregister(conn_id)
+
+    def test_three_distinct_turns_are_preserved_in_fifo_order(self):
+        tracker = SpeculativeTurnTracker()
+        prompt_queue = Queue()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            speculative_turns=tracker,
+            cancel_scope=CancelScope(),
+        )
+        conn_id = service.register()
+
+        for index in range(3):
+            turn_id = f"turn_{index}"
+            service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id=turn_id, turn_revision=0, interrupt_response=False),
+            )
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(
+                    transcript=f"question {index}",
+                    turn_id=turn_id,
+                    turn_revision=0,
+                ),
+            )
+            if index == 0:
+                active_request = prompt_queue.get_nowait()
+                assert active_request.turn_id == "turn_0"
+                assert active_request.response_user_item_id is not None
+                assert [item.content[0].text for item in active_request.chat_snapshot.buffer] == ["question 0"]
+                service.dispatch_pipeline_event(
+                    conn_id,
+                    AssistantTextEvent(text="reply 0", turn_id="turn_0", turn_revision=0),
+                )
+                service._state(conn_id).runtime_config.chat.add_response_item(
+                    make_assistant_message("reply 0"),
+                    after_user_id=active_request.response_user_item_id,
+                )
+
+        st = service._state(conn_id)
+        assert st.active_response_turn_id == "turn_0"
+        assert st.pending_response_turn_id == "turn_1"
+        assert [request.turn_id for request in st.deferred_response_requests] == ["turn_2"]
+        assert [(item.role, item.content[0].text) for item in st.pending_response_request.chat_snapshot.buffer] == [
+            ("user", "question 0"),
+            ("assistant", "reply 0"),
+            ("user", "question 1"),
+        ]
+        assert [
+            (item.role, item.content[0].text) for item in st.deferred_response_requests[0].chat_snapshot.buffer
+        ] == [
+            ("user", "question 0"),
+            ("assistant", "reply 0"),
+            ("user", "question 1"),
+            ("user", "question 2"),
+        ]
+        assert prompt_queue.empty()
+
+        service.finish_response(conn_id)
+        second_request = prompt_queue.get_nowait()
+        assert second_request.turn_id == "turn_1"
+        assert [(item.role, item.content[0].text) for item in second_request.chat_snapshot.buffer] == [
+            ("user", "question 0"),
+            ("assistant", "reply 0"),
+            ("user", "question 1"),
+        ]
+        service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(text="reply 1", turn_id="turn_1", turn_revision=0),
+        )
+        st.runtime_config.chat.add_response_item(
+            make_assistant_message("reply 1"),
+            after_user_id=second_request.response_user_item_id,
+        )
+        assert st.active_response_turn_id == "turn_1"
+        assert st.pending_response_turn_id == "turn_2"
+        assert st.deferred_response_requests == []
+
+        service.finish_response(conn_id)
+        third_request = prompt_queue.get_nowait()
+        assert third_request.turn_id == "turn_2"
+        assert [(item.role, item.content[0].text) for item in third_request.chat_snapshot.buffer] == [
+            ("user", "question 0"),
+            ("assistant", "reply 0"),
+            ("user", "question 1"),
+            ("assistant", "reply 1"),
+            ("user", "question 2"),
+        ]
+        service.unregister(conn_id)
+
+    def test_deferred_item_flush_cannot_retire_accepted_fifo_turns(self, monkeypatch):
+        import speech_to_speech.api.openai_realtime.service as service_module
+
+        monkeypatch.setattr(service_module, "MAX_TRACKED_PROTOCOL_ITEMS", 3)
+        tracker = SpeculativeTurnTracker()
+        prompt_queue = Queue()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            speculative_turns=tracker,
+            cancel_scope=CancelScope(),
+        )
+        conn_id = service.register()
+        created_items = {}
+        for turn_id in ("turn_active", "turn_pending", "turn_deferred"):
+            created_items[turn_id] = service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id=turn_id, turn_revision=0, interrupt_response=False),
+            )[0]
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(transcript=turn_id, turn_id=turn_id, turn_revision=0),
+            )
+            if turn_id == "turn_active":
+                prompt_queue.get_nowait()
+                service.dispatch_pipeline_event(
+                    conn_id,
+                    AssistantTextEvent(text="active reply", turn_id=turn_id, turn_revision=0),
+                )
+
+        for index in range(3):
+            assert (
+                service.handle_conversation_item_create(
+                    conn_id,
+                    ConversationItemCreateEvent(
+                        type="conversation.item.create",
+                        item={
+                            "id": f"msg_deferred_{index}",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": str(index)}],
+                        },
+                    ),
+                )
+                == []
+            )
+
+        service.finish_response(conn_id)
+
+        state = service._state(conn_id)
+        promoted = prompt_queue.get_nowait()
+        assert promoted.turn_id == "turn_pending"
+        assert state.pending_response_turn_id == "turn_pending"
+        assert [request.turn_id for request in state.deferred_response_requests] == ["turn_deferred"]
+        for turn_id in ("turn_pending", "turn_deferred"):
+            input_item_id = created_items[turn_id].item_id
+            assert input_item_id in state.protocol_item_ids
+            assert state.turn_input_item_ids[turn_id] == input_item_id
+            assert tracker.is_latest(turn_id, 0)
+        assert len(state.protocol_item_ids) == 3
+        service.unregister(conn_id)
+
+    def test_deleting_held_turn_preserves_fifo_before_a_new_arrival(self):
+        tracker = SpeculativeTurnTracker()
+        prompt_queue = Queue()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            speculative_turns=tracker,
+            cancel_scope=CancelScope(),
+        )
+        conn_id = service.register()
+        created_items = {}
+        for turn_id in ("turn_a", "turn_b", "turn_c"):
+            created_items[turn_id] = service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id=turn_id, turn_revision=0, interrupt_response=False),
+            )[0]
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(transcript=turn_id, turn_id=turn_id, turn_revision=0),
+            )
+            if turn_id == "turn_a":
+                prompt_queue.get_nowait()
+                service.dispatch_pipeline_event(
+                    conn_id,
+                    AssistantTextEvent(text="reply a", turn_id=turn_id, turn_revision=0),
+                )
+
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(
+                type="conversation.item.delete",
+                item_id=created_items["turn_b"].item_id,
+            ),
+        )
+        state = service._state(conn_id)
+        assert state.pending_response_turn_id == "turn_c"
+        assert state.deferred_response_requests == []
+
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_d", turn_revision=0, interrupt_response=False),
+        )
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="turn_d", turn_id="turn_d", turn_revision=0),
+        )
+        assert state.pending_response_turn_id == "turn_c"
+        assert [request.turn_id for request in state.deferred_response_requests] == ["turn_d"]
+
+        service.finish_response(conn_id)
+        assert prompt_queue.get_nowait().turn_id == "turn_c"
+        service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(text="reply c", turn_id="turn_c", turn_revision=0),
+        )
+        service.finish_response(conn_id)
+        assert prompt_queue.get_nowait().turn_id == "turn_d"
+        service.unregister(conn_id)
+
+    def test_deleting_a_deep_queued_turn_releases_capacity_immediately(self):
+        tracker = SpeculativeTurnTracker()
+        prompt_queue = Queue()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            speculative_turns=tracker,
+            cancel_scope=CancelScope(),
+        )
+        conn_id = service.register()
+        created_items = {}
+        for turn_id in ("turn_a", "turn_b", "turn_c"):
+            created_items[turn_id] = service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id=turn_id, turn_revision=0, interrupt_response=False),
+            )[0]
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(transcript=turn_id, turn_id=turn_id, turn_revision=0),
+            )
+            if turn_id == "turn_a":
+                prompt_queue.get_nowait()
+                service.dispatch_pipeline_event(
+                    conn_id,
+                    AssistantTextEvent(text="reply a", turn_id=turn_id, turn_revision=0),
+                )
+
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(
+                type="conversation.item.delete",
+                item_id=created_items["turn_c"].item_id,
+            ),
+        )
+
+        state = service._state(conn_id)
+        assert state.pending_response_turn_id == "turn_b"
+        assert state.deferred_response_requests == []
+        service.unregister(conn_id)
+
+    def test_promoted_turn_excludes_client_context_that_arrived_after_admission(self):
+        prompt_queue = Queue()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            speculative_turns=SpeculativeTurnTracker(),
+            cancel_scope=CancelScope(),
+        )
+        conn_id = service.register()
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_active", turn_revision=0, interrupt_response=False),
+        )
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="first", turn_id="turn_active", turn_revision=0),
+        )
+        prompt_queue.get_nowait()
+        service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(text="first reply", turn_id="turn_active", turn_revision=0),
+        )
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_next", turn_revision=0, interrupt_response=False),
+        )
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="second", turn_id="turn_next", turn_revision=0),
+        )
+        service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "msg_future_context",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "future client context"}],
+                },
+            ),
+        )
+        service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "sys_future_context",
+                    "type": "message",
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": "future system context"}],
+                },
+            ),
+        )
+        state = service._state(conn_id)
+        state.runtime_config.chat.add_response_item(
+            make_assistant_message("committed first reply"),
+            after_user_id=state.input_item_chat_ids[state.turn_input_item_ids["turn_active"]],
+        )
+
+        service.finish_response(conn_id)
+
+        promoted = prompt_queue.get_nowait()
+        texts = [
+            part.text
+            for item in promoted.chat_snapshot.buffer
+            for part in getattr(item, "content", [])
+            if getattr(part, "text", None)
+        ]
+        assert texts == ["first", "committed first reply", "second"]
+        assert promoted.chat_snapshot.init_chat_message is None
+        assert state.runtime_config.chat.init_chat_message is not None
+        assert state.runtime_config.chat.init_chat_message.content[0].text == "future system context"
+        assert any(
+            getattr(part, "text", None) == "future client context"
+            for item in state.runtime_config.chat.buffer
+            for part in getattr(item, "content", [])
+        )
+        service.unregister(conn_id)
+
+    def test_promoted_turn_refreshes_prior_context_without_later_queued_user(self):
+        prompt_queue = Queue()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            speculative_turns=SpeculativeTurnTracker(),
+            cancel_scope=CancelScope(),
+        )
+        conn_id = service.register()
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_active", turn_revision=0, interrupt_response=False),
+        )
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="first", turn_id="turn_active", turn_revision=0),
+        )
+        prompt_queue.get_nowait()
+        service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(text="first reply", turn_id="turn_active", turn_revision=0),
+        )
+        service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "msg_deferred_context",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "accepted context"}],
+                },
+            ),
+        )
+        for turn_id, transcript in (("turn_next", "second"), ("turn_later", "third")):
+            service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id=turn_id, turn_revision=0, interrupt_response=False),
+            )
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(transcript=transcript, turn_id=turn_id, turn_revision=0),
+            )
+        state = service._state(conn_id)
+        state.runtime_config.chat.add_item(make_assistant_message("committed first reply"))
+
+        service.finish_response(conn_id)
+
+        promoted = prompt_queue.get_nowait()
+        assert promoted.turn_id == "turn_next"
+        assert [(item.role, item.content[0].text) for item in promoted.chat_snapshot.buffer] == [
+            ("user", "first"),
+            ("assistant", "committed first reply"),
+            ("user", "accepted context"),
+            ("user", "second"),
+        ]
+        service.unregister(conn_id)
+
+    def test_promoted_turn_restores_exact_user_after_completed_compaction(self):
+        from speech_to_speech.LLM.chat import Chat, CompactionResult
+
+        prompt_queue = Queue()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            speculative_turns=SpeculativeTurnTracker(),
+            cancel_scope=CancelScope(),
+        )
+        conn_id = service.register()
+        state = service._state(conn_id)
+        state.runtime_config.chat = Chat(size=2)
+
+        for turn_id, transcript in (
+            ("turn_active", "first exact"),
+            ("turn_target", "second exact"),
+            ("turn_later", "third exact"),
+        ):
+            service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id=turn_id, turn_revision=0, interrupt_response=False),
+            )
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(transcript=transcript, turn_id=turn_id, turn_revision=0),
+            )
+            if turn_id == "turn_active":
+                active_request = prompt_queue.get_nowait()
+                service.dispatch_pipeline_event(
+                    conn_id,
+                    AssistantTextEvent(text="first reply", turn_id=turn_id, turn_revision=0),
+                )
+                state.runtime_config.chat.add_response_item(
+                    make_assistant_message("first reply"),
+                    after_user_id=active_request.response_user_item_id,
+                )
+
+        target_chat_id = state.input_item_chat_ids[state.turn_input_item_ids["turn_target"]]
+        # Isolate the completed-compaction restoration branch. Production keeps
+        # this owner leased while active; that hard-eviction invariant has its
+        # own regression test.
+        state.runtime_config.chat.release_response_turn(active_request.response_user_item_id, force=True)
+        state.runtime_config.chat.trim_if_needed(
+            lambda _snapshot: CompactionResult(user_summary="lossy summary", assistant_summary="summary reply")
+        )
+        assert state.runtime_config.chat._compact_thread is not None
+        state.runtime_config.chat._compact_thread.join(timeout=2.0)
+        assert state.runtime_config.chat.user_message(target_chat_id) is None
+
+        service.finish_response(conn_id)
+
+        promoted = prompt_queue.get_nowait()
+        assert promoted.turn_id == "turn_target"
+        assert promoted.response_user_item_id == target_chat_id
+        snapshot_texts = [
+            part.text
+            for item in promoted.chat_snapshot.buffer
+            for part in getattr(item, "content", [])
+            if getattr(part, "text", None)
+        ]
+        assert "second exact" in snapshot_texts
+        assert "third exact" not in snapshot_texts
+        assert state.runtime_config.chat.user_message(target_chat_id) is not None
+        reply = state.runtime_config.chat.add_response_item(
+            make_assistant_message("second exact reply"),
+            after_user_id=promoted.response_user_item_id,
+        )
+        assert reply is not None
+        assert state.runtime_config.chat.response_owner_for_item(reply.id) == target_chat_id
+        service.unregister(conn_id)
+
+    def test_response_fifo_overflow_is_reported_without_replacing_accepted_turns(self):
+        prompt_queue = Queue()
+        service = RealtimeService(text_prompt_queue=prompt_queue)
+        conn_id = service.register()
+        overflow_events = []
+
+        for index in range(10):
+            turn_id = f"turn_{index}"
+            service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id=turn_id, turn_revision=0, interrupt_response=False),
+            )
+            overflow_events = service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(
+                    transcript=f"question {index}",
+                    turn_id=turn_id,
+                    turn_revision=0,
+                ),
+            )
+
+        st = service._state(conn_id)
+        assert st.pending_response_turn_id == "turn_0"
+        assert [request.turn_id for request in st.deferred_response_requests] == [
+            f"turn_{index}" for index in range(1, 9)
+        ]
+        assert overflow_events[-1].type == "error"
+        assert overflow_events[-1].error.type == "response_queue_full"
+        service.unregister(conn_id)
+
+    def test_queued_delete_promotes_a_held_successor_turn(self):
+        tracker = SpeculativeTurnTracker()
+        cancel_scope = CancelScope()
+        prompt_queue = Queue()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            speculative_turns=tracker,
+            cancel_scope=cancel_scope,
+        )
+        conn_id = service.register()
+        queued = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_queued", turn_revision=0),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="first", turn_id="turn_queued", turn_revision=0),
+        )
+        assert prompt_queue.get_nowait().turn_id == "turn_queued"
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_successor", turn_revision=0, interrupt_response=False),
+        )
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="second", turn_id="turn_successor", turn_revision=0),
+        )
+        st = service._state(conn_id)
+        assert st.pending_response_turn_id == "turn_queued"
+        assert len(st.deferred_response_requests) == 1
+        assert st.deferred_response_requests[0].turn_id == "turn_successor"
+        assert prompt_queue.empty()
+
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=queued.item_id),
+        )
+
+        successor = prompt_queue.get_nowait()
+        assert successor.turn_id == "turn_successor"
+        assert successor.cancel_generation == cancel_scope.generation == 1
+        assert st.pending_response_turn_id == "turn_successor"
+        assert st.deferred_response_requests == []
+        service.unregister(conn_id)
+
+    def test_barge_in_releases_successor_promoted_by_queued_delete(self):
+        tracker = SpeculativeTurnTracker()
+        cancel_scope = CancelScope()
+        prompt_queue = Queue()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            speculative_turns=tracker,
+            cancel_scope=cancel_scope,
+        )
+        conn_id = service.register()
+        created_items = {}
+        for turn_id in ("turn_active", "turn_deleted", "turn_promoted"):
+            created_items[turn_id] = service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id=turn_id, turn_revision=0, interrupt_response=False),
+            )[0]
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(transcript=turn_id, turn_id=turn_id, turn_revision=0),
+            )
+            if turn_id == "turn_active":
+                prompt_queue.get_nowait()
+                service.dispatch_pipeline_event(
+                    conn_id,
+                    AssistantTextEvent(text="active reply", turn_id=turn_id, turn_revision=0),
+                )
+
+        state = service._state(conn_id)
+        promoted_chat_id = state.input_item_chat_ids[created_items["turn_promoted"].item_id]
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(
+                type="conversation.item.delete",
+                item_id=created_items["turn_deleted"].item_id,
+            ),
+        )
+
+        assert state.pending_response_turn_id == "turn_promoted"
+        assert promoted_chat_id in state.runtime_config.chat._protected_response_user_ids
+
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_interrupt", turn_revision=0, interrupt_response=True),
+        )
+
+        assert not state.in_response
+        assert not state.response_pending
+        assert promoted_chat_id not in state.runtime_config.chat._protected_response_user_ids
+        service.unregister(conn_id)
+
+    def test_delete_restores_compacted_history_and_removes_only_exact_user(self, service, conn_id):
+        from speech_to_speech.LLM.chat import Chat, CompactionResult, make_assistant_message
+
+        st = service._state(conn_id)
+        st.runtime_config.chat = Chat(size=2)
+        service.text_prompt_queue = None
+        audio_items = []
+        for index in range(3):
+            started = service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id=f"turn_{index}", turn_revision=0),
+            )[0]
+            audio_items.append(started.item_id)
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(
+                    transcript=f"user-{index}",
+                    turn_id=f"turn_{index}",
+                    turn_revision=0,
+                ),
+            )
+            st.runtime_config.chat.add_item(make_assistant_message(f"assistant-{index}"))
+        st.runtime_config.chat.trim_if_needed(
+            lambda _snapshot: CompactionResult(user_summary="summary-user", assistant_summary="summary-assistant")
+        )
+        assert st.runtime_config.chat._compact_thread is not None
+        st.runtime_config.chat._compact_thread.join(timeout=2.0)
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=audio_items[0]),
+        )
+
+        assert isinstance(deleted[0], ConversationItemDeletedEvent)
+        texts = [
+            part.text
+            for item in st.runtime_config.chat.buffer
+            for part in getattr(item, "content", [])
+            if getattr(part, "text", None)
+        ]
+        assert "user-0" not in texts
+        assert "assistant-0" in texts
+        assert "user-1" in texts
+        assert "user-2" in texts
+        assert "summary-user" not in texts
+
+    def test_lossy_eviction_keeps_protocol_visible_item_deletable(self):
+        service = RealtimeService(chat_size=1)
+        conn_id = service.register()
+        for item_id, text in (("msg_old", "old"), ("msg_new", "new")):
+            service.handle_conversation_item_create(
+                conn_id,
+                ConversationItemCreateEvent(
+                    type="conversation.item.create",
+                    item={
+                        "id": item_id,
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": text}],
+                    },
+                ),
+            )
+        st = service._state(conn_id)
+        st.runtime_config.chat.trim_if_needed()
+        assert [item.id for item in st.runtime_config.chat.buffer] == ["msg_new"]
+
+        events = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="msg_old"),
+        )
+
+        assert isinstance(events[0], ConversationItemDeletedEvent)
+        assert st.protocol_item_ids == ["msg_new"]
+        assert [item.id for item in st.runtime_config.chat.buffer] == ["msg_new"]
+        service.unregister(conn_id)
+
+    def test_missing_item_returns_correlated_error(self, service, conn_id):
+        events = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(
+                type="conversation.item.delete",
+                event_id="event_delete",
+                item_id="item_missing",
+            ),
+        )
+
+        assert len(events) == 1
+        assert isinstance(events[0], RealtimeErrorEvent)
+        assert events[0].error.type == "item_not_found"
+        assert events[0].error.event_id == "event_delete"
+
+    def test_guarded_missing_item_delete_poison_is_correlated_and_sticky(self, service, conn_id):
+        _activate_home_assistant_guard(service, conn_id)
+
+        events = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(
+                type="conversation.item.delete",
+                event_id="guarded_delete_missing",
+                item_id="msg_missing",
+            ),
+        )
+
+        assert isinstance(events[0], RealtimeErrorEvent)
+        assert events[0].error.type == "invalid_conversation_item"
+        assert events[0].error.event_id == "guarded_delete_missing"
+        assert service._state(conn_id).runtime_config.home_assistant_guard_failed
+
+    def test_client_item_rebinds_explicit_response_away_from_an_old_audio_turn(self):
+        tracker = SpeculativeTurnTracker()
+        cancel_scope = CancelScope()
+        prompt_queue = Queue()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            speculative_turns=tracker,
+            cancel_scope=cancel_scope,
+        )
+        conn_id = service.register()
+        old_audio = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_old", turn_revision=0),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="old", turn_id="turn_old", turn_revision=0),
+        )
+        prompt_queue.get_nowait()
+        service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(text="old reply", turn_id="turn_old", turn_revision=0),
+        )
+        service.finish_response(conn_id)
+        service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "msg_new",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "new request"}],
+                },
+            ),
+        )
+        service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        prompt_queue.get_nowait()
+        st = service._state(conn_id)
+        generation_before_delete = cancel_scope.generation
+
+        old_deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=old_audio.item_id),
+        )
+
+        assert [event.type for event in old_deleted] == ["conversation.item.deleted"]
+        assert st.in_response
+        assert st.active_response_turn_id is None
+        assert st.active_response_input_item_id == "msg_new"
+        assert cancel_scope.generation == generation_before_delete
+
+        exact_deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="msg_new"),
+        )
+        assert [event.type for event in exact_deleted] == ["conversation.item.deleted", "response.done"]
+        assert st.in_response is False
+        service.unregister(conn_id)
+
+    def test_response_input_clears_obsolete_audio_turn_ownership(self):
+        cancel_scope = CancelScope()
+        prompt_queue = Queue()
+        service = RealtimeService(text_prompt_queue=prompt_queue, cancel_scope=cancel_scope)
+        conn_id = service.register()
+        old_audio = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_old", turn_revision=0),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="old", turn_id="turn_old", turn_revision=0),
+        )
+        prompt_queue.get_nowait()
+        service.finish_response(conn_id)
+        service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "new request"}],
+                        }
+                    ]
+                },
+            ),
+        )
+        prompt_queue.get_nowait()
+        generation_before_delete = cancel_scope.generation
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=old_audio.item_id),
+        )
+
+        assert [event.type for event in deleted] == ["conversation.item.deleted"]
+        assert service._state(conn_id).in_response
+        assert cancel_scope.generation == generation_before_delete
+
+    def test_response_input_reuse_retires_deleted_audio_identity_before_later_delete(self):
+        service = RealtimeService(text_prompt_queue=Queue(), cancel_scope=CancelScope())
+        conn_id = service.register()
+        state = service._state(conn_id)
+        created = service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "msg_inline_reuse",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "old audio transcript"}],
+                },
+            ),
+        )
+        assert created[0].type == "conversation.item.created"
+        state.audio_input_item_ids.add("msg_inline_reuse")
+        state.input_item_chat_ids["msg_inline_reuse"] = "msg_inline_reuse"
+        state.input_item_turn_ids["msg_inline_reuse"] = "turn_inline_old"
+        state.turn_input_item_ids["turn_inline_old"] = "msg_inline_reuse"
+        assert (
+            service.handle_conversation_item_delete(
+                conn_id,
+                ConversationItemDeleteEvent(type="conversation.item.delete", item_id="msg_inline_reuse"),
+            )[0].type
+            == "conversation.item.deleted"
+        )
+
+        response = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": "msg_inline_reuse",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "new inline request"}],
+                        }
+                    ]
+                },
+            ),
+        )
+        assert isinstance(response, ResponseCreatedEvent)
+        assert "msg_inline_reuse" not in state.audio_input_item_ids
+        assert "msg_inline_reuse" not in state.deleted_input_item_ids
+
+        deleted_again = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="msg_inline_reuse"),
+        )
+        assert [event.type for event in deleted_again] == ["conversation.item.deleted", "response.done"]
+        assert state.runtime_config.chat.user_message("msg_inline_reuse") is None
+        service.unregister(conn_id)
+
+    def test_initial_active_response_owner_survives_later_turn_hard_eviction(self):
+        from openai.types.realtime.realtime_conversation_item_function_call import (
+            RealtimeConversationItemFunctionCall,
+        )
+
+        prompt_queue = Queue()
+        tracker = SpeculativeTurnTracker()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            chat_size=1,
+            speculative_turns=tracker,
+            cancel_scope=CancelScope(),
+        )
+        conn_id = service.register()
+        first_audio = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_a", turn_revision=0, interrupt_response=False),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="turn A", turn_id="turn_a", turn_revision=0),
+        )
+        prompt_queue.get_nowait()
+        state = service._state(conn_id)
+        first_chat_id = state.input_item_chat_ids[first_audio.item_id]
+        service.response._ensure_response(conn_id)
+
+        for turn_id, transcript in (("turn_b", "turn B"), ("turn_c", "turn C")):
+            service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id=turn_id, turn_revision=0, interrupt_response=False),
+            )
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(transcript=transcript, turn_id=turn_id, turn_revision=0),
+            )
+
+        chat = state.runtime_config.chat
+        assert chat.user_message(first_chat_id) is not None
+        recorded = chat.add_response_item(
+            RealtimeConversationItemFunctionCall(
+                type="function_call",
+                id="fc_active_owner",
+                call_id="call_active_owner",
+                name="lookup",
+                arguments="{}",
+            ),
+            after_user_id=first_chat_id,
+        )
+        assert isinstance(recorded, RealtimeConversationItemFunctionCall)
+        assert "call_active_owner" in chat._pending_tool_calls
+        service.unregister(conn_id)
+
+    def test_clearing_initial_pending_response_releases_its_eviction_lease(self):
+        prompt_queue = Queue()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            chat_size=1,
+            speculative_turns=SpeculativeTurnTracker(),
+            cancel_scope=CancelScope(),
+        )
+        conn_id = service.register()
+        started = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_pending", turn_revision=0, interrupt_response=False),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(
+                transcript="pending request",
+                turn_id="turn_pending",
+                turn_revision=0,
+            ),
+        )
+        state = service._state(conn_id)
+        chat_id = state.input_item_chat_ids[started.item_id]
+        assert chat_id in state.runtime_config.chat._protected_response_user_ids
+
+        service.response.clear_pending_requests(conn_id)
+
+        assert chat_id not in state.runtime_config.chat._protected_response_user_ids
+        service.unregister(conn_id)
+
+    def test_response_input_rejects_a_duplicate_live_id_without_false_deletion(self, service, conn_id):
+        created = service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "msg_duplicate",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "original"}],
+                },
+            ),
+        )
+        assert created[0].type == "conversation.item.created"
+
+        rejected = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": "msg_duplicate",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "duplicate"}],
+                        }
+                    ]
+                },
+            ),
+        )
+
+        assert isinstance(rejected, RealtimeErrorEvent)
+        assert rejected.error.type == "duplicate_item_id"
+        assert [item.content[0].text for item in service._state(conn_id).runtime_config.chat.buffer] == ["original"]
+
+    def test_deleting_any_recorded_response_input_user_cancels_its_response(self):
+        prompt_queue = Queue()
+        cancel_scope = CancelScope()
+        service = RealtimeService(text_prompt_queue=prompt_queue, cancel_scope=cancel_scope)
+        conn_id = service.register()
+        created = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": "msg_input_one",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "one"}],
+                        },
+                        {
+                            "id": "msg_input_two",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "two"}],
+                        },
+                    ]
+                },
+            ),
+        )
+        assert isinstance(created, ResponseCreatedEvent)
+        prompt_queue.get_nowait()
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="msg_input_one"),
+        )
+
+        assert [event.type for event in deleted] == ["conversation.item.deleted", "response.done"]
+        assert service._state(conn_id).in_response is False
+        assert cancel_scope.generation == 1
+        service.unregister(conn_id)
+
+    def test_multi_input_response_writeback_depends_on_every_serialized_user(self):
+        prompt_queue = Queue()
+        service = RealtimeService(text_prompt_queue=prompt_queue, cancel_scope=CancelScope())
+        conn_id = service.register()
+        created = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": "msg_input_one",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "one"}],
+                        },
+                        {
+                            "id": "msg_input_two",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "two"}],
+                        },
+                    ]
+                },
+            ),
+        )
+        assert isinstance(created, ResponseCreatedEvent)
+        request = prompt_queue.get_nowait()
+        assert request.response_user_item_id == "msg_input_two"
+        assert request.response_user_item_ids == {"msg_input_one", "msg_input_two"}
+        response_item = service._state(conn_id).runtime_config.chat.add_response_item(
+            make_assistant_message("combined answer"),
+            after_user_id=request.response_user_item_id,
+            owner_user_ids=request.response_user_item_ids,
+        )
+        assert response_item is not None and response_item.id is not None
+
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="msg_input_one"),
+        )
+
+        assert all(item.id != response_item.id for item in service._state(conn_id).runtime_config.chat.buffer)
+        service.unregister(conn_id)
+
+    def test_partial_multi_input_delete_preserves_surviving_follow_up_owner(self):
+        prompt_queue = Queue()
+        service = RealtimeService(text_prompt_queue=prompt_queue, cancel_scope=CancelScope())
+        conn_id = service.register()
+        service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": "msg_input_one",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "one"}],
+                        },
+                        {
+                            "id": "msg_input_two",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "two"}],
+                        },
+                    ]
+                },
+            ),
+        )
+        prompt_queue.get_nowait()
+        service.finish_response(conn_id)
+
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="msg_input_one"),
+        )
+        state = service._state(conn_id)
+        assert state.response_context_input_item_id == "msg_input_two"
+        assert state.response_context_input_item_ids == {"msg_input_two"}
+
+        service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        follow_up = prompt_queue.get_nowait()
+        assert follow_up.response_user_item_id == "msg_input_two"
+        assert follow_up.response_user_item_ids == {"msg_input_two"}
+        response_item = state.runtime_config.chat.add_response_item(
+            make_assistant_message("surviving answer"),
+            after_user_id=follow_up.response_user_item_id,
+            owner_user_ids=follow_up.response_user_item_ids,
+        )
+        assert response_item is not None and response_item.id is not None
+        service.finish_response(conn_id)
+
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="msg_input_two"),
+        )
+
+        assert all(item.id != response_item.id for item in state.runtime_config.chat.buffer)
+        service.unregister(conn_id)
+
+    def test_response_input_dependency_batch_cannot_exceed_protocol_bound(self, monkeypatch):
+        import speech_to_speech.api.openai_realtime.service as service_module
+
+        monkeypatch.setattr(service_module, "MAX_TRACKED_PROTOCOL_ITEMS", 5)
+        monkeypatch.setattr(service_module, "MAX_DEFERRED_RESPONSE_REQUESTS", 1)
+
+        accepted_queue = Queue()
+        accepted_service = RealtimeService(text_prompt_queue=accepted_queue, cancel_scope=CancelScope())
+        accepted_conn_id = accepted_service.register()
+        accepted = accepted_service.handle_response_create(
+            accepted_conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": f"msg_accepted_{index}",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": str(index)}],
+                        }
+                        for index in range(2)
+                    ]
+                },
+            ),
+        )
+        assert accepted is not None and accepted.type == "response.created"
+        accepted_queue.get_nowait()
+        assert accepted_service._state(accepted_conn_id).response_context_input_item_ids == {
+            "msg_accepted_0",
+            "msg_accepted_1",
+        }
+        accepted_service.unregister(accepted_conn_id)
+
+        service = RealtimeService(text_prompt_queue=Queue(), cancel_scope=CancelScope())
+        conn_id = service.register()
+
+        rejected = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": f"msg_input_{index}",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": str(index)}],
+                        }
+                        for index in range(3)
+                    ]
+                },
+            ),
+        )
+
+        state = service._state(conn_id)
+        assert isinstance(rejected, RealtimeErrorEvent)
+        assert rejected.error.type == "invalid_input_item"
+        assert state.runtime_config.chat.buffer == []
+        assert state.protocol_item_ids == []
+        assert state.response_context_input_item_ids == set()
+        assert state.admitting_response_input_item_ids == set()
+        service.unregister(conn_id)
+
+    def test_response_input_dependencies_reserve_supported_turn_fifo(self, monkeypatch):
+        import speech_to_speech.api.openai_realtime.service as service_module
+
+        monkeypatch.setattr(service_module, "MAX_TRACKED_PROTOCOL_ITEMS", 4)
+        monkeypatch.setattr(service_module, "MAX_DEFERRED_RESPONSE_REQUESTS", 1)
+        tracker = SpeculativeTurnTracker()
+        prompt_queue = Queue()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            speculative_turns=tracker,
+            cancel_scope=CancelScope(),
+        )
+        conn_id = service.register()
+
+        created = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": "msg_input_active",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "active"}],
+                        }
+                    ]
+                },
+            ),
+        )
+        assert created is not None and created.type == "response.created"
+        prompt_queue.get_nowait()
+
+        turn_items = {}
+        for turn_id in ("turn_pending", "turn_deferred"):
+            turn_items[turn_id] = service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id=turn_id, turn_revision=0, interrupt_response=False),
+            )[0].item_id
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(transcript=turn_id, turn_id=turn_id, turn_revision=0),
+            )
+
+        state = service._state(conn_id)
+        assert state.pending_response_turn_id == "turn_pending"
+        assert [request.turn_id for request in state.deferred_response_requests] == ["turn_deferred"]
+        for turn_id, item_id in turn_items.items():
+            assert item_id in state.protocol_item_ids
+            assert state.turn_input_item_ids[turn_id] == item_id
+            assert tracker.is_latest(turn_id, 0)
+        service.unregister(conn_id)
+
+    def test_protocol_retirement_prunes_completed_response_context(self, monkeypatch):
+        import speech_to_speech.api.openai_realtime.service as service_module
+
+        monkeypatch.setattr(service_module, "MAX_TRACKED_PROTOCOL_ITEMS", 5)
+        monkeypatch.setattr(service_module, "MAX_DEFERRED_RESPONSE_REQUESTS", 1)
+        service = RealtimeService(text_prompt_queue=Queue(), cancel_scope=CancelScope())
+        conn_id = service.register()
+        service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": f"msg_input_{index}",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": str(index)}],
+                        }
+                        for index in range(2)
+                    ]
+                },
+            ),
+        )
+        service.finish_response(conn_id)
+        state = service._state(conn_id)
+
+        for index in range(5):
+            state.record_protocol_item(f"item_later_{index}")
+
+        assert len(state.protocol_item_ids) == 5
+        assert state.response_context_input_item_id is None
+        assert state.response_context_input_item_ids == set()
+        service.unregister(conn_id)
+
+    def test_multi_input_dependencies_survive_a_tool_follow_up(self):
+        from openai.types.realtime.realtime_conversation_item_function_call import (
+            RealtimeConversationItemFunctionCall,
+        )
+
+        prompt_queue = Queue()
+        service = RealtimeService(text_prompt_queue=prompt_queue, cancel_scope=CancelScope())
+        conn_id = service.register()
+        service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": "msg_input_one",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "one"}],
+                        },
+                        {
+                            "id": "msg_input_two",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "two"}],
+                        },
+                    ]
+                },
+            ),
+        )
+        first_request = prompt_queue.get_nowait()
+        chat = service._state(conn_id).runtime_config.chat
+        chat.add_response_item(
+            RealtimeConversationItemFunctionCall(
+                type="function_call",
+                call_id="call_multi",
+                name="lookup",
+                arguments="{}",
+            ),
+            after_user_id=first_request.response_user_item_id,
+            owner_user_ids=first_request.response_user_item_ids,
+        )
+        service.finish_response(conn_id)
+        created = service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "fco_multi",
+                    "type": "function_call_output",
+                    "call_id": "call_multi",
+                    "output": "result",
+                },
+            ),
+        )
+        assert created[0].type == "conversation.item.created"
+
+        service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        follow_up = prompt_queue.get_nowait()
+        assert follow_up.response_user_item_id == "msg_input_two"
+        assert follow_up.response_user_item_ids == {"msg_input_one", "msg_input_two"}
+        response_item = chat.add_response_item(
+            make_assistant_message("follow-up answer"),
+            after_user_id=follow_up.response_user_item_id,
+            owner_user_ids=follow_up.response_user_item_ids,
+        )
+        assert response_item is not None and response_item.id is not None
+
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="msg_input_one"),
+        )
+
+        assert all(item.id != response_item.id for item in chat.buffer)
+        service.unregister(conn_id)
+
+    def test_inline_tool_output_inherits_every_original_response_input_dependency(self):
+        from openai.types.realtime.realtime_conversation_item_function_call import (
+            RealtimeConversationItemFunctionCall,
+        )
+
+        prompt_queue = Queue()
+        cancel_scope = CancelScope()
+        service = RealtimeService(text_prompt_queue=prompt_queue, cancel_scope=cancel_scope)
+        conn_id = service.register()
+        service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": "msg_inline_one",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "one"}],
+                        },
+                        {
+                            "id": "msg_inline_two",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "two"}],
+                        },
+                    ]
+                },
+            ),
+        )
+        first_request = prompt_queue.get_nowait()
+        chat = service._state(conn_id).runtime_config.chat
+        chat.add_response_item(
+            RealtimeConversationItemFunctionCall(
+                type="function_call",
+                call_id="call_inline",
+                name="lookup",
+                arguments="{}",
+            ),
+            after_user_id=first_request.response_user_item_id,
+            owner_user_ids=first_request.response_user_item_ids,
+        )
+        service.finish_response(conn_id)
+
+        created = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": "fco_inline",
+                            "type": "function_call_output",
+                            "call_id": "call_inline",
+                            "output": "result",
+                        }
+                    ]
+                },
+            ),
+        )
+
+        assert isinstance(created, ResponseCreatedEvent)
+        follow_up = prompt_queue.get_nowait()
+        assert follow_up.response_user_item_id == "msg_inline_two"
+        assert follow_up.response_user_item_ids == {"msg_inline_one", "msg_inline_two"}
+        state = service._state(conn_id)
+        assert state.active_response_input_item_ids == {"msg_inline_one", "msg_inline_two"}
+        response_item = chat.add_response_item(
+            make_assistant_message("inline follow-up"),
+            after_user_id=follow_up.response_user_item_id,
+            owner_user_ids=follow_up.response_user_item_ids,
+        )
+        assert response_item is not None and response_item.id is not None
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="msg_inline_one"),
+        )
+
+        assert [event.type for event in deleted] == ["conversation.item.deleted", "response.done"]
+        assert cancel_scope.generation == 1
+        assert all(item.id != response_item.id for item in chat.buffer)
+        service.unregister(conn_id)
+
+    def test_mixed_inline_input_anchors_writeback_after_last_canonical_user(self):
+        from openai.types.realtime.realtime_conversation_item_function_call import (
+            RealtimeConversationItemFunctionCall,
+        )
+
+        prompt_queue = Queue()
+        service = RealtimeService(text_prompt_queue=prompt_queue, cancel_scope=CancelScope())
+        conn_id = service.register()
+        service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": "msg_older_owner",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "older owner"}],
+                        }
+                    ]
+                },
+            ),
+        )
+        first_request = prompt_queue.get_nowait()
+        chat = service._state(conn_id).runtime_config.chat
+        chat.add_response_item(
+            RealtimeConversationItemFunctionCall(
+                type="function_call",
+                call_id="call_mixed",
+                name="lookup",
+                arguments="{}",
+            ),
+            after_user_id=first_request.response_user_item_id,
+        )
+        service.finish_response(conn_id)
+
+        created = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": "msg_new_prompt",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "new prompt"}],
+                        },
+                        {
+                            "id": "fco_mixed",
+                            "type": "function_call_output",
+                            "call_id": "call_mixed",
+                            "output": "result",
+                        },
+                    ]
+                },
+            ),
+        )
+
+        assert isinstance(created, ResponseCreatedEvent)
+        request = prompt_queue.get_nowait()
+        assert request.response_user_item_id == "msg_new_prompt"
+        assert request.response_user_item_ids == {"msg_older_owner", "msg_new_prompt"}
+        service.unregister(conn_id)
+
+    def test_promoted_snapshot_excludes_protocol_id_recreated_after_admission(self):
+        service = RealtimeService(text_prompt_queue=Queue(), cancel_scope=CancelScope())
+        conn_id = service.register()
+        for item_id, text in (("msg_target", "target"), ("msg_reused", "old value")):
+            events = service.handle_conversation_item_create(
+                conn_id,
+                ConversationItemCreateEvent(
+                    type="conversation.item.create",
+                    item={
+                        "id": item_id,
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": text}],
+                    },
+                ),
+            )
+            assert [event.type for event in events] == ["conversation.item.created"]
+        state = service._state(conn_id)
+        state.turn_input_item_ids["turn_target"] = "msg_target"
+        state.input_item_chat_ids["msg_target"] = "msg_target"
+        request = GenerateResponseRequest(
+            runtime_config=state.runtime_config,
+            chat_snapshot=state.runtime_config.chat.copy(),
+            response_user_item_id="msg_target",
+            response_user_item_ids={"msg_target"},
+            admitted_protocol_item_ids=set(state.protocol_item_ids),
+            admitted_protocol_sequence=state.next_protocol_item_sequence,
+            turn_id="turn_target",
+            turn_revision=0,
+        )
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="msg_reused"),
+        )
+        assert deleted[0].type == "conversation.item.deleted"
+        recreated = service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "msg_reused",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "new value"}],
+                },
+            ),
+        )
+        assert recreated[0].type == "conversation.item.created"
+
+        service.response.resume_pending_request(conn_id, request, enqueue=False)
+
+        promoted = state.pending_response_request
+        assert promoted is not None and promoted.chat_snapshot is not None
+        serialized = promoted.chat_snapshot.to_responses_api_chat()
+        serialized_text = json.dumps(serialized)
+        assert "target" in serialized_text
+        assert "new value" not in serialized_text
+        service.unregister(conn_id)
+
+    def test_deleted_audio_id_reused_as_user_item_loses_stale_audio_identity(self, service, conn_id):
+        created = service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "msg_reused_audio",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "old audio transcript"}],
+                },
+            ),
+        )
+        assert created[0].type == "conversation.item.created"
+        state = service._state(conn_id)
+        state.audio_input_item_ids.add("msg_reused_audio")
+        state.input_item_chat_ids["msg_reused_audio"] = "msg_reused_audio"
+        state.input_item_turn_ids["msg_reused_audio"] = "turn_old_audio"
+        state.turn_input_item_ids["turn_old_audio"] = "msg_reused_audio"
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="msg_reused_audio"),
+        )
+        assert deleted[0].type == "conversation.item.deleted"
+        assert "msg_reused_audio" in state.audio_input_item_ids
+        assert "msg_reused_audio" in state.deleted_input_item_ids
+
+        recreated = service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "msg_reused_audio",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "new text item"}],
+                },
+            ),
+        )
+        assert recreated[0].type == "conversation.item.created"
+        assert "msg_reused_audio" not in state.audio_input_item_ids
+        assert "msg_reused_audio" not in state.deleted_input_item_ids
+        assert "msg_reused_audio" not in state.input_item_turn_ids
+        assert "turn_old_audio" not in state.turn_input_item_ids
+
+        deleted_again = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="msg_reused_audio"),
+        )
+        assert deleted_again[0].type == "conversation.item.deleted"
+        assert state.runtime_config.chat.user_message("msg_reused_audio") is None
+
+    def test_deferred_user_reusing_deleted_audio_id_can_be_deleted_before_flush(self):
+        service = RealtimeService(text_prompt_queue=Queue(), cancel_scope=CancelScope())
+        conn_id = service.register()
+        started = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_old_audio", turn_revision=0),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(
+                transcript="old audio transcript",
+                turn_id="turn_old_audio",
+                turn_revision=0,
+            ),
+        )
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=started.item_id),
+        )
+        state = service._state(conn_id)
+        assert started.item_id in state.audio_input_item_ids
+        assert started.item_id in state.deleted_input_item_ids
+
+        active = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": "msg_active_owner",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "active"}],
+                        }
+                    ]
+                },
+            ),
+        )
+        assert isinstance(active, ResponseCreatedEvent)
+        deferred = service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": started.item_id,
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "replacement"}],
+                },
+            ),
+        )
+        assert deferred == []
+        assert started.item_id not in state.audio_input_item_ids
+        assert [item.id for item in state.deferred_items] == [started.item_id]
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=started.item_id),
+        )
+
+        assert [event.type for event in deleted] == ["conversation.item.deleted"]
+        assert state.deferred_items == []
+        service.finish_response(conn_id)
+        assert state.runtime_config.chat.user_message(started.item_id) is None
+        service.unregister(conn_id)
+
+    def test_untranscribed_audio_delete_never_removes_the_prior_turn(self, service, conn_id):
+        st = service._state(conn_id)
+        first = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_1", turn_revision=0),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="keep me", turn_id="turn_1", turn_revision=0),
+        )
+        second = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_2", turn_revision=0),
+        )[0]
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(
+                type="conversation.item.delete",
+                event_id="delete_second",
+                item_id=second.item_id,
+            ),
+        )
+
+        assert isinstance(deleted[0], ConversationItemDeletedEvent)
+        assert [item.content[0].text for item in st.runtime_config.chat.buffer] == ["keep me"]
+        assert st.last_item_id == first.item_id
+
+    def test_deleted_speculative_turn_cannot_reopen_or_recreate_history(self):
+        tracker = SpeculativeTurnTracker()
+        service = RealtimeService(speculative_turns=tracker)
+        conn_id = service.register()
+        st = service._state(conn_id)
+        started = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_1", turn_revision=0),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="assistant echo", turn_id="turn_1", turn_revision=0),
+        )
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(
+                type="conversation.item.delete",
+                event_id="delete_turn",
+                item_id=started.item_id,
+            ),
+        )
+
+        assert tracker.begin_reopen_candidate("turn_1", 0) is None
+        assert (
+            service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id="turn_1", turn_revision=1, reopened=True),
+            )
+            == []
+        )
+        assert (
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(transcript="assistant echo again", turn_id="turn_1", turn_revision=1),
+            )
+            == []
+        )
+        assert st.runtime_config.chat.buffer == []
+        service.unregister(conn_id)
+
+    def test_late_speech_stop_stays_stale_after_exact_tombstone_eviction(self):
+        tracker = SpeculativeTurnTracker(max_tracked_turns=1)
+        service = RealtimeService(speculative_turns=tracker)
+        conn_id = service.register()
+        for turn_id in ("turn_deleted_1", "turn_deleted_2"):
+            started = service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id=turn_id, turn_revision=0),
+            )[0]
+            service.handle_conversation_item_delete(
+                conn_id,
+                ConversationItemDeleteEvent(type="conversation.item.delete", item_id=started.item_id),
+            )
+
+        assert "turn_deleted_1" not in tracker._discarded_turn_ids
+        assert (
+            service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStoppedEvent(turn_id="turn_deleted_1", turn_revision=0, audio_end_ms=10),
+            )
+            == []
+        )
+        service.unregister(conn_id)
+
+    def test_reusing_existing_protocol_item_never_moves_the_creation_tail(self, service, conn_id):
+        st = service._state(conn_id)
+        st.record_protocol_item("item_audio")
+        st.record_protocol_item("item_tool")
+        st.record_protocol_item("item_audio")
+
+        created = service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "msg_after",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "after"}],
+                },
+            ),
+        )[0]
+
+        assert created.previous_item_id == "item_tool"
+
+    def test_deleted_audio_indexes_are_bounded_and_retire_correlated_maps(self, service, conn_id, monkeypatch):
+        import speech_to_speech.api.openai_realtime.service as service_module
+
+        monkeypatch.setattr(service_module, "MAX_TRACKED_PROTOCOL_ITEMS", 2)
+        st = service._state(conn_id)
+        for index in range(3):
+            item_id = f"item_{index}"
+            turn_id = f"turn_{index}"
+            st.audio_input_item_ids.add(item_id)
+            st.input_item_turn_ids[item_id] = turn_id
+            st.turn_input_item_ids[turn_id] = item_id
+            st.record_deleted_input_item(item_id)
+
+        assert list(st.deleted_input_item_ids) == ["item_1", "item_2"]
+        assert "item_0" not in st.audio_input_item_ids
+        assert "item_0" not in st.input_item_turn_ids
+        assert "turn_0" not in st.turn_input_item_ids
+
+    def test_protocol_index_retirement_permanently_discards_late_audio_turn(self, monkeypatch):
+        import speech_to_speech.api.openai_realtime.service as service_module
+
+        monkeypatch.setattr(service_module, "MAX_TRACKED_PROTOCOL_ITEMS", 2)
+        tracker = SpeculativeTurnTracker()
+        service = RealtimeService(speculative_turns=tracker)
+        conn_id = service.register()
+        state = service._state(conn_id)
+        for index in range(3):
+            item_id = f"item_{index}"
+            turn_id = f"turn_{index}"
+            tracker.observe(turn_id, 0)
+            state.audio_input_item_ids.add(item_id)
+            state.input_item_turn_ids[item_id] = turn_id
+            state.turn_input_item_ids[turn_id] = item_id
+            state.record_protocol_item(item_id)
+
+        assert not tracker.is_latest("turn_0", 0)
+        assert (
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(transcript="must stay retired", turn_id="turn_0", turn_revision=0),
+            )
+            == []
+        )
+        assert not any(
+            getattr(part, "text", None) == "must stay retired"
+            for item in state.runtime_config.chat.buffer
+            for part in getattr(item, "content", [])
+        )
+        service.unregister(conn_id)
+
+    def test_protocol_index_retains_pending_and_active_response_owner(self, monkeypatch):
+        import speech_to_speech.api.openai_realtime.service as service_module
+
+        monkeypatch.setattr(service_module, "MAX_TRACKED_PROTOCOL_ITEMS", 2)
+        tracker = SpeculativeTurnTracker()
+        prompt_queue = Queue()
+        service = RealtimeService(text_prompt_queue=prompt_queue, speculative_turns=tracker)
+        conn_id = service.register()
+        owner = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_owner", turn_revision=0, interrupt_response=False),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="keep my turn", turn_id="turn_owner", turn_revision=0),
+        )
+        request = prompt_queue.get_nowait()
+        state = service._state(conn_id)
+
+        for item_id in ("msg_ordinary_a", "msg_ordinary_b"):
+            service.handle_conversation_item_create(
+                conn_id,
+                ConversationItemCreateEvent(
+                    type="conversation.item.create",
+                    item={
+                        "id": item_id,
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": item_id}],
+                    },
+                ),
+            )
+
+        assert owner.item_id in state.protocol_item_ids
+        assert "msg_ordinary_a" not in state.protocol_item_ids
+        assert state.turn_input_item_ids["turn_owner"] == owner.item_id
+        assert tracker.is_latest("turn_owner", 0)
+
+        service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(
+                parts=[
+                    AssistantTextPart(text="answer"),
+                    AssistantToolCallPart(
+                        tool={"type": "function_call", "call_id": "call_owner", "name": "lookup", "arguments": "{}"}
+                    ),
+                ],
+                turn_id=request.turn_id,
+                turn_revision=request.turn_revision,
+            ),
+        )
+
+        assert state.in_response
+        assert state.active_response_turn_id == "turn_owner"
+        assert owner.item_id in state.protocol_item_ids
+        assert state.input_item_turn_ids[owner.item_id] == "turn_owner"
+        assert tracker.is_latest("turn_owner", 0)
+
+        service.finish_response(conn_id)
+
+        assert not state.in_response
+        assert not state.response_pending
+        service.unregister(conn_id)
+
+    def test_audio_tail_delete_restores_protocol_visible_predecessor(self, service, conn_id):
+        first = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_1", turn_revision=0),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="first", turn_id="turn_1", turn_revision=0),
+        )
+        second = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_2", turn_revision=0),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="second", turn_id="turn_2", turn_revision=0),
+        )
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=second.item_id),
+        )
+
+        created = service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "msg_after",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "after"}],
+                },
+            ),
+        )[0]
+
+        assert created.previous_item_id == first.item_id
+
+    def test_deferred_flush_never_uses_an_unacknowledged_item_as_predecessor(self, service, conn_id):
+        service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "id": "msg_a",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "a"}],
+                },
+            ),
+        )
+        st = service._state(conn_id)
+        st.in_response = True
+        for item_id in ("msg_b", "msg_c"):
+            service.handle_conversation_item_create(
+                conn_id,
+                ConversationItemCreateEvent(
+                    type="conversation.item.create",
+                    item={
+                        "id": item_id,
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": item_id}],
+                    },
+                ),
+            )
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="msg_a"),
+        )
+
+        created = service.conversation.flush_deferred_items(conn_id)
+
+        assert [(event.item.id, event.previous_item_id) for event in created] == [
+            ("msg_b", None),
+            ("msg_c", "msg_b"),
+        ]
+
+    def test_barrier_rejection_keeps_delete_event_correlation(self, service, conn_id):
+        service._state(conn_id).runtime_config.transcript_barrier_pending_sequence = 1
+
+        error = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(
+                type="conversation.item.delete",
+                event_id="delete_pending",
+                item_id="msg_x",
+            ),
+        )[0]
+
+        assert error.error.type == "transcript_barrier_pending"
+        assert error.error.event_id == "delete_pending"
+
+
 class TestDeferConversationItemsDuringResponse:
     """conversation.item.create is buffered while a response is generating and
     flushed, in order, once it completes — so a client item never races the LLM
@@ -912,6 +3286,78 @@ class TestDeferConversationItemsDuringResponse:
         assert not any(isinstance(e, RealtimeErrorEvent) for e in finish_events)
         assert chat._has_call_id_in_buffer("call_1")
         assert chat.buffer[-1].type == "function_call_output"
+
+    def test_tool_result_follow_up_keeps_original_user_deletion_owner(
+        self,
+        service,
+        conn_id,
+        text_prompt_queue,
+    ):
+        from openai.types.realtime.realtime_conversation_item_function_call import (
+            RealtimeConversationItemFunctionCall,
+        )
+
+        st = service._state(conn_id)
+        chat = st.runtime_config.chat
+        started = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_owner", turn_revision=0, interrupt_response=False),
+        )[0]
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="look this up", turn_id="turn_owner", turn_revision=0),
+        )
+        first_request = text_prompt_queue.get_nowait()
+        assert first_request.response_user_item_id is not None
+        service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(text="checking", turn_id="turn_owner", turn_revision=0),
+        )
+        chat.add_response_item(
+            RealtimeConversationItemFunctionCall(
+                type="function_call",
+                call_id="call_owned",
+                name="search",
+                arguments="{}",
+            ),
+            after_user_id=first_request.response_user_item_id,
+        )
+        service.finish_response(conn_id)
+        created = service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={"type": "function_call_output", "output": "result", "call_id": "call_owned"},
+            ),
+        )
+        output_id = created[0].item.id
+
+        assert output_id is not None
+        assert chat.response_owner_for_item(output_id) == first_request.response_user_item_id
+        assert st.response_context_input_item_id == started.item_id
+        assert st.response_context_input_item_ids == {started.item_id}
+
+        response_created = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        assert isinstance(response_created, ResponseCreatedEvent)
+        request = text_prompt_queue.get_nowait()
+        assert request.response_user_item_id == first_request.response_user_item_id
+        assert st.active_response_input_item_ids == {started.item_id}
+        chat.add_response_item(make_assistant_message("owned follow-up"), after_user_id=request.response_user_item_id)
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=started.item_id),
+        )
+
+        assert isinstance(deleted[0], ConversationItemDeletedEvent)
+        assert any(isinstance(event, ResponseDoneEvent) for event in deleted)
+        assert not st.in_response
+        assert all(
+            getattr(part, "text", None) not in {"look this up", "owned follow-up"}
+            for item in chat.buffer
+            for part in getattr(item, "content", [])
+        )
+        assert not any(getattr(item, "call_id", None) == "call_owned" for item in chat.buffer)
 
     def test_guarded_deferred_batch_is_atomic_when_later_output_is_invalid(
         self,
@@ -1007,6 +3453,37 @@ class TestHandleResponseCreate:
         assert isinstance(err, RealtimeErrorEvent)
         assert err.error.type == "conversation_already_has_active_response"
 
+    def test_response_create_rejects_pending_implicit_fifo_without_mutation(self):
+        prompt_queue = Queue()
+        tracker = SpeculativeTurnTracker()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            speculative_turns=tracker,
+            cancel_scope=CancelScope(),
+        )
+        conn_id = service.register()
+        for turn_id in ("turn_a", "turn_b"):
+            service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id=turn_id, turn_revision=0, interrupt_response=False),
+            )
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(transcript=turn_id, turn_id=turn_id, turn_revision=0),
+            )
+
+        rejected = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+
+        state = service._state(conn_id)
+        assert isinstance(rejected, RealtimeErrorEvent)
+        assert rejected.error.type == "conversation_already_has_active_response"
+        assert state.response_pending and not state.in_response
+        assert state.pending_response_turn_id == "turn_a"
+        assert [request.turn_id for request in state.deferred_response_requests] == ["turn_b"]
+        assert prompt_queue.get_nowait().turn_id == "turn_a"
+        assert prompt_queue.empty()
+        service.unregister(conn_id)
+
     def test_response_create_stores_overrides(self, service, conn_id, runtime_config, text_prompt_queue):
         evt = ResponseCreateEvent(
             type="response.create",
@@ -1040,6 +3517,7 @@ class TestHandleResponseCreate:
         assert initial_req.turn_id == "turn_1"
         assert initial_req.turn_revision == 2
         assert initial_req.speech_stopped_at_s == 123.0
+        service.finish_response(conn_id)
 
         result = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
 
@@ -1217,6 +3695,7 @@ class TestHandleResponseCreate:
             ),
         )
         text_prompt_queue.get()  # drain the STT-triggered request
+        service.finish_response(conn_id)
 
         result = service.handle_response_create(
             conn_id, ResponseCreateEvent(type="response.create", response={"conversation": "none"})
@@ -1495,8 +3974,9 @@ class TestDispatchPipelineEvent:
         assert evt.audio_start_ms == 0
         assert evt.item_id.startswith("item_")
 
-    def test_speech_started_cancels_active_response(self, service, conn_id):
+    def test_speech_started_cancels_active_response(self, service, conn_id, cancel_scope):
         service.encode_audio_chunk(conn_id, _pcm_bytes(256))
+        generation = cancel_scope.generation
         events = service.dispatch_pipeline_event(
             conn_id,
             SpeechStartedEvent(),
@@ -1508,6 +3988,49 @@ class TestDispatchPipelineEvent:
         assert done.response.status_details.reason == "turn_detected"
         speech = [e for e in events if isinstance(e, InputAudioBufferSpeechStartedEvent)]
         assert len(speech) == 1
+        assert cancel_scope.generation == generation + 1
+
+    def test_barge_in_generation_is_stale_before_waiting_history_writer_can_commit(
+        self,
+        service,
+        conn_id,
+        cancel_scope,
+        monkeypatch,
+    ):
+        service.encode_audio_chunk(conn_id, _pcm_bytes(256))
+        state = service._state(conn_id)
+        generation = cancel_scope.generation
+        writer_ready = Event()
+        committed = Event()
+        writer_threads: list[Thread] = []
+        original_finish = service.response.finish_response
+
+        def provider_writeback():
+            writer_ready.set()
+            with state.runtime_config.transcript_barrier_state_guard():
+                if not cancel_scope.is_stale(generation):
+                    state.runtime_config.chat.add_response_item(
+                        make_assistant_message("unheard response"),
+                        after_user_id=None,
+                    )
+                    committed.set()
+
+        def finish_while_provider_waits(*args, **kwargs):
+            writer = Thread(target=provider_writeback)
+            writer_threads.append(writer)
+            writer.start()
+            assert writer_ready.wait(timeout=1.0)
+            return original_finish(*args, **kwargs)
+
+        monkeypatch.setattr(service.response, "finish_response", finish_while_provider_waits)
+
+        service.dispatch_pipeline_event(conn_id, SpeechStartedEvent())
+
+        writer_threads[0].join(timeout=1.0)
+        assert not writer_threads[0].is_alive()
+        assert cancel_scope.is_stale(generation)
+        assert not committed.is_set()
+        assert state.runtime_config.chat.buffer == []
 
     def test_speech_started_no_response_emits_only_started(self, service, conn_id):
         """speech_started without active response emits only the started event."""
@@ -2655,7 +5178,7 @@ class TestDispatchPipelineEvent:
             conn_id,
             SpeechStoppedEvent(duration_s=2.0, turn_id="turn_1", turn_revision=1),
         )
-        service.dispatch_pipeline_event(
+        empty_events = service.dispatch_pipeline_event(
             conn_id,
             TranscriptionCompletedEvent(transcript="", turn_id="turn_1", turn_revision=1),
         )
@@ -2665,7 +5188,73 @@ class TestDispatchPipelineEvent:
         first_req = text_prompt_queue.get_nowait()
         assert first_req.turn_revision == 0
         assert text_prompt_queue.empty()
-        assert service._state(conn_id).response_usage.audio_duration_s == 2.0
+        assert any(isinstance(event, ResponseCreatedEvent) for event in empty_events)
+        assert any(isinstance(event, ResponseDoneEvent) for event in empty_events)
+        assert not service._state(conn_id).in_response
+        assert not service._state(conn_id).response_pending
+        assert service.total_usage.audio_duration_s == 2.0
+        assert service.total_usage.responses_cancelled == 1
+        service.unregister(conn_id)
+
+    def test_empty_active_revision_closes_lane_before_the_next_turn(self, runtime_config, should_listen):
+        text_prompt_queue = Queue()
+        tracker = SpeculativeTurnTracker()
+        cancel_scope = CancelScope()
+        service = RealtimeService(
+            text_prompt_queue=text_prompt_queue,
+            should_listen=should_listen,
+            speculative_turns=tracker,
+            cancel_scope=cancel_scope,
+        )
+        conn_id = service.register()
+        service._state(conn_id).runtime_config = runtime_config
+
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_empty", turn_revision=0, interrupt_response=False),
+        )
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="false start", turn_id="turn_empty", turn_revision=0),
+        )
+        assert text_prompt_queue.get_nowait().turn_revision == 0
+        service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(text="stale reply", turn_id="turn_empty", turn_revision=0),
+        )
+        assert service._state(conn_id).in_response
+
+        tracker.observe("turn_empty", 1)
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(
+                turn_id="turn_empty",
+                turn_revision=1,
+                reopened=True,
+                interrupt_response=False,
+            ),
+        )
+        terminal = service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="", turn_id="turn_empty", turn_revision=1),
+        )
+
+        assert any(isinstance(event, ResponseDoneEvent) and event.response.status == "cancelled" for event in terminal)
+        assert not service._state(conn_id).in_response
+        assert not service._state(conn_id).response_pending
+        assert cancel_scope.generation == 1
+
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_next", turn_revision=0, interrupt_response=False),
+        )
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="real question", turn_id="turn_next", turn_revision=0),
+        )
+        successor = text_prompt_queue.get_nowait()
+        assert successor.turn_id == "turn_next"
+        assert service._state(conn_id).response_pending
         service.unregister(conn_id)
 
     def test_empty_first_revision_tracks_audio_for_later_nonempty_reopen(self, runtime_config, should_listen):
@@ -2795,23 +5384,235 @@ class TestDispatchPipelineEvent:
 
     # -- response_failed --
 
+    def test_zero_output_success_emits_created_and_done_for_pending_response(self):
+        prompt_queue = Queue()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            speculative_turns=SpeculativeTurnTracker(),
+            cancel_scope=CancelScope(),
+        )
+        conn_id = service.register()
+        for turn_id, transcript in (("turn_empty", "empty response"), ("turn_successor", "next response")):
+            service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id=turn_id, turn_revision=0, interrupt_response=False),
+            )
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(transcript=transcript, turn_id=turn_id, turn_revision=0),
+            )
+        request = prompt_queue.get_nowait()
+        assert request.turn_id == "turn_empty"
+
+        events = service.finish_response(conn_id)
+
+        assert [event.type for event in events] == ["response.created", "response.done"]
+        assert events[0].response.id == events[1].response.id
+        assert events[1].response.status == "completed"
+        state = service._state(conn_id)
+        successor = prompt_queue.get_nowait()
+        assert successor.turn_id == "turn_successor"
+        assert not state.in_response and state.response_pending
+        assert state.pending_response_request is successor
+        service.unregister(conn_id)
+
     def test_response_failed_emits_error_and_failed_done(self, service, conn_id):
         service.response._ensure_response(conn_id)
+        generation = service.cancel_scope.generation
+        service._state(conn_id).active_response_cancel_generation = generation
         events = service.dispatch_pipeline_event(
             conn_id,
-            ResponseFailedEvent(message="input must not be empty"),
+            ResponseFailedEvent(message="input must not be empty", cancel_generation=generation),
         )
-        # A top-level error event carries the reason (response.done can't), then
-        # the response is closed as failed.
+        # A top-level error event carries the reason (response.done can't). The
+        # response stays active until its normal terminal sentinel reaches the
+        # audio side, preventing that sentinel from closing a successor.
         err = events[0]
         assert isinstance(err, RealtimeErrorEvent)
         assert err.error.message == "input must not be empty"
         assert err.error.type == "response_failed"
-        done = [e for e in events if isinstance(e, ResponseDoneEvent)]
+        assert not any(isinstance(event, ResponseDoneEvent) for event in events)
+        assert service._state(conn_id).in_response is True
+
+        terminal_events = service.finish_response(conn_id)
+        done = [e for e in terminal_events if isinstance(e, ResponseDoneEvent)]
         assert len(done) == 1
         assert done[0].response.status == "failed"
         # Slot released so the next response is not locked out.
         assert service._state(conn_id).in_response is False
+
+    def test_response_failure_terminal_promotes_successor_exactly_once(self):
+        tracker = SpeculativeTurnTracker()
+        prompt_queue = Queue()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            speculative_turns=tracker,
+            cancel_scope=CancelScope(),
+        )
+        conn_id = service.register()
+        failed_request = None
+        for turn_id, transcript in (("turn_failed", "first"), ("turn_successor", "second")):
+            service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id=turn_id, turn_revision=0, interrupt_response=False),
+            )
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(transcript=transcript, turn_id=turn_id, turn_revision=0),
+            )
+            if turn_id == "turn_failed":
+                failed_request = prompt_queue.get_nowait()
+                assert failed_request.turn_id == turn_id
+
+        assert failed_request is not None
+
+        state = service._state(conn_id)
+        assert state.response_pending
+        assert [request.turn_id for request in state.deferred_response_requests] == ["turn_successor"]
+
+        failure_events = service.dispatch_pipeline_event(
+            conn_id,
+            ResponseFailedEvent(
+                message="provider failed",
+                turn_id="turn_failed",
+                turn_revision=0,
+                cancel_generation=failed_request.cancel_generation,
+            ),
+        )
+
+        assert len(failure_events) == 2
+        assert isinstance(failure_events[0], ResponseCreatedEvent)
+        assert isinstance(failure_events[1], RealtimeErrorEvent)
+        created_response_id = failure_events[0].response.id
+        assert state.in_response
+        assert state.active_response_turn_id == "turn_failed"
+        assert state.pending_response_turn_id == "turn_successor"
+        assert prompt_queue.empty()
+
+        terminal_events = service.finish_response(conn_id)
+
+        done = next(event for event in terminal_events if isinstance(event, ResponseDoneEvent))
+        assert done.response.status == "failed"
+        assert done.response.id == created_response_id
+        successor = prompt_queue.get_nowait()
+        assert successor.turn_id == "turn_successor"
+        assert state.response_pending
+        assert state.pending_response_request is successor
+        service.unregister(conn_id)
+
+    def test_late_failure_cannot_activate_or_poison_promoted_successor(self):
+        tracker = SpeculativeTurnTracker()
+        prompt_queue = Queue()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            speculative_turns=tracker,
+            cancel_scope=CancelScope(),
+        )
+        conn_id = service.register()
+        old_request = None
+        for turn_id in ("turn_old", "turn_successor"):
+            service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStartedEvent(turn_id=turn_id, turn_revision=0, interrupt_response=False),
+            )
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(transcript=turn_id, turn_id=turn_id, turn_revision=0),
+            )
+            if turn_id == "turn_old":
+                old_request = prompt_queue.get_nowait()
+                service.dispatch_pipeline_event(
+                    conn_id,
+                    AssistantTextEvent(text="old reply", turn_id=turn_id, turn_revision=0),
+                )
+
+        assert old_request is not None
+
+        service.finish_response(conn_id)
+        successor = prompt_queue.get_nowait()
+        state = service._state(conn_id)
+        assert successor.turn_id == "turn_successor"
+        assert state.response_pending and not state.in_response
+
+        events = service.dispatch_pipeline_event(
+            conn_id,
+            ResponseFailedEvent(
+                message="late old failure",
+                turn_id="turn_old",
+                turn_revision=0,
+                cancel_generation=old_request.cancel_generation,
+            ),
+        )
+
+        assert events == []
+        assert state.response_pending and not state.in_response
+        assert state.pending_response_turn_id == "turn_successor"
+        assert not state.response_failure_pending
+        service.unregister(conn_id)
+
+    def test_idless_late_cancelled_failure_cannot_poison_successor(self):
+        prompt_queue = Queue()
+        cancel_scope = CancelScope()
+        service = RealtimeService(
+            text_prompt_queue=prompt_queue,
+            speculative_turns=SpeculativeTurnTracker(),
+            cancel_scope=cancel_scope,
+        )
+        conn_id = service.register()
+        created = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={
+                    "input": [
+                        {
+                            "id": "msg_explicit_old",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "old explicit"}],
+                        }
+                    ]
+                },
+            ),
+        )
+        assert isinstance(created, ResponseCreatedEvent)
+        old_request = prompt_queue.get_nowait()
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_successor", turn_revision=0, interrupt_response=False),
+        )
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(
+                transcript="successor",
+                turn_id="turn_successor",
+                turn_revision=0,
+            ),
+        )
+
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id="msg_explicit_old"),
+        )
+        successor = prompt_queue.get_nowait()
+        state = service._state(conn_id)
+        assert successor.turn_id == "turn_successor"
+        assert state.response_pending and not state.in_response
+        assert successor.cancel_generation != old_request.cancel_generation
+
+        events = service.dispatch_pipeline_event(
+            conn_id,
+            ResponseFailedEvent(
+                message="late id-less old failure",
+                cancel_generation=old_request.cancel_generation,
+            ),
+        )
+
+        assert events == []
+        assert state.response_pending and not state.in_response
+        assert state.pending_response_turn_id == "turn_successor"
+        assert not state.response_failure_pending
+        service.unregister(conn_id)
 
     def test_response_failed_without_active_response_is_noop(self, service, conn_id):
         # No active response (e.g. already closed): nothing to fail, emit nothing.
@@ -2827,11 +5628,13 @@ class TestDispatchPipelineEvent:
         state.runtime_config.transcript_barrier_version = 1
         state.runtime_config.transcript_barrier_nonce = "ab" * 32
         service.response._ensure_response(conn_id)
+        generation = service.cancel_scope.generation
+        state.active_response_cancel_generation = generation
 
         with caplog.at_level(logging.INFO):
             events = service.dispatch_pipeline_event(
                 conn_id,
-                ResponseFailedEvent(message=canary),
+                ResponseFailedEvent(message=canary, cancel_generation=generation),
             )
 
         error = events[0]
@@ -3047,6 +5850,73 @@ class TestUsageMetricsTracking:
         usage = service._state(conn_id).response_usage
         assert usage.input_tokens == 8
         assert usage.output_tokens == 17
+
+    def test_late_cancelled_generation_usage_cannot_charge_successor(self):
+        cancel_scope = CancelScope()
+        service = RealtimeService(text_prompt_queue=Queue(), cancel_scope=cancel_scope)
+        conn_id = service.register()
+        service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        assert service._state(conn_id).active_response_cancel_generation == 0
+
+        cancel_scope.cancel()
+        service.handle_response_cancel(conn_id)
+        service.dispatch_pipeline_event(
+            conn_id,
+            TokenUsageEvent(input_tokens=100, output_tokens=50, cancel_generation=0),
+        )
+        usage = service._state(conn_id).response_usage
+        assert usage.input_tokens == 0
+        assert usage.output_tokens == 0
+
+        service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        assert service._state(conn_id).active_response_cancel_generation == 1
+
+        service.dispatch_pipeline_event(
+            conn_id,
+            TokenUsageEvent(input_tokens=100, output_tokens=50, cancel_generation=0),
+        )
+        assert usage.input_tokens == 0
+        assert usage.output_tokens == 0
+
+        service.dispatch_pipeline_event(
+            conn_id,
+            TokenUsageEvent(input_tokens=7, output_tokens=3, cancel_generation=1),
+        )
+        assert usage.input_tokens == 7
+        assert usage.output_tokens == 3
+        service.unregister(conn_id)
+
+    def test_later_turn_usage_same_generation_cannot_charge_active_response(self):
+        cancel_scope = CancelScope()
+        service = RealtimeService(text_prompt_queue=Queue(), cancel_scope=cancel_scope)
+        conn_id = service.register()
+        service.response.resume_pending_request(
+            conn_id,
+            GenerateResponseRequest(
+                runtime_config=service._state(conn_id).runtime_config,
+                turn_id="turn_active",
+                turn_revision=0,
+                cancel_generation=cancel_scope.generation,
+            ),
+            enqueue=False,
+        )
+        service.response._ensure_response(conn_id)
+
+        service.dispatch_pipeline_event(
+            conn_id,
+            TokenUsageEvent(
+                input_tokens=100,
+                output_tokens=50,
+                turn_id="turn_next",
+                turn_revision=0,
+                cancel_generation=cancel_scope.generation,
+            ),
+        )
+
+        usage = service._state(conn_id).response_usage
+        assert usage.input_tokens == 0
+        assert usage.output_tokens == 0
+        service.unregister(conn_id)
 
     def test_token_usage_emits_no_events(self, service, conn_id):
         events = service.dispatch_pipeline_event(

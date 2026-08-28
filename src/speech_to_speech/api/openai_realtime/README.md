@@ -60,13 +60,31 @@ flowchart LR
 | `input_audio_buffer.append` | Stream base64 PCM audio. Decoded, resampled to 16 kHz, and chunked for the VAD. |
 | `session.update` | Deep-merge session config (instructions, tools, voice, turn detection, audio format). |
 | `conversation.item.create` | Inject `input_text` or `function_call_output` into the LLM context without triggering generation. |
-| `response.create` | Trigger LLM generation. Supports per-response `instructions` and `tool_choice` overrides. |
+| `conversation.item.delete` | Delete one exact protocol-visible user item. An input-audio item ID removes its mapped transcript, derived assistant/tool and tool-follow-up history, and cancels only a queued or active response owned by that turn. |
+| `response.create` | Trigger LLM generation. Supports per-response `instructions` and `tool_choice` overrides; rejected while any automatic or explicit response is active or pending. |
 | `response.cancel` | Cancel the in-progress response and re-enable listening. |
 
 `turn_detection.create_response` defaults to `true` when omitted or `null`.
 Set it to `false` to emit and store each non-empty completed transcription without
 automatically starting generation; send `response.create` when the response
 should begin.
+
+Automatic responses use a bounded FIFO. A speculative revision that resolves
+to an empty transcript retires its pending or active slot, and a queued turn is
+restored from exact compaction provenance (or its admission snapshot after
+lossy eviction) before it reaches the model. Promotion preserves FIFO order,
+incorporates completed output from earlier turns, and excludes client items
+that arrived after the promoted turn was admitted, even when a deleted
+protocol ID is reused later. For a `response.input`
+batch, derived assistant and tool history remains deletion-owned by every user
+item serialized into that response, including when the tool result itself is
+supplied inline through `response.input`. Restored turns with outstanding tool
+results are retained only up to the configured chat size; admitting another
+restored turn retires the oldest outstanding tool ownership before it can crowd
+the newly accepted user out of the hard-bounded history. A delayed tool result
+restores its exact owner from reversible compaction provenance, and resolving
+the owner's final pending call releases that protection so later users remain
+evictable in causal order.
 
 ### Server -> Client
 
@@ -77,9 +95,10 @@ should begin.
 | `input_audio_buffer.speech_started` | VAD detected user speech. |
 | `input_audio_buffer.speech_stopped` | End of user speech segment. |
 | `conversation.item.created` | Acknowledges injected `input_text` from `conversation.item.create`. |
+| `conversation.item.deleted` | Acknowledges an exact user-item deletion only after the live or compacted history no longer contains that item. |
 | `conversation.item.input_audio_transcription.delta` | Streaming partial transcript (when live transcription is enabled). |
 | `conversation.item.input_audio_transcription.completed` | Final transcript for the user turn (with duration usage). |
-| `response.created` | Emitted before the first assistant output part or outbound audio chunk, whichever arrives first (response is `in_progress`). |
+| `response.created` | Emitted before the first assistant output part or outbound audio chunk, whichever arrives first, or immediately before `response.done` for a successful zero-output response (response is `in_progress`). |
 | `response.output_audio.delta` | Base64 PCM audio chunk from TTS. |
 | `response.output_audio.done` | Audio stream complete for the current output item; emitted only after at least one `response.output_audio.delta`. |
 | `response.output_audio_transcript.done` | Full assistant text transcript for the turn. |
@@ -261,7 +280,7 @@ indices are dense.
 
 1. Client executes the tool and sends `conversation.item.create` with `type: "function_call_output"` and `output: "<result>"`
 2. `RealtimeService` appends the tool output to the chat context and emits `conversation.item.created`; this does not trigger generation.
-3. If the tool result needs to be spoken to the user, such as camera/search/data results, the client sends `response.create` to trigger follow-up generation.
+3. If the tool result needs to be spoken to the user, such as camera/search/data results, the client sends `response.create` to trigger follow-up generation. The follow-up retains the original user item's deletion ownership.
 4. For fire-and-forget robot actions such as dance, emotion, head movement, stop, or idle tools, the client can stop after `conversation.item.created`; the assistant should already have spoken the natural lead-in before the tool call.
 
 ---
@@ -277,7 +296,12 @@ Barge-in (user speaks while the assistant is playing audio) is handled cooperati
 - **Generation counter** (`cancel_scope.generation`): each response request is stamped when it enters the LLM queue, and pipeline threads carry that generation through LLM and TTS while checking `cancel_scope.is_stale(gen)` on every streaming token. When `cancel()` is called, the generation increments, so both already-running work and a prior request dequeued only afterward are stale before provider execution -- no timing games required.
 - **Discard flag** (`cancel_scope.discarding`): set by `cancel()`, checked by the async `_send_loop` to drop output from superseded generations that arrives between `cancel()` and `response_done()`. Cleared by `response_done(generation)` (only when the sentinel's generation matches the discarded or current one -- sentinels from unrelated older generations are ignored), by `new_response()` on an explicit `response.create`, or by `reset()` on session claim/release.
 
-Pipeline output is **generation-tagged**: `AudioOutput` chunks and `AssistantTextEvent`s carry a `cancel_generation` field stamped by the handler that produced them. The send loop's `_generation_is_discardable` drops an item if its generation is stale, or if `discarding` is set and the item is not from the current generation. Output from the *current* generation always passes through, so a fresh response is never swallowed by a lingering discard window (e.g. a superseded speculative turn whose TTS never emitted a `__RESPONSE_DONE__` sentinel).
+Pipeline output is **generation-tagged**: `AudioOutput` chunks, `AssistantTextEvent`s, token-usage reports, and response failures carry a `cancel_generation` field stamped by the handler that produced them. The send loop drops stale audio/assistant output, and the service rejects usage or a failure that does not own the active generation. Output from the *current* generation always passes through, so a fresh response is never swallowed, charged, or failed by a superseded turn (e.g. a speculative turn whose TTS never emitted a `__RESPONSE_DONE__` sentinel).
+Assistant events also retain their turn ownership across user-event queue
+boundaries; output left behind after its response closes is discarded instead
+of opening or attaching to a successor response. A transient speculative reopen
+at either backend's final history fence is resolved outside the private-content
+lock and retried, so a cancelled reopen cannot silently lose valid writeback.
 
 ```mermaid
 sequenceDiagram
@@ -291,11 +315,13 @@ sequenceDiagram
     Note over TTS,Client: Response active or pending (in_response / response_pending)
     User->>VAD: speaks
     VAD->>SendLoop: speech_started on text_output_queue
-    SendLoop->>Client: input_audio_buffer.speech_started
-    SendLoop->>Client: response.done (status=cancelled, reason=turn_detected)
+    SendLoop->>SendLoop: dispatch locks response history
     SendLoop->>SendLoop: cancel_scope.cancel() (gen++ & discarding=True)
+    SendLoop->>SendLoop: close old response and build protocol events
     SendLoop->>SendLoop: flush output_queue + text_output_queue
     SendLoop->>SendLoop: response_playing.clear()
+    SendLoop->>Client: input_audio_buffer.speech_started
+    SendLoop->>Client: response.done (status=cancelled, reason=turn_detected)
     LLM->>LLM: is_stale(gen) → True, aborts generation
     TTS->>TTS: is_stale(gen) → True, aborts generation
     TTS->>SendLoop: __RESPONSE_DONE__ (tagged with gen)
@@ -306,8 +332,8 @@ sequenceDiagram
 **Step by step:**
 
 1. **VAD detects speech**: puts a `SpeechStartedEvent` on `text_output_queue`.
-2. **`_send_loop` processes text events first** (priority over audio): translates `speech_started` into protocol events. If an active response was in progress, `RealtimeService.dispatch_pipeline_event` emits `response.done` with `status="cancelled"` and `reason="turn_detected"`; it first emits `response.output_audio.done` only when at least one audio delta was sent.
-3. **Cancel + queue flush**: if a response is active (`in_response`) *or* pending (`response_pending` -- accepted `response.create`, no audio yet), and interrupts are enabled (see step 4), the send loop calls `cancel_scope.cancel()` (increments generation, enables discard), clears `response_pending`, drains `output_queue` (preserving `__RESPONSE_DONE__` sentinels) and `text_output_queue` (preserving user-side events: `speech_stopped`, partial/completed transcriptions, token usage), then clears `response_playing`.
+2. **`_send_loop` processes text events first** (priority over audio): translates `speech_started` into protocol events. If an active or pending response was in progress, `RealtimeService.dispatch_pipeline_event` holds the response-history guard while it calls `cancel_scope.cancel()` (increments generation and enables discard). It then synchronously closes any active response and builds `response.done` with `status="cancelled"` and `reason="turn_detected"`; it also builds `response.output_audio.done` first only when at least one audio delta was sent. A provider writer cannot enter between generation cancellation and response closure, and these events are not transmitted yet.
+3. **Queue flush before outbound I/O**: the send loop clears pending requests, drains `output_queue` (preserving `__RESPONSE_DONE__` sentinels) and `text_output_queue` (preserving user-side events: `speech_stopped`, partial/completed transcriptions, token usage), then clears `response_playing`. Only after that synchronous boundary does it transmit the previously built protocol events.
 4. **Interrupt gating**: the cancel only fires if the `SpeechStartedEvent.interrupt_response` flag is set *and* the session config allows it (`turn_detection.interrupt_response`, read via `RuntimeConfig.interrupt_response_enabled`, default true). When disabled, user speech during a response is transcribed but the response keeps playing.
 5. **LLM/TTS cancellation**: each response carries the generation stamped when it entered the LLM queue. Immediately before local-model/provider execution, the LLM atomically admits only that exact generation and remains visible as active until its generator exits. A local Transformers worker that survives the bounded join retains a second activation lease until the thread actually exits, and every generation owns a distinct streamer/stopping criterion, so private-barrier activation cannot race past live work or reuse its token channel. Worker exceptions are caught before Python's default thread exception hook, redacted under the same live session guard, and reduced to one content-free generation failure while waking the matching streamer. LLM and TTS also check `cancel_scope.is_stale(gen)` on every streaming token and abort early when stale.
 6. **Discard guard**: while `cancel_scope.discarding` is True, the send loop drops audio chunks and assistant text whose `cancel_generation` is not current (see `_generation_is_discardable` above). The guard clears when a `__RESPONSE_DONE__` with a matching generation arrives (via `cancel_scope.response_done(gen)`), or when an explicit `response.create` starts a new response (`cancel_scope.new_response()`).

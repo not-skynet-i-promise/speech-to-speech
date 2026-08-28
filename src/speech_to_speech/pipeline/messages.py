@@ -17,6 +17,7 @@ from openai.types.responses.response_function_tool_call import ResponseFunctionT
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
+from speech_to_speech.LLM.chat import Chat
 
 # ── Base class ────────────────────────────────────────────────────────
 
@@ -133,6 +134,7 @@ class TokenUsage(PipelineMessage):
     output_tokens: int
     turn_id: str | None = None
     turn_revision: int | None = None
+    cancel_generation: int | None = None
 
 
 class EndOfResponse(PipelineMessage):
@@ -183,15 +185,34 @@ class GenerateResponseRequest(PipelineMessage):
     """Triggers LLM generation for a realtime session.
 
     Carries everything the LM handler needs to produce a response so it
-    never has to reach back into shared objects.  ``runtime_config``
-    holds the per-connection session config *and* the conversation chat;
-    ``response`` carries per-response overrides from ``response.create``.
+    never has to reach back into shared objects. ``runtime_config`` retains
+    the canonical per-connection configuration and conversation for guarded
+    state and response write-back. ``chat_snapshot`` freezes the history this
+    particular turn may read, so a deferred request cannot observe a later
+    turn appended to the shared conversation. ``response`` carries
+    per-response overrides from ``response.create``.
     Downstream handlers resolve each attribute by preferring the
     per-response value over the session default.
     """
 
     tag: Literal["generate_response"] = "generate_response"
     runtime_config: RuntimeConfig
+    chat_snapshot: Chat | None = Field(default=None, exclude=True, repr=False)
+    # Exact canonical user item whose response output must precede any later
+    # queued user turns.  Without this anchor, cross-thread write-back appends
+    # assistant output after users that arrived while the provider was running.
+    response_user_item_id: str | None = None
+    # Every canonical user item serialized by this response. The primary ID
+    # above controls insertion order; this complete set controls fail-closed
+    # cleanup if any serialized input is later deleted.
+    response_user_item_ids: set[str] = Field(default_factory=set)
+    # Protocol items visible when this request entered the FIFO. A promoted
+    # request may incorporate output from an earlier response, but must not see
+    # client items that arrived after its own admission.
+    admitted_protocol_item_ids: set[str] | None = None
+    # Monotonic admission boundary for protocol items. Unlike the ID set above,
+    # this distinguishes a later item that reuses an ID after deletion.
+    admitted_protocol_sequence: int | None = None
     response: RealtimeResponseCreateParams | None = None
     language_code: Optional[str] = None
     turn_id: str | None = None

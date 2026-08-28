@@ -30,6 +30,7 @@ from speech_to_speech.pipeline.messages import (
     TTSInput,
     VADAudio,
 )
+from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
 from speech_to_speech.STT.base_stt_handler import BaseSTTHandler
 from speech_to_speech.TTS.facebookmms_handler import FacebookMMSTTSHandler
 
@@ -136,6 +137,18 @@ class _NeverCalledLanguageModelHandler(BaseLanguageModelHandler):
     def _generate(self, *args, **kwargs):
         raise AssertionError("stale queued request reached local model generation")
         yield LLMResponseChunk()
+
+
+class _SuccessfulLanguageModelHandler(BaseLanguageModelHandler):
+    """Provider-free local handler that produces one canonical assistant item."""
+
+    def _load_model(self, model_name, device, torch_dtype, gen_kwargs):
+        raise AssertionError("test bypasses setup")
+
+    def _generate(self, chat, language_code, gen, ctx, runtime_config=None, response=None):
+        ctx.generated_text = "local writeback survives transient reopen"
+        if False:
+            yield LLMResponseChunk()
 
 
 class _ExplodingLanguageModelHandler(BaseLanguageModelHandler):
@@ -409,6 +422,51 @@ def test_local_llm_poison_during_generation_blocks_assistant_and_tool_history_wr
     assert runtime_config.transcript_barrier_failed is True
     assert not any(getattr(item, "role", None) == "assistant" for item in chat.buffer)
     assert not any(getattr(item, "type", None) == "function_call" for item in chat.buffer)
+
+
+def test_local_llm_retries_writeback_after_transient_pending_reopen(monkeypatch):
+    handler = object.__new__(_SuccessfulLanguageModelHandler)
+    tracker = SpeculativeTurnTracker()
+    tracker.observe("turn", 0)
+    handler.speculative_turns = tracker
+    handler.cancel_scope = None
+    handler.enable_lang_prompt = False
+    handler.compactor = None
+    handler.tokenizer = type("Tokenizer", (), {"encode": staticmethod(lambda _text: [])})()
+    original_check = handler._turn_commits_writeback_now
+    calls = 0
+
+    def transient_reopen(turn_id, turn_revision):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            candidate = tracker.begin_reopen_candidate(turn_id, turn_revision)
+            tracker.cancel_reopen_candidate(turn_id, candidate)
+            return None
+        return original_check(turn_id, turn_revision)
+
+    monkeypatch.setattr(handler, "_turn_commits_writeback_now", transient_reopen)
+    runtime_config = RuntimeConfig(chat=Chat(10), session=RealtimeSessionCreateRequest(type="realtime"))
+    user = runtime_config.chat.add_item(make_user_message("local request"))
+
+    list(
+        handler.process(
+            GenerateResponseRequest(
+                runtime_config=runtime_config,
+                response_user_item_id=user.id,
+                turn_id="turn",
+                turn_revision=0,
+            )
+        )
+    )
+
+    assert calls >= 2
+    assert tracker.is_committed("turn", 0)
+    assert any(
+        getattr(part, "text", None) == "local writeback survives transient reopen"
+        for item in runtime_config.chat.buffer
+        for part in getattr(item, "content", [])
+    )
 
 
 def test_local_llm_drops_request_cancelled_before_dequeue():

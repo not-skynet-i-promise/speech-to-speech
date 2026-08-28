@@ -107,6 +107,8 @@ class _Turn(BaseModel):
     response: Any
     turn_id: str | None
     turn_revision: int | None
+    response_user_item_id: str | None
+    response_user_item_ids: set[str]
     speech_stopped_at_s: float | None
     wants_audio: bool
 
@@ -314,6 +316,12 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             return True
         return self.speculative_turns.is_latest_after_reopen_grace(turn_id, turn_revision)
 
+    def _turn_commits_writeback_now(self, turn_id: str | None, turn_revision: int | None) -> bool | None:
+        """Commit writeback ownership without waiting; ``None`` asks for a retry."""
+        if self.speculative_turns is None:
+            return True
+        return self.speculative_turns.try_commit_if_latest_after_reopen_grace(turn_id, turn_revision)
+
     def _fail_home_assistant_guard_for_current_turn(
         self,
         runtime_config: RuntimeConfig,
@@ -422,18 +430,36 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         if self._generation_is_stale(turn.gen) or not self._turn_output_allowed(turn.turn_id, turn.turn_revision):
             logger.info("LLM generation cancelled (stale speculative turn)")
             return
-        with turn.runtime_config.transcript_barrier_state_guard():
-            if turn.runtime_config.private_protocol_failed:
+        while True:
+            with turn.runtime_config.transcript_barrier_state_guard():
+                if turn.runtime_config.private_protocol_failed or self._generation_is_stale(turn.gen):
+                    return
+                commits_writeback = self._turn_commits_writeback_now(turn.turn_id, turn.turn_revision)
+                if commits_writeback is not None:
+                    if not commits_writeback:
+                        return
+                    if not is_out_of_band(turn.response):
+                        # Flush assistant text accumulated before this call first (so history
+                        # order matches what the client received), then persist the call —
+                        # all before the chunk leaves for the client.
+                        chat = turn.runtime_config.chat
+                        for pending_item in state.pending:
+                            chat.add_response_item(
+                                pending_item,
+                                after_user_id=turn.response_user_item_id,
+                                owner_user_ids=turn.response_user_item_ids,
+                            )
+                        state.pending.clear()
+                        chat.add_response_item(
+                            fc_item,
+                            after_user_id=turn.response_user_item_id,
+                            owner_user_ids=turn.response_user_item_ids,
+                        )
+                    break
+            # A reopen began after the blocking output check. Resolve it only
+            # outside the private state lock, then retry the atomic commit fence.
+            if not self._turn_output_allowed(turn.turn_id, turn.turn_revision):
                 return
-            if not is_out_of_band(turn.response):
-                # Flush assistant text accumulated before this call first (so history
-                # order matches what the client received), then persist the call —
-                # all before the chunk leaves for the client.
-                chat = turn.runtime_config.chat
-                for pending_item in state.pending:
-                    chat.add_item(pending_item)
-                state.pending.clear()
-                chat.add_item(fc_item)
         yield self._chunk(turn, tools=[item])
 
     # ── consumption ─────────────────────────────────────────────────────────--
@@ -693,20 +719,36 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             # Out-of-band responses emit output and usage but never write back to the
             # default conversation (their context was a throwaway chat).
             if not is_out_of_band(turn.response):
-                with turn.runtime_config.transcript_barrier_state_guard():
-                    if not turn.runtime_config.private_protocol_failed:
-                        # Tool calls (and any assistant text preceding them) were already
-                        # written eagerly in _record_tool_call; only trailing items remain.
-                        for item in state.pending:
-                            original_chat.add_item(item)
-                        original_chat.strip_images(consumed_image_ids)
-                        original_chat.trim_if_needed(self.compactor)
+                while True:
+                    with turn.runtime_config.transcript_barrier_state_guard():
+                        if turn.runtime_config.private_protocol_failed or self._generation_is_stale(turn.gen):
+                            break
+                        commits_writeback = self._turn_commits_writeback_now(turn.turn_id, turn.turn_revision)
+                        if commits_writeback is not None:
+                            if commits_writeback:
+                                # Tool calls (and any assistant text preceding them) were already
+                                # written eagerly in _record_tool_call; only trailing items remain.
+                                for item in state.pending:
+                                    original_chat.add_response_item(
+                                        item,
+                                        after_user_id=turn.response_user_item_id,
+                                        owner_user_ids=turn.response_user_item_ids,
+                                    )
+                                original_chat.strip_images(consumed_image_ids)
+                                original_chat.trim_if_needed(self.compactor)
+                            break
+                    # A reopen began between the blocking output check and the
+                    # guarded writeback fence. Wait only outside the content lock,
+                    # then retry if the original revision still owns the turn.
+                    if not self._turn_output_allowed(turn.turn_id, turn.turn_revision):
+                        break
             if state.input_tokens or state.output_tokens:
                 yield TokenUsage(
                     input_tokens=state.input_tokens,
                     output_tokens=state.output_tokens,
                     turn_id=turn.turn_id,
                     turn_revision=turn.turn_revision,
+                    cancel_generation=turn.gen,
                 )
         with private_content_redaction(turn.runtime_config) as private_content:
             if private_content and error_message is not None:
@@ -747,9 +789,10 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             return
 
         original_chat = runtime_config.chat
+        request_chat = request.chat_snapshot or original_chat
         if is_out_of_band(response):
             try:
-                active_chat = build_active_chat(original_chat, response)
+                active_chat = build_active_chat(request_chat, response)
             except ChatItemError as exc:
                 with private_content_redaction(runtime_config) as private_content:
                     guarded_failure = runtime_config.home_assistant_guard_operational
@@ -776,7 +819,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 )
                 return
         else:
-            active_chat = original_chat.copy()
+            active_chat = request_chat.copy()
         language_code = request.language_code
         instructions = (
             response.instructions if response and response.instructions else runtime_config.session.instructions
@@ -809,6 +852,8 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             response=response,
             turn_id=turn_id,
             turn_revision=turn_revision,
+            response_user_item_id=request.response_user_item_id,
+            response_user_item_ids=set(request.response_user_item_ids),
             speech_stopped_at_s=speech_stopped_at_s,
             wants_audio=wants_audio,
         )

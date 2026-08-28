@@ -17,7 +17,12 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from openai.types.realtime import ResponseCreatedEvent, ResponseCreateEvent, SessionUpdateEvent
+from openai.types.realtime import (
+    ConversationItemDeleteEvent,
+    ResponseCreatedEvent,
+    ResponseCreateEvent,
+    SessionUpdateEvent,
+)
 from openai.types.realtime.conversation_item import (
     RealtimeConversationItemFunctionCall,
     RealtimeConversationItemFunctionCallOutput,
@@ -139,6 +144,72 @@ def test_warmup_uses_request_scoped_sdk_retries():
     handler = _make_handler()
 
     assert handler.client.last_options == {"max_retries": base_mod.WARMUP_MAX_RETRIES}
+
+
+def test_process_serializes_request_chat_snapshot_not_later_shared_turns():
+    handler = _make_handler(stream=False)
+    chat = Chat(10)
+    queued_turn = chat.add_item(make_user_message("queued turn"))
+    snapshot = chat.copy()
+    chat.add_item(make_user_message("later turn"))
+    runtime = RuntimeConfig(chat=chat, session=RealtimeSessionCreateRequest(type="realtime"))
+
+    list(
+        handler.process(
+            GenerateResponseRequest(
+                runtime_config=runtime,
+                chat_snapshot=snapshot,
+                response_user_item_id=queued_turn.id,
+            )
+        )
+    )
+
+    messages = handler.client.chat.completions.last_kwargs["messages"]
+    user_text = [message["content"] for message in messages if message["role"] == "user"]
+    assert user_text == ["queued turn"]
+    assert [item.content[0].text for item in chat.buffer if item.role == "user"] == [
+        "queued turn",
+        "later turn",
+    ]
+    assert [item.role for item in chat.buffer] == ["user", "assistant", "user"]
+
+
+def test_active_deletion_removes_response_already_written_by_real_backend_path():
+    prompt_queue: queue.Queue = queue.Queue()
+    cancel_scope = CancelScope()
+    service = RealtimeService(text_prompt_queue=prompt_queue, cancel_scope=cancel_scope)
+    conn_id = service.register()
+    created = service.handle_response_create(
+        conn_id,
+        ResponseCreateEvent(
+            type="response.create",
+            response={
+                "input": [
+                    {
+                        "id": "msg_rejected_echo",
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "assistant self echo"}],
+                    }
+                ]
+            },
+        ),
+    )
+    assert isinstance(created, ResponseCreatedEvent)
+    request = prompt_queue.get_nowait()
+    handler = _make_handler(stream=False, cancel_scope=cancel_scope)
+
+    list(handler.process(request))
+    assert [item.role for item in service._state(conn_id).runtime_config.chat.buffer] == ["user", "assistant"]
+
+    deleted = service.handle_conversation_item_delete(
+        conn_id,
+        ConversationItemDeleteEvent(type="conversation.item.delete", item_id="msg_rejected_echo"),
+    )
+
+    assert [event.type for event in deleted] == ["conversation.item.deleted", "response.done"]
+    assert service._state(conn_id).runtime_config.chat.buffer == []
+    service.unregister(conn_id)
 
 
 def test_cancelled_queued_request_cannot_start_after_private_barrier_ready():
@@ -789,6 +860,96 @@ def test_streaming_text_and_usage():
     assert tools == []
     # assistant text was stored back into the conversation history
     assert any(getattr(i, "role", None) == "assistant" for i in chat.buffer)
+
+
+def test_turn_deletion_at_locked_writeback_fence_cannot_restore_assistant_history(monkeypatch):
+    handler = _make_handler(stream=False)
+    handler.client.chat.completions.next_result = _complete_response(content="must not persist")
+    tracker = SpeculativeTurnTracker()
+    tracker.observe("t", 0)
+    handler.speculative_turns = tracker
+    original_check = handler._turn_commits_writeback_now
+
+    def delete_then_check(turn_id, turn_revision):
+        tracker.discard(turn_id)
+        return original_check(turn_id, turn_revision)
+
+    monkeypatch.setattr(handler, "_turn_commits_writeback_now", delete_then_check)
+
+    _text, _tools, _usage, chat, _end = _drive(handler)
+
+    assert [getattr(item, "role", None) for item in chat.buffer] == ["user"]
+    assert not any(
+        getattr(part, "text", None) == "must not persist"
+        for item in chat.buffer
+        for part in getattr(item, "content", [])
+    )
+
+
+def test_transient_pending_reopen_at_writeback_fence_retries_valid_history(monkeypatch):
+    handler = _make_handler(stream=False)
+    handler.client.chat.completions.next_result = _complete_response(content="must persist")
+    tracker = SpeculativeTurnTracker()
+    tracker.observe("t", 0)
+    handler.speculative_turns = tracker
+    original_check = handler._turn_commits_writeback_now
+    calls = 0
+
+    def transient_reopen(turn_id, turn_revision):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            candidate = tracker.begin_reopen_candidate(turn_id, turn_revision)
+            tracker.cancel_reopen_candidate(turn_id, candidate)
+            return None
+        return original_check(turn_id, turn_revision)
+
+    monkeypatch.setattr(handler, "_turn_commits_writeback_now", transient_reopen)
+
+    _text, _tools, _usage, chat, _end = _drive(handler)
+
+    assert calls >= 2
+    assert tracker.is_committed("t", 0)
+    assert any(
+        getattr(part, "text", None) == "must persist" for item in chat.buffer for part in getattr(item, "content", [])
+    )
+
+
+def test_transient_pending_reopen_at_eager_tool_fence_retries_tool_writeback(monkeypatch):
+    handler = _make_handler(stream=True)
+    handler.client.chat.completions.create = lambda **_kwargs: _FakeStream(
+        [_chunk(tool_calls=[_tc_delta(0, id="srv_1", name="camera_snapshot", arguments="{}")])]
+    )
+    tracker = SpeculativeTurnTracker()
+    tracker.observe("t", 0)
+    handler.speculative_turns = tracker
+    original_commit = handler._turn_commits_writeback_now
+    calls = 0
+
+    def transient_reopen(turn_id, turn_revision):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            candidate = tracker.begin_reopen_candidate(turn_id, turn_revision)
+            tracker.cancel_reopen_candidate(turn_id, candidate)
+            return None
+        return original_commit(turn_id, turn_revision)
+
+    monkeypatch.setattr(handler, "_turn_commits_writeback_now", transient_reopen)
+    chat = Chat(10)
+    chat.add_item(make_user_message("take a photo"))
+    request = GenerateResponseRequest(
+        runtime_config=RuntimeConfig(chat=chat, session=RealtimeSessionCreateRequest(type="realtime")),
+        turn_id="t",
+        turn_revision=0,
+    )
+
+    outputs = list(handler.process(request))
+
+    assert calls >= 2
+    assert tracker.is_committed("t", 0)
+    assert any(isinstance(output, LLMResponseChunk) and output.tools for output in outputs)
+    assert chat._pending_tool_calls
 
 
 def test_streaming_tool_call_accumulates_arguments():

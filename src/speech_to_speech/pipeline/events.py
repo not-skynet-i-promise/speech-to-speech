@@ -121,6 +121,7 @@ class TokenUsageEvent(PipelineEvent):
     output_tokens: int = 0
     turn_id: str | None = None
     turn_revision: int | None = None
+    cancel_generation: int | None = None
 
 
 class ResponseFailedEvent(PipelineEvent):
@@ -134,3 +135,4 @@ class ResponseFailedEvent(PipelineEvent):
     message: str = ""
     turn_id: str | None = None
     turn_revision: int | None = None
+    cancel_generation: int | None = None
