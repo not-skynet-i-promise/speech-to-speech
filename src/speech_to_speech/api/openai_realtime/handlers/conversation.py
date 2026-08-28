@@ -177,7 +177,11 @@ class ConversationHandler(RealtimeBaseHandler):
             ]
             if removed_text_outputs:
                 if not history_was_bound:
-                    st.deleted_response_text_outputs[event.item_id] = dict(removed_text_outputs[0])
+                    removed = removed_text_outputs[0]
+                    st.deleted_response_text_outputs[event.item_id] = {
+                        "item_id": removed["item_id"],
+                        "output_index": removed["output_index"],
+                    }
 
             for output_index, call in tuple(st.pending_function_calls.items()):
                 if call.id != event.item_id:
@@ -451,6 +455,10 @@ class ConversationHandler(RealtimeBaseHandler):
                 event.turn_id,
                 event.turn_revision,
             )
+            if event.turn_id is not None:
+                item_id = self._completion_input_item_id(conn_id, event.turn_id, event.turn_revision)
+                if item_id is not None:
+                    self.terminalize_input_item(conn_id, item_id)
             return []
         item_id = self._completion_input_item_id(conn_id, event.turn_id, event.turn_revision)
         if item_id is None:
@@ -492,6 +500,10 @@ class ConversationHandler(RealtimeBaseHandler):
                 event.turn_id,
                 event.turn_revision,
             )
+            if event.turn_id is not None:
+                item_id = self._completion_input_item_id(conn_id, event.turn_id, event.turn_revision)
+                if item_id is not None:
+                    self.terminalize_input_item(conn_id, item_id)
             return []
         if event.turn_id is not None:
             item_id = st.input_item_by_turn_revision.get((event.turn_id, event.turn_revision))

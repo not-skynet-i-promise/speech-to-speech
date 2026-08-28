@@ -121,6 +121,7 @@ class _Turn(BaseModel):
     speech_stopped_at_s: float | None
     wants_audio: bool
     response_key: str
+    cancel_event: ThreadingEvent
     prefetch_transaction: ResponsePrefetchTransaction | None = None
     # End of the conversation when this turn started; keeps its output ahead of
     # user messages appended while the model was still running.
@@ -364,7 +365,8 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
     def _turn_is_cancelled(self, turn: _Turn) -> bool:
         return (
-            turn.prefetch_transaction is not None
+            turn.cancel_event.is_set()
+            or turn.prefetch_transaction is not None
             and turn.prefetch_transaction.discarded
             or self._generation_is_stale(turn.gen)
         )
@@ -921,7 +923,15 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
     def _process_audio(self, request: LLMIn) -> Iterator[LLMOut]:
         """Process an audio-input turn through the selected backend protocol."""
-        assert request.audio is not None
+        audio = request.audio
+        request.audio = None
+        if audio is None or request.is_cancelled:
+            yield EndOfResponse(
+                turn_id=request.turn_id,
+                turn_revision=request.turn_revision,
+                response_key=request.response_key,
+            )
+            return
         runtime_config = request.runtime_config
         response = request.response
         turn_id = request.turn_id
@@ -982,7 +992,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         wants_audio = response_wants_audio(response)
         self._apply_config(active_chat, instructions, wants_audio, language_name=lang_name)
 
-        audio_b64 = self._audio_to_wav_base64(request.audio, request.audio_sample_rate)
+        audio_b64 = self._audio_to_wav_base64(audio, request.audio_sample_rate)
         audio_message = active_chat.add_item(make_user_audio_message(audio_b64))
         optional_kwargs = self._build_audio_optional_kwargs(response, req_tools, req_tool_choice)
 
@@ -1027,6 +1037,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             speech_stopped_at_s=speech_stopped_at_s,
             wants_audio=wants_audio,
             response_key=request.response_key,
+            cancel_event=request.cancel_event,
             prefetch_transaction=request.prefetch_transaction,
             history_anchor_id=history_anchor_id,
         )
@@ -1044,6 +1055,13 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
     def process(self, request: LLMIn) -> Iterator[LLMOut]:
         """Process a language model request and yield LLMResponseChunks."""
+        if request.is_cancelled:
+            yield EndOfResponse(
+                turn_id=request.turn_id,
+                turn_revision=request.turn_revision,
+                response_key=request.response_key,
+            )
+            return
         if request.audio is not None:
             yield from self._process_audio(request)
             return
@@ -1122,6 +1140,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             speech_stopped_at_s=speech_stopped_at_s,
             wants_audio=wants_audio,
             response_key=request.response_key,
+            cancel_event=request.cancel_event,
             prefetch_transaction=request.prefetch_transaction,
             history_anchor_id=history_anchor_id,
         )

@@ -354,6 +354,17 @@ class GenerateResponseRequest(PipelineMessage):
     turn_revision: int | None = None
     speech_stopped_at_s: float | None = None
     prefetch_transaction: ResponsePrefetchTransaction | None = Field(default=None, exclude=True, repr=False)
+    cancel_event: Event = Field(default_factory=Event, exclude=True, repr=False)
+
+    def cancel(self) -> None:
+        """Mark this request unusable and release any direct-audio payload."""
+        self.audio = None
+        self.cancel_event.set()
+
+    @property
+    def is_cancelled(self) -> bool:
+        """Return whether the request was retracted before completion."""
+        return self.cancel_event.is_set()
 
 
 # ── Binary sentinels (audio/output queue) ─────────────────────────────

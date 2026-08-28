@@ -532,6 +532,29 @@ class TestHandleConversationItemDelete:
         assert st.deleted_response_function_calls[wire_item_id] == (0, "call_private")
         assert "PRIVATE_ARGUMENT_SENTINEL" not in repr(st.deleted_response_function_calls)
 
+    def test_pending_private_text_tombstone_retains_only_binding_identity(self, service, conn_id):
+        st = service._state(conn_id)
+        st.mark_response_pending("response_private_text")
+        events = service.dispatch_pipeline_event(
+            conn_id,
+            AssistantOutputEvent(
+                text="PRIVATE_TEXT_SENTINEL",
+                response_key="response_private_text",
+            ),
+        )
+        wire_item_id = next(event.item_id for event in events if isinstance(event, ResponseAudioTranscriptDeltaEvent))
+
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=wire_item_id),
+        )
+
+        assert st.deleted_response_text_outputs[wire_item_id] == {
+            "item_id": wire_item_id,
+            "output_index": 0,
+        }
+        assert "PRIVATE_TEXT_SENTINEL" not in repr(st.deleted_response_text_outputs)
+
     def test_unknown_item_returns_error(self, service, conn_id):
         events = service.handle_conversation_item_delete(
             conn_id,
@@ -721,6 +744,65 @@ class TestHandleConversationItemDelete:
         assert st.response_pending is False
         assert queued_request.response_key in st.closed_response_keys
         assert queued_request.audio is None
+        assert queued_request.is_cancelled
+
+    @pytest.mark.parametrize("direct_audio", [False, True])
+    def test_delete_cancels_worker_owned_generation_and_late_writeback(
+        self,
+        service,
+        conn_id,
+        text_prompt_queue,
+        direct_audio,
+    ):
+        started = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_worker_owned", turn_revision=0),
+        )
+        wire_item_id = next(event.item_id for event in started if isinstance(event, InputAudioBufferSpeechStartedEvent))
+        if direct_audio:
+            service.dispatch_pipeline_event(
+                conn_id,
+                AudioInputCompletedEvent(
+                    audio=np.zeros(1600, dtype=np.float32),
+                    audio_sample_rate=16000,
+                    audio_duration_s=0.1,
+                    turn_id="turn_worker_owned",
+                    turn_revision=0,
+                ),
+            )
+        else:
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(
+                    transcript="PRIVATE_WORKER_INPUT",
+                    turn_id="turn_worker_owned",
+                    turn_revision=0,
+                ),
+            )
+        worker_owned_request = text_prompt_queue.get_nowait()
+
+        deleted = service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=wire_item_id),
+        )
+        late_writeback = service._state(conn_id).runtime_config.chat.add_provisional_generation_items(
+            worker_owned_request.response_key,
+            [
+                RealtimeConversationItemAssistantMessage(
+                    type="message",
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "PRIVATE_WORKER_OUTPUT"}],
+                )
+            ],
+        )
+
+        st = service._state(conn_id)
+        assert isinstance(deleted[-1], ConversationItemDeletedEvent)
+        assert worker_owned_request.is_cancelled
+        assert worker_owned_request.audio is None
+        assert worker_owned_request.response_key in st.closed_response_keys
+        assert late_writeback is None
+        assert "PRIVATE_WORKER" not in "\n".join(item.model_dump_json() for item in st.runtime_config.chat.buffer)
 
     def test_active_input_deleted_before_transcription_stays_deleted(self, service, conn_id):
         st = service._state(conn_id)
@@ -747,6 +829,44 @@ class TestHandleConversationItemDelete:
         assert completed == []
         assert st.runtime_config.chat.buffer == []
         assert service.text_prompt_queue.empty()
+        assert st.input_item_by_turn_revision == {}
+
+    @pytest.mark.parametrize("terminal", ["failed", "direct_audio"])
+    def test_deleted_explicit_terminal_releases_turn_route(self, service, conn_id, terminal):
+        st = service._state(conn_id)
+        started = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_deleted_terminal", turn_revision=0),
+        )
+        wire_item_id = next(event.item_id for event in started if isinstance(event, InputAudioBufferSpeechStartedEvent))
+        service.handle_conversation_item_delete(
+            conn_id,
+            ConversationItemDeleteEvent(type="conversation.item.delete", item_id=wire_item_id),
+        )
+
+        if terminal == "failed":
+            events = service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionFailedEvent(
+                    message="private failure",
+                    turn_id="turn_deleted_terminal",
+                    turn_revision=0,
+                ),
+            )
+        else:
+            events = service.dispatch_pipeline_event(
+                conn_id,
+                AudioInputCompletedEvent(
+                    audio=np.zeros(1600, dtype=np.float32),
+                    audio_sample_rate=16000,
+                    audio_duration_s=0.1,
+                    turn_id="turn_deleted_terminal",
+                    turn_revision=0,
+                ),
+            )
+
+        assert events == []
+        assert st.input_item_by_turn_revision == {}
 
     def test_metadata_free_active_input_delete_suppresses_all_late_terminals(
         self,

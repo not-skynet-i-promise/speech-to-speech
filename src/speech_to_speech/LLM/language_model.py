@@ -4,7 +4,7 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator, Sized
 from queue import Empty
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from typing import Any, Literal, Optional, Protocol, runtime_checkable
 
 import torch
@@ -154,11 +154,12 @@ class StreamContext(BaseModel):
     recorded_item_ids: set[str] = Field(default_factory=set)
     recorded_call_ids: set[str] = Field(default_factory=set)
     prefetch_transaction: ResponsePrefetchTransaction | None = None
+    cancel_event: Event | None = None
 
     @property
     def interrupted(self) -> bool:
         """True when generation ended early for any reason."""
-        return self.cancelled or self.stopped
+        return self.cancelled or self.stopped or bool(self.cancel_event and self.cancel_event.is_set())
 
 
 class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
@@ -578,12 +579,21 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         if not isinstance(request, GenerateResponseRequest):
             raise TypeError(f"Unexpected request type: {type(request)}")
 
+        if request.is_cancelled:
+            yield EndOfResponse(
+                turn_id=request.turn_id,
+                turn_revision=request.turn_revision,
+                response_key=request.response_key,
+            )
+            return
+
         ctx.turn_id = request.turn_id
         ctx.turn_revision = request.turn_revision
         ctx.speech_stopped_at_s = request.speech_stopped_at_s
         gen = self.cancel_scope.generation if self.cancel_scope else None
         ctx.cancel_generation = gen
         ctx.prefetch_transaction = request.prefetch_transaction
+        ctx.cancel_event = request.cancel_event
         if not self._turn_is_latest(ctx.turn_id, ctx.turn_revision):
             logger.info("Skipping stale LLM request for turn=%s rev=%s", ctx.turn_id, ctx.turn_revision)
             yield EndOfResponse(
@@ -669,6 +679,9 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
         try:
             for chunk in self._generate(active_chat, language_code, gen, ctx, runtime_config, response):
+                if request.is_cancelled:
+                    ctx.cancelled = True
+                    break
                 chunk.response_key = request.response_key
                 chunk.prefetch_transaction = request.prefetch_transaction
                 new_parts = [part.model_copy(deep=True) for part in chunk.parts]
@@ -692,7 +705,7 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             if ctx.stopped:
                 return
 
-            turn_output_allowed = not ctx.cancelled and self._turn_output_allowed(ctx.turn_id, ctx.turn_revision)
+            turn_output_allowed = not ctx.interrupted and self._turn_output_allowed(ctx.turn_id, ctx.turn_revision)
             # Out-of-band responses still emit output, but never write back to the default
             # conversation (their context was a throwaway chat).
             commit_allowed = turn_output_allowed and not out_of_band

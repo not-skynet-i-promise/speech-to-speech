@@ -1270,6 +1270,25 @@ def test_audio_request_uses_chat_completions_input_audio_payload():
     assert audio_part["data"]
 
 
+def test_cancelled_audio_request_releases_payload_without_calling_provider():
+    handler = _make_handler(stream=False)
+    create = MagicMock()
+    handler.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+    )
+    request = _make_audio_request()
+
+    request.cancel()
+    outputs = list(handler.process(request))
+
+    assert request.audio is None
+    assert request.is_cancelled
+    assert len(outputs) == 1
+    assert isinstance(outputs[0], EndOfResponse)
+    assert outputs[0].response_key == request.response_key
+    create.assert_not_called()
+
+
 def test_audio_second_turn_retains_recent_audio_then_compacts_older_turn():
     handler = _make_handler(stream=False)
     captured_calls = []
