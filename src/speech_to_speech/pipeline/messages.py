@@ -380,6 +380,14 @@ class GenerateResponseRequest(PipelineMessage):
             self._provider_started = True
             return True, start()
 
+    def claim_provider_request(self) -> bool:
+        """Atomically claim provider admission for an immediately following local call."""
+        with self._provider_lock:
+            if self.cancel_event.is_set() or self._provider_started:
+                return False
+            self._provider_started = True
+            return True
+
     @property
     def is_cancelled(self) -> bool:
         """Return whether the request was retracted before completion."""

@@ -68,7 +68,10 @@ from speech_to_speech.pipeline.messages import (
     TokenUsage,
 )
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
-from speech_to_speech.pipeline.transcript_logging import log_exception, transcript_for_response_log
+from speech_to_speech.pipeline.transcript_logging import (
+    log_response_exception,
+    transcript_for_response_log,
+)
 from speech_to_speech.utils.utils import is_out_of_band, response_wants_audio
 
 try:
@@ -171,6 +174,41 @@ class StreamContext(BaseModel):
             return True, result
         self.cancelled = True
         return False, None
+
+    def start_provider_stream(self, start: Callable[[], Iterable[Any]]) -> tuple[bool, Any]:
+        """Admit a lazy provider stream only after its first provider step starts."""
+
+        def start_and_prime() -> Iterator[Any]:
+            token_iter = iter(start())
+            try:
+                first_token = next(token_iter)
+            except StopIteration:
+
+                def empty() -> Iterator[Any]:
+                    yield from ()
+
+                return empty()
+
+            def primed() -> Iterator[Any]:
+                try:
+                    yield first_token
+                    yield from token_iter
+                finally:
+                    close = getattr(token_iter, "close", None)
+                    if callable(close):
+                        close()
+
+            return primed()
+
+        started, token_iter = self.start_provider_request(start_and_prime)
+        return started, token_iter
+
+    def claim_provider_request(self) -> bool:
+        """Atomically claim an immediately following local provider invocation."""
+        if self.request is None or self.request.claim_provider_request():
+            return True
+        self.cancelled = True
+        return False
 
 
 class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
@@ -641,13 +679,19 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             try:
                 active_chat = build_active_chat(original_chat, response)
             except ChatItemError as exc:
-                log_exception(logger, "Out-of-band response rejected", exc, level=logging.INFO)
+                log_response_exception(
+                    logger,
+                    "Out-of-band response rejected",
+                    exc,
+                    response,
+                    level=logging.INFO,
+                )
                 yield EndOfResponse(
                     turn_id=ctx.turn_id,
                     turn_revision=ctx.turn_revision,
                     cancel_generation=gen,
                     response_key=request.response_key,
-                    error=str(exc),
+                    error="Invalid isolated response input",
                 )
                 return
         else:
@@ -790,7 +834,12 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             # Any generation failure must still terminate the response. Without this
             # the exception would escape process() and no EndOfResponse would be
             # emitted, leaving st.in_response stuck and locking every later response.
-            log_exception(logger, "LLM generation failed; ending the current response", exc)
+            log_response_exception(
+                logger,
+                "LLM generation failed; ending the current response",
+                exc,
+                response,
+            )
             rollback_history()
             if request.prefetch_transaction is not None:
                 # The terminal is queued before this generator resumes into its
@@ -801,7 +850,9 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 turn_revision=ctx.turn_revision,
                 cancel_generation=ctx.cancel_generation,
                 response_key=request.response_key,
-                error=f"Language model generation failed: {exc}",
+                error=(
+                    "Language model generation failed" if out_of_band else f"Language model generation failed: {exc}"
+                ),
             )
             return
         finally:
@@ -895,7 +946,7 @@ class LanguageModelHandler(BaseLanguageModelHandler):
             with MLXLockContext(handler_name="MLX-LLM", timeout=10.0):
                 if self._check_stop(gen, ctx):
                     return
-                started, token_iter = ctx.start_provider_request(
+                started, token_iter = ctx.start_provider_stream(
                     lambda: mlx_stream_generate(
                         self.model,  # type: ignore[arg-type]
                         self.tokenizer,  # type: ignore[arg-type]
@@ -903,7 +954,7 @@ class LanguageModelHandler(BaseLanguageModelHandler):
                         max_tokens=self.gen_kwargs["max_new_tokens"],
                     )
                 )
-                if not started:
+                if not started or token_iter is None:
                     return
                 if ctx.prefetch_transaction is not None:
 
@@ -932,14 +983,13 @@ class LanguageModelHandler(BaseLanguageModelHandler):
 
             def _locked_pipe() -> None:
                 with lock:
-                    self.pipe(chat_prompt, **self.gen_kwargs)
+                    if ctx.claim_provider_request():
+                        self.pipe(chat_prompt, **self.gen_kwargs)
 
             if self._check_stop(gen, ctx):
                 return
             thread = Thread(target=_locked_pipe)
-            started, _ = ctx.start_provider_request(thread.start)
-            if not started:
-                return
+            thread.start()
             yield from self._stream_tokens(self.streamer, gen, language_code, ctx, runtime_config, response)
             self._finish_transformers_generation(thread)
             if self.device == "mps":
@@ -1091,7 +1141,7 @@ class VisionLanguageModelHandler(BaseLanguageModelHandler):
             with MLXLockContext(handler_name="MLX-VLM", timeout=10.0):
                 if self._check_stop(gen, ctx):
                     return
-                started, token_iter = ctx.start_provider_request(
+                started, token_iter = ctx.start_provider_stream(
                     lambda: mlx_vlm_stream_generate(  # type: ignore[arg-type]
                         self.model,
                         self.processor,
@@ -1101,7 +1151,7 @@ class VisionLanguageModelHandler(BaseLanguageModelHandler):
                         enable_thinking=self.enable_thinking,
                     )
                 )
-                if not started:
+                if not started or token_iter is None:
                     return
                 if ctx.prefetch_transaction is not None:
 
@@ -1137,14 +1187,13 @@ class VisionLanguageModelHandler(BaseLanguageModelHandler):
 
             def _locked_generate() -> None:
                 with lock:
-                    self.model.generate(**generate_kwargs)  # type: ignore[union-attr,operator]
+                    if ctx.claim_provider_request():
+                        self.model.generate(**generate_kwargs)  # type: ignore[union-attr,operator]
 
             if self._check_stop(gen, ctx):
                 return
             thread = Thread(target=_locked_generate)
-            started, _ = ctx.start_provider_request(thread.start)
-            if not started:
-                return
+            thread.start()
             yield from self._stream_tokens(self.streamer, gen, language_code, ctx, runtime_config, response)
             self._finish_transformers_generation(thread)
             if self.device == "mps":

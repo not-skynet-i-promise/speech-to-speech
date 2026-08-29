@@ -228,6 +228,7 @@ class ConnState(BaseModel):
     deleted_conversation_item_ids: dict[str, None] = Field(default_factory=dict)
     deleted_response_text_outputs: dict[str, dict[str, Any]] = Field(default_factory=dict)
     deleted_response_function_calls: dict[str, tuple[int, str | None]] = Field(default_factory=dict)
+    deleted_audio_response_keys: set[str] = Field(default_factory=set)
     # A response's streamed output_index values remain positions in its final
     # output array even when the client removes an item from conversation
     # history before response.done. Keep only the non-sensitive identity needed

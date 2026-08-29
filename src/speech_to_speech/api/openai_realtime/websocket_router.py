@@ -463,7 +463,19 @@ async def _dispatch_client_event(
             await send_correlated(events)
 
     elif isinstance(event, ConversationItemDeleteEvent):
-        await send_correlated(service.handle_conversation_item_delete(session_id, event))
+        st = service._state(session_id)
+        queued_request = st.queued_input_responses.get(event.item_id)
+        retracts_response = queued_request is not None
+        events = service.handle_conversation_item_delete(session_id, event)
+        deletion_succeeded = any(getattr(outgoing, "type", None) == "conversation.item.deleted" for outgoing in events)
+        if retracts_response and deletion_succeeded:
+            unit.cancel_scope.cancel()
+            _flush_queue(unit.text_prompt_queue, preserve=_keep_pipeline_control)
+            _flush_queue(unit.output_queue, preserve=_keep_cancel_bookkeeping)
+            _flush_queue(unit.text_output_queue, preserve=_keep_user_text_event)
+            transport.discard_pending_audio()
+            unit.response_playing.clear()
+        await send_correlated(events)
 
     elif isinstance(event, ConversationItemTruncateEvent):
         # The stock Agents SDK sends this after an audible WebSocket
@@ -957,7 +969,10 @@ def create_app(
 
                     if _is_pipeline_end(audio_chunk):
                         if transport is not None and session_id:
+                            st = unit.service._state(session_id)
+                            response_key = st.current_response_key
                             await transport.send_events(unit.service.finish_response(session_id))
+                            st.retire_closed_response_key(response_key)
                         break
 
                     if _is_audio_done(audio_chunk):
@@ -1013,7 +1028,9 @@ def create_app(
                                 unit.service.finish_response(session_id, response_key=response_key)
                             )
                         if session_id:
-                            unit.service._state(session_id).clear_pending_response(response_key)
+                            st = unit.service._state(session_id)
+                            st.clear_pending_response(response_key)
+                            st.retire_closed_response_key(response_key)
                         unit.response_playing.clear()
                         unit.cancel_scope.response_done(audio_generation)
                         unit.should_listen.set()

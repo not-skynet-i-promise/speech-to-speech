@@ -137,6 +137,8 @@ class ResponseHandler(RealtimeBaseHandler):
         st.finished_function_call_indices = set()
         st.next_assistant_output_sequence = 0
         st.pending_early_tool_calls = {}
+        if completed_response_key is not None:
+            st.deleted_audio_response_keys.discard(completed_response_key)
 
     @staticmethod
     def _prefetch_matches(event: ResponseCreateEvent) -> bool:

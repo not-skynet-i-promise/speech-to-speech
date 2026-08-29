@@ -178,6 +178,8 @@ class ConversationHandler(RealtimeBaseHandler):
             ]
             if removed_text_outputs:
                 removed = removed_text_outputs[0]
+                if st.current_response_key is not None:
+                    st.deleted_audio_response_keys.add(st.current_response_key)
                 st.deleted_response_outputs[int(removed["output_index"])] = {
                     "kind": "text",
                     "item_id": str(removed["item_id"]),

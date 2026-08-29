@@ -57,7 +57,11 @@ from speech_to_speech.pipeline.messages import (
     TokenUsage,
 )
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
-from speech_to_speech.pipeline.transcript_logging import log_exception, transcript_for_response_log
+from speech_to_speech.pipeline.transcript_logging import (
+    log_exception,
+    log_response_exception,
+    transcript_for_response_log,
+)
 from speech_to_speech.utils.utils import is_out_of_band, response_wants_audio
 
 logger = logging.getLogger(__name__)
@@ -827,9 +831,18 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 # the error and fall through to the EndOfResponse below. Without this the
                 # exception would escape process() and no EndOfResponse would be emitted,
                 # leaving st.in_response stuck and locking every subsequent response.
-                log_exception(logger, "LLM generation failed; ending the current response", exc)
+                log_response_exception(
+                    logger,
+                    "LLM generation failed; ending the current response",
+                    exc,
+                    turn.response,
+                )
                 if error_message is None:
-                    error_message = f"Language model generation failed: {exc}"
+                    error_message = (
+                        "Language model generation failed"
+                        if is_out_of_band(turn.response)
+                        else f"Language model generation failed: {exc}"
+                    )
 
             if (
                 provider_request_started
@@ -977,13 +990,19 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             try:
                 active_chat = build_active_chat(original_chat, response)
             except ChatItemError as exc:
-                log_exception(logger, "Out-of-band response rejected", exc, level=logging.INFO)
+                log_response_exception(
+                    logger,
+                    "Out-of-band response rejected",
+                    exc,
+                    response,
+                    level=logging.INFO,
+                )
                 yield EndOfResponse(
                     turn_id=turn_id,
                     turn_revision=turn_revision,
                     cancel_generation=gen,
                     response_key=request.response_key,
-                    error=str(exc),
+                    error="Invalid isolated response input",
                 )
                 return
         else:
@@ -1113,13 +1132,19 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             try:
                 active_chat = build_active_chat(original_chat, response)
             except ChatItemError as exc:
-                log_exception(logger, "Out-of-band response rejected", exc, level=logging.INFO)
+                log_response_exception(
+                    logger,
+                    "Out-of-band response rejected",
+                    exc,
+                    response,
+                    level=logging.INFO,
+                )
                 yield EndOfResponse(
                     turn_id=turn_id,
                     turn_revision=turn_revision,
                     cancel_generation=gen,
                     response_key=request.response_key,
-                    error=str(exc),
+                    error="Invalid isolated response input",
                 )
                 return
         else:

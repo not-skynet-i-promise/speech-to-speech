@@ -307,6 +307,12 @@ class AudioHandler(RealtimeBaseHandler):
         """Encode a raw PCM audio chunk as a base64 delta event for the WebSocket transport."""
         response = self._service.response
         st = self._state(conn_id)
+        if st.response_key_is_closed(response_key) or response_key in st.deleted_audio_response_keys:
+            logger.debug("Dropping audio for a closed response")
+            return []
+        if response_key is not None and st.current_response_key is not None and response_key != st.current_response_key:
+            logger.debug("Dropping audio for a non-current response")
+            return []
 
         resp_id, assistant_item_id, assistant_output_index, events = self.begin_audio_output(
             conn_id,

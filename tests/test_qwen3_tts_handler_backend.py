@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from openai.types.realtime.realtime_response_create_params import RealtimeResponseCreateParams
 
 import speech_to_speech.TTS.qwen3_tts_handler as qwen3_tts_module
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
@@ -17,6 +18,34 @@ from speech_to_speech.TTS.qwen3_tts_handler import Qwen3TTSHandler
 
 def _audible_stream_chunk():
     return np.full(512, 0.1, dtype=np.float32)
+
+
+def test_isolated_qwen_tts_never_prints_generated_prose(monkeypatch):
+    """The production TTS path must keep out-of-band prose out of the terminal."""
+    sentinel = "PRIVATE_ISOLATED_QWEN_PROSE"
+    printed: list[str] = []
+    handler = object.__new__(Qwen3TTSHandler)
+    handler.speculative_turns = None
+    handler.cancel_scope = None
+    handler.queue_in = Queue()
+    handler._model_type = lambda: "custom_voice"
+    handler._apply_session_voice_override = lambda *_args: None
+    handler._has_voice_clone_reference = lambda: False
+    handler._process_custom_voice = lambda _text: iter(())
+    monkeypatch.setattr(qwen3_tts_module.console, "print", lambda value, **_kwargs: printed.append(str(value)))
+
+    outputs = list(
+        handler.process(
+            TTSInput(
+                text=sentinel,
+                runtime_config=RuntimeConfig(),
+                response=RealtimeResponseCreateParams(conversation="none"),
+            )
+        )
+    )
+
+    assert outputs == []
+    assert sentinel not in "\n".join(printed)
 
 
 def test_setup_uses_mlx_backend_on_darwin_and_maps_qwen_repo_ids(monkeypatch):

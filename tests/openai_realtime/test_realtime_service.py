@@ -550,11 +550,15 @@ class TestHandleConversationItemDelete:
             ConversationItemDeleteEvent(type="conversation.item.delete", item_id=wire_item_id),
         )
 
+        late_audio = service.encode_audio_chunk(conn_id, _pcm_bytes(256), "response_private_text")
+
         assert st.deleted_response_text_outputs[wire_item_id] == {
             "item_id": wire_item_id,
             "output_index": 0,
         }
         assert "PRIVATE_TEXT_SENTINEL" not in repr(st.deleted_response_text_outputs)
+        assert late_audio == []
+        assert st.pending_assistant_item_id is None
 
     def test_unknown_item_returns_error(self, service, conn_id):
         events = service.handle_conversation_item_delete(

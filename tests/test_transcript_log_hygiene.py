@@ -22,6 +22,7 @@ from speech_to_speech.pipeline.messages import (
     Transcription,
 )
 from speech_to_speech.pipeline.transcript_logging import (
+    log_response_exception,
     log_transcripts_enabled,
     set_log_transcripts,
     transcript_for_log,
@@ -148,6 +149,24 @@ def test_isolated_response_content_stays_suppressed_when_transcript_logging_is_e
     logged = _logged_text(caplog)
     assert SENTINEL not in logged
     assert "isolated-response-suppressed" in logged
+
+
+def test_isolated_response_exception_stays_content_free_with_transcript_logging(caplog):
+    """Provider exceptions can reflect private input and never qualify for the opt-in."""
+    caplog.set_level(logging.DEBUG)
+    set_log_transcripts(True)
+    response = RealtimeResponseCreateParams(conversation="none")
+
+    log_response_exception(
+        logging.getLogger("isolated-response-test"),
+        "Isolated provider failed",
+        RuntimeError(ERROR_SENTINEL),
+        response,
+    )
+
+    logged = _logged_text(caplog)
+    assert ERROR_SENTINEL not in logged
+    assert "Isolated provider failed (RuntimeError)" in logged
 
 
 @pytest.mark.parametrize("enabled", [False, True])

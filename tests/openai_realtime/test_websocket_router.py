@@ -32,6 +32,7 @@ from speech_to_speech.pipeline.events import (
     ResponseGenerationDoneEvent,
     SpeechStartedEvent,
     TokenUsageEvent,
+    TranscriptionCompletedEvent,
     TranscriptionFailedEvent,
 )
 from speech_to_speech.pipeline.messages import (
@@ -473,6 +474,37 @@ class TestClientEventDispatch:
                 time.sleep(0.1)
                 assert not cancel_scope.discarding
 
+    def test_item_delete_cancels_worker_owned_provider_generation(self, setup):
+        """A successful input deletion must cancel both request and pipeline generation."""
+        app, service, _, _, _, _, _, _, cancel_scope = setup
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                conn_id = next(iter(service._conns))
+                started = service.dispatch_pipeline_event(
+                    conn_id,
+                    SpeechStartedEvent(turn_id="turn_delete", turn_revision=0),
+                )
+                item_id = next(event.item_id for event in started if hasattr(event, "item_id"))
+                service.dispatch_pipeline_event(
+                    conn_id,
+                    TranscriptionCompletedEvent(
+                        transcript="PRIVATE_WORKER_INPUT",
+                        turn_id="turn_delete",
+                        turn_revision=0,
+                    ),
+                )
+                request = service.text_prompt_queue.get_nowait()
+                generation = cancel_scope.generation
+
+                ws.send_json({"type": "conversation.item.delete", "item_id": item_id})
+                deleted = ws.receive_json()
+
+                assert deleted["type"] == "conversation.item.deleted"
+                assert request.is_cancelled
+                assert cancel_scope.generation == generation + 1
+                assert request.response_key in service._state(conn_id).closed_response_keys
+
     def test_response_cancel_clears_pending_implicit_response(self, setup):
         app, service, _, _, _, _, _, _, cancel_scope = setup
         with TestClient(app) as client:
@@ -602,6 +634,22 @@ class TestSendLoop:
                 types = {msg1["type"], msg2["type"]}
                 assert "response.output_audio.done" in types
                 assert "response.done" in types
+
+    def test_normal_ordered_terminal_retires_closed_response_key(self, setup):
+        """Ordinary completed responses must not accumulate suppression records."""
+        app, service, _, output_queue, *_ = setup
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                conn_id = next(iter(service._conns))
+                response_key = "ordinary_completed_response"
+                service.response._ensure_response(conn_id, response_key)
+
+                output_queue.put(AudioOutput(audio=AUDIO_RESPONSE_DONE, response_key=response_key))
+                done = ws.receive_json()
+
+                assert done["type"] == "response.done"
+                assert response_key not in service._state(conn_id).closed_response_keys
 
     def test_text_output_sends_pipeline_events(self, setup):
         app, _, _, _, text_output_queue, *_ = setup

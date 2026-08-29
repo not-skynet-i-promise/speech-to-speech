@@ -79,6 +79,16 @@ def transcript_for_response_log(text: object, response: object | None) -> str:
     return transcript_for_log(text)
 
 
+def assistant_console_text(text: object, response: object | None) -> str | None:
+    """Return live assistant text unless the response is explicitly isolated."""
+    conversation = getattr(response, "conversation", None)
+    if isinstance(response, dict):
+        conversation = response.get("conversation")
+    if conversation == "none":
+        return None
+    return "" if text is None else str(text)
+
+
 def log_exception(
     target: logging.Logger,
     message: str,
@@ -98,3 +108,18 @@ def log_exception(
         )
         return
     target.log(level, "%s (%s)", message, type(exc).__name__)
+
+
+def log_response_exception(
+    target: logging.Logger,
+    message: str,
+    exc: BaseException,
+    response: object | None,
+    *,
+    level: int = logging.ERROR,
+) -> None:
+    """Log failures without ever exposing isolated response content."""
+    if assistant_console_text("isolated", response) is None:
+        target.log(level, "%s (%s)", message, type(exc).__name__)
+        return
+    log_exception(target, message, exc, level=level)
