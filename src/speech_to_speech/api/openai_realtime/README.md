@@ -71,6 +71,10 @@ flowchart LR
 | `response.create` | Trigger LLM generation. Supports per-response `instructions` and `tool_choice` overrides. |
 | `response.cancel` | Cancel the in-progress or queued response and re-enable listening. |
 
+`turn_detection.create_response` defaults to `true` when omitted or `null`.
+Set it to `false` to emit and store completed transcriptions without starting
+generation automatically; send `response.create` when generation should begin.
+
 ### Server -> Client
 
 | Event | Description |

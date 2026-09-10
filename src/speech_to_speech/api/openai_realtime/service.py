@@ -627,7 +627,7 @@ class RealtimeService:
     # ── STT → LM bridge ────────────────────────────
 
     def _on_transcription_completed(self, conn_id: str, event: TranscriptionCompletedEvent) -> list[ServerEvent]:
-        """Handle a final STT transcription: emit protocol event, append to chat, trigger LM."""
+        """Emit and store a final transcription, then trigger LM when configured."""
         st = self._state(conn_id)
         completed_events = self.conversation.on_transcription_completed(conn_id, event)
         if not completed_events:
@@ -668,7 +668,7 @@ class RealtimeService:
             st.speculative_user_speech_stopped_at_s = event.speech_stopped_at_s
 
         queue = self.text_prompt_queue
-        if queue and transcript:
+        if queue and transcript and cfg.create_response_enabled:
             request = GenerateResponseRequest(
                 runtime_config=cfg,
                 language_code=event.language_code,
