@@ -3901,10 +3901,50 @@ class TestDispatchPipelineEvent:
         assert request.audio_sample_rate == 16000
         assert request.turn_id == "turn_1"
         assert request.turn_revision == 0
+        assert state.pending_input_audio is None
 
         service.response._ensure_response(conn_id)
         assert state.input_audio_duration_s == 0.0
         assert state.response_usage.audio_duration_s == 2.5
+
+    def test_create_response_false_preserves_audio_for_explicit_response(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+        text_prompt_queue,
+    ):
+        from openai.types.realtime.realtime_audio_input_turn_detection import ServerVad
+
+        runtime_config.session.audio.input.turn_detection = ServerVad(
+            type="server_vad",
+            create_response=False,
+        )
+        audio = np.zeros(1600, dtype=np.float32)
+        service.dispatch_pipeline_event(
+            conn_id,
+            AudioInputCompletedEvent(
+                audio=audio,
+                audio_sample_rate=16000,
+                audio_duration_s=0.1,
+                turn_id="turn_1",
+                turn_revision=0,
+            ),
+        )
+
+        state = service._state(conn_id)
+        assert text_prompt_queue.empty()
+        assert state.response_pending is False
+        assert np.array_equal(state.pending_input_audio, audio)
+
+        result = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+
+        assert isinstance(result, ResponseCreatedEvent)
+        request = text_prompt_queue.get_nowait()
+        assert np.array_equal(request.audio, audio)
+        assert request.audio_sample_rate == 16000
+        assert request.turn_id == "turn_1"
+        assert state.pending_input_audio is None
 
     def test_empty_transcription_completed_emits_event_without_response(
         self,

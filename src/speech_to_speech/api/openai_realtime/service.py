@@ -4,6 +4,7 @@ from queue import Queue
 from threading import Event as ThreadingEvent
 from typing import Any, Callable, Literal, Optional, TypeVar, Union, cast
 
+import numpy as np
 from openai.types.realtime import (
     ConversationItem,
     ConversationItemCreatedEvent,
@@ -203,6 +204,8 @@ class ConnState(BaseModel):
     input_item_by_turn_revision: dict[tuple[str, int | None], str] = Field(default_factory=dict)
     input_items: dict[str, InputItemState] = Field(default_factory=dict)
     input_audio_duration_s: float = 0.0
+    pending_input_audio: np.ndarray | None = None
+    pending_input_audio_sample_rate: int = PIPELINE_SAMPLE_RATE
     last_item_id: Optional[str] = None
     current_response_params: RealtimeResponseCreateParams | None = None
     pending_assistant_item_id: Optional[str] = None
@@ -712,8 +715,10 @@ class RealtimeService:
             st.speculative_user_turn_revision = event.turn_revision
             st.speculative_user_speech_stopped_at_s = event.speech_stopped_at_s
 
+        st.pending_input_audio = event.audio
+        st.pending_input_audio_sample_rate = event.audio_sample_rate
         queue = self.text_prompt_queue
-        if queue:
+        if queue and st.runtime_config.create_response_enabled:
             request = GenerateResponseRequest(
                 runtime_config=st.runtime_config,
                 audio=event.audio,
@@ -724,6 +729,7 @@ class RealtimeService:
             )
             st.mark_response_pending(request.response_key)
             queue.put(request)
+            st.pending_input_audio = None
         return []
 
     # ── Metrics ────────────────────────────────────

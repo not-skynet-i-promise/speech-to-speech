@@ -72,8 +72,9 @@ flowchart LR
 | `response.cancel` | Cancel the in-progress or queued response and re-enable listening. |
 
 `turn_detection.create_response` defaults to `true` when omitted or `null`.
-Set it to `false` to emit and store completed transcriptions without starting
-generation automatically; send `response.create` when generation should begin.
+Set it to `false` to retain a completed input turn without starting generation
+automatically; send `response.create` when generation should begin. This applies
+to both transcribed and native-audio input.
 
 ### Server -> Client
 

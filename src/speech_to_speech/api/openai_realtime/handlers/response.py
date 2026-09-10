@@ -593,9 +593,12 @@ class ResponseHandler(RealtimeBaseHandler):
 
         cfg = st.runtime_config
         queue = self._queue(conn_id)
+        pending_audio = None if out_of_band else st.pending_input_audio
         request = GenerateResponseRequest(
             runtime_config=cfg,
             response=event.response,
+            audio=pending_audio,
+            audio_sample_rate=st.pending_input_audio_sample_rate,
             turn_id=None if out_of_band else st.speculative_user_turn_id,
             turn_revision=None if out_of_band else st.speculative_user_turn_revision,
             speech_stopped_at_s=None if out_of_band else st.speculative_user_speech_stopped_at_s,
@@ -606,6 +609,8 @@ class ResponseHandler(RealtimeBaseHandler):
         st.current_response_id = _generate_id("resp")
         st.current_response_key = request.response_key
         st.response_created_pending_key = request.response_key
+        if pending_audio is not None:
+            st.pending_input_audio = None
         self._start_item(conn_id)
 
         if queue:
