@@ -3901,7 +3901,9 @@ class TestDispatchPipelineEvent:
         assert request.turn_id == "turn_1"
         assert request.turn_revision == 0
         assert request.audio_in_history is True
-        assert state.pending_native_audio_response is False
+        assert request.native_audio_item_id == state.pending_native_audio_item_id
+        assert state.pending_native_audio_item_id is not None
+        assert request.input_chat is not runtime_config.chat
 
         service.response._ensure_response(conn_id)
         assert state.input_audio_duration_s == 0.0
@@ -3935,7 +3937,7 @@ class TestDispatchPipelineEvent:
         state = service._state(conn_id)
         assert text_prompt_queue.empty()
         assert state.response_pending is False
-        assert state.pending_native_audio_response is True
+        assert state.pending_native_audio_item_id is not None
         assert runtime_config.chat.buffer[-1].content[0].type == "input_audio"
 
         result = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
@@ -3945,7 +3947,10 @@ class TestDispatchPipelineEvent:
         assert request.audio is None
         assert request.audio_in_history is True
         assert request.turn_id == "turn_1"
-        assert state.pending_native_audio_response is False
+        assert request.native_audio_item_id == state.pending_native_audio_item_id
+
+        service.finish_response(conn_id, response_key=request.response_key)
+        assert state.pending_native_audio_item_id is None
 
     def test_create_response_false_preserves_multiple_native_audio_turns(
         self,
@@ -4033,6 +4038,56 @@ class TestDispatchPipelineEvent:
         assert isinstance(retry, ResponseCreatedEvent)
         retry_request = text_prompt_queue.get_nowait()
         assert retry_request.runtime_config.chat.buffer[-1].content[0].type == "input_audio"
+        assert retry_request.audio_in_history is True
+        assert retry_request.native_audio_item_id == service._state(conn_id).pending_native_audio_item_id
+
+    def test_each_queued_native_audio_request_uses_its_own_history_snapshot(
+        self,
+        service,
+        conn_id,
+        text_prompt_queue,
+    ):
+        for turn_id, value in (("turn_1", 0.0), ("turn_2", 0.5)):
+            service.dispatch_pipeline_event(
+                conn_id,
+                AudioInputCompletedEvent(
+                    audio=np.full(1600, value, dtype=np.float32),
+                    turn_id=turn_id,
+                    turn_revision=0,
+                ),
+            )
+
+        first = text_prompt_queue.get_nowait()
+        second = text_prompt_queue.get_nowait()
+        first_audio = [item for item in first.input_chat.buffer if item.content[0].type == "input_audio"]
+        second_audio = [item for item in second.input_chat.buffer if item.content[0].type == "input_audio"]
+
+        assert len(first_audio) == 1
+        assert len(second_audio) == 2
+        assert first.native_audio_item_id == first_audio[-1].id
+        assert second.native_audio_item_id == second_audio[-1].id
+
+    def test_each_queued_transcript_request_uses_its_own_history_snapshot(
+        self,
+        service,
+        conn_id,
+        text_prompt_queue,
+    ):
+        for turn_id, transcript in (("turn_1", "first"), ("turn_2", "second")):
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(
+                    transcript=transcript,
+                    turn_id=turn_id,
+                    turn_revision=0,
+                ),
+            )
+
+        first = text_prompt_queue.get_nowait()
+        second = text_prompt_queue.get_nowait()
+
+        assert [item.content[0].text for item in first.input_chat.buffer] == ["first"]
+        assert [item.content[0].text for item in second.input_chat.buffer] == ["first", "second"]
 
     def test_empty_transcription_completed_emits_event_without_response(
         self,

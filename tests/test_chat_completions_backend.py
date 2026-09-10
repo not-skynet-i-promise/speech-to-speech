@@ -379,6 +379,33 @@ def test_chat_completions_backend_processes_ordered_audio_already_in_history():
     assert [part.audio for part in retained_audio] == ["second"]
 
 
+def test_chat_completions_backend_bounds_deferred_audio_to_the_queued_snapshot():
+    handler = _make_handler(stream=False)
+    chat = Chat(5)
+    first = chat.add_item(make_user_audio_message("first"))
+    snapshot = chat.copy(deep=True)
+    chat.add_item(make_user_audio_message("second"))
+    cfg = RuntimeConfig(
+        chat=chat,
+        session=RealtimeSessionCreateRequest(type="realtime", instructions="You are helpful."),
+    )
+
+    list(
+        handler.process(
+            GenerateResponseRequest(
+                runtime_config=cfg,
+                input_chat=snapshot,
+                audio_in_history=True,
+                native_audio_item_id=first.id,
+            )
+        )
+    )
+
+    captured = handler.client.chat.completions.last_kwargs
+    audio_parts = [message["content"][0] for message in captured["messages"] if message["role"] == "user"]
+    assert [part["input_audio"]["data"] for part in audio_parts] == ["first"]
+
+
 def test_chat_completions_backend_uses_configured_audio_url_payload():
     handler = _make_handler(stream=False)
     handler.audio_content_type = "audio_url"

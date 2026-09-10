@@ -922,8 +922,9 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             return
 
         original_chat = runtime_config.chat
+        request_chat = request.input_chat or original_chat
         history_anchor_id: str | None = None
-        if not is_out_of_band(response) and original_chat.has_pending_tool_calls():
+        if not is_out_of_band(response) and request_chat.has_pending_tool_calls():
             yield EndOfResponse(
                 turn_id=turn_id,
                 turn_revision=turn_revision,
@@ -946,7 +947,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 )
                 return
         else:
-            active_chat = original_chat.copy()
+            active_chat = request_chat.copy()
 
         language_code = request.language_code
         language_code, _ = resolve_auto_language(language_code)
@@ -966,7 +967,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         self._apply_config(active_chat, instructions, wants_audio, language_name=lang_name)
 
         if request.audio_in_history:
-            history_anchor_id = original_chat.history_anchor_id()
+            history_anchor_id = request_chat.history_anchor_id()
         else:
             assert request.audio is not None
             audio_b64 = self._audio_to_wav_base64(request.audio, request.audio_sample_rate)
@@ -1053,8 +1054,9 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             return
 
         original_chat = runtime_config.chat
-        history_anchor_id = original_chat.history_anchor_id()
-        if not is_out_of_band(response) and original_chat.has_pending_tool_calls():
+        request_chat = request.input_chat or original_chat
+        history_anchor_id = request_chat.history_anchor_id()
+        if not is_out_of_band(response) and request_chat.has_pending_tool_calls():
             yield EndOfResponse(
                 turn_id=turn_id,
                 turn_revision=turn_revision,
@@ -1077,7 +1079,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 )
                 return
         else:
-            active_chat = original_chat.copy()
+            active_chat = request_chat.copy()
         language_code = request.language_code
         language_code, _ = resolve_auto_language(language_code)
         lang_name = language_name_for_prompt(language_code, enable=self.enable_lang_prompt)

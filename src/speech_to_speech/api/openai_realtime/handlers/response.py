@@ -95,6 +95,13 @@ class ResponseHandler(RealtimeBaseHandler):
         )
         st.response_usage.reset()
         completed_response_key = st.current_response_key
+        native_audio_item_id = (
+            st.native_audio_item_by_response_key.pop(completed_response_key, None)
+            if completed_response_key is not None
+            else None
+        )
+        if status == "completed" and native_audio_item_id == st.pending_native_audio_item_id:
+            st.pending_native_audio_item_id = None
         completed_with_tools = bool(st.pending_function_calls)
         if (
             status == "completed"
@@ -181,6 +188,7 @@ class ResponseHandler(RealtimeBaseHandler):
 
         request = GenerateResponseRequest(
             runtime_config=st.runtime_config,
+            input_chat=st.runtime_config.chat.copy(deep=True),
             turn_id=st.speculative_user_turn_id,
             turn_revision=st.speculative_user_turn_revision,
             speech_stopped_at_s=st.speculative_user_speech_stopped_at_s,
@@ -593,11 +601,14 @@ class ResponseHandler(RealtimeBaseHandler):
 
         cfg = st.runtime_config
         queue = self._queue(conn_id)
-        audio_in_history = not out_of_band and st.pending_native_audio_response
+        native_audio_item_id = None if out_of_band else st.pending_native_audio_item_id
+        audio_in_history = native_audio_item_id is not None
         request = GenerateResponseRequest(
             runtime_config=cfg,
+            input_chat=None if out_of_band else cfg.chat.copy(deep=True),
             response=event.response,
             audio_in_history=audio_in_history,
+            native_audio_item_id=native_audio_item_id,
             turn_id=None if out_of_band else st.speculative_user_turn_id,
             turn_revision=None if out_of_band else st.speculative_user_turn_revision,
             speech_stopped_at_s=None if out_of_band else st.speculative_user_speech_stopped_at_s,
@@ -608,8 +619,8 @@ class ResponseHandler(RealtimeBaseHandler):
         st.current_response_id = _generate_id("resp")
         st.current_response_key = request.response_key
         st.response_created_pending_key = request.response_key
-        if audio_in_history:
-            st.pending_native_audio_response = False
+        if native_audio_item_id is not None:
+            st.native_audio_item_by_response_key[request.response_key] = native_audio_item_id
         self._start_item(conn_id)
 
         if queue:

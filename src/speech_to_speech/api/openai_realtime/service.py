@@ -203,8 +203,11 @@ class ConnState(BaseModel):
     input_item_by_turn_revision: dict[tuple[str, int | None], str] = Field(default_factory=dict)
     input_items: dict[str, InputItemState] = Field(default_factory=dict)
     input_audio_duration_s: float = 0.0
-    # An explicit response should use native-audio provider settings.
-    pending_native_audio_response: bool = False
+    # Latest native-audio input that has not completed a response. Keep the
+    # item identity so an older response cannot consume a newer turn and
+    # failures remain retryable.
+    pending_native_audio_item_id: str | None = None
+    native_audio_item_by_response_key: dict[str, str] = Field(default_factory=dict)
     last_item_id: Optional[str] = None
     current_response_params: RealtimeResponseCreateParams | None = None
     pending_assistant_item_id: Optional[str] = None
@@ -484,6 +487,7 @@ class RealtimeService:
         """Tombstone a response key without losing its pending provider usage."""
         st = self._state(conn_id)
         if response_key is not None:
+            st.native_audio_item_by_response_key.pop(response_key, None)
             input_tokens, output_tokens = st.pending_token_usage.pop(response_key, (0, 0))
             self.total_usage.input_tokens += input_tokens
             self.total_usage.output_tokens += output_tokens
@@ -673,6 +677,7 @@ class RealtimeService:
         if queue and transcript and cfg.create_response_enabled:
             request = GenerateResponseRequest(
                 runtime_config=cfg,
+                input_chat=cfg.chat.copy(deep=True),
                 language_code=event.language_code,
                 turn_id=event.turn_id,
                 turn_revision=event.turn_revision,
@@ -719,19 +724,22 @@ class RealtimeService:
             cfg.chat.remove_user_message(st.speculative_user_item_id)
         item = cfg.chat.add_item(make_user_audio_message(audio_to_wav_base64(event.audio, event.audio_sample_rate)))
         st.speculative_user_item_id = item.id
-        st.pending_native_audio_response = True
+        st.pending_native_audio_item_id = item.id
         queue = self.text_prompt_queue
         if queue and cfg.create_response_enabled:
             request = GenerateResponseRequest(
                 runtime_config=cfg,
+                input_chat=cfg.chat.copy(deep=True),
                 audio_in_history=True,
+                native_audio_item_id=item.id,
                 turn_id=event.turn_id,
                 turn_revision=event.turn_revision,
                 speech_stopped_at_s=event.speech_stopped_at_s,
             )
             st.mark_response_pending(request.response_key)
+            assert item.id is not None
+            st.native_audio_item_by_response_key[request.response_key] = item.id
             queue.put(request)
-            st.pending_native_audio_response = False
         return []
 
     # ── Metrics ────────────────────────────────────
