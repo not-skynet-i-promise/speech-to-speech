@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
+import io
 import uuid
+import wave
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -21,6 +24,25 @@ def response_wants_audio(response: RealtimeResponseCreateParams | None) -> bool:
         return True
     mods = response.output_modalities
     return not mods or "audio" in mods
+
+
+def audio_to_wav_base64(audio: np.ndarray, sample_rate: int) -> str:
+    """Encode a mono 16-bit WAV payload without touching the filesystem."""
+    audio_array = np.asarray(audio)
+    if audio_array.ndim > 1:
+        audio_array = np.mean(audio_array, axis=1)
+    if np.issubdtype(audio_array.dtype, np.floating):
+        pcm = (np.clip(audio_array, -1.0, 1.0) * 32767.0).astype("<i2")
+    else:
+        pcm = np.clip(audio_array, -32768, 32767).astype("<i2")
+
+    with io.BytesIO() as wav_io:
+        with wave.open(wav_io, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(pcm.tobytes())
+        return base64.b64encode(wav_io.getvalue()).decode("ascii")
 
 
 def is_out_of_band(response: RealtimeResponseCreateParams | None) -> bool:

@@ -4,7 +4,6 @@ from queue import Queue
 from threading import Event as ThreadingEvent
 from typing import Any, Callable, Literal, Optional, TypeVar, Union, cast
 
-import numpy as np
 from openai.types.realtime import (
     ConversationItem,
     ConversationItemCreatedEvent,
@@ -53,7 +52,7 @@ from speech_to_speech.api.openai_realtime.handlers import (
 )
 from speech_to_speech.api.openai_realtime.input_state import InputItemState
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
-from speech_to_speech.LLM.chat import Chat, make_user_message
+from speech_to_speech.LLM.chat import Chat, make_user_audio_message, make_user_message
 from speech_to_speech.pipeline.events import (
     AssistantOutputEvent,
     AssistantResponseDoneEvent,
@@ -73,7 +72,7 @@ from speech_to_speech.pipeline.messages import GenerateResponseRequest
 from speech_to_speech.pipeline.queue_types import TextPromptItem
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
 from speech_to_speech.pipeline.transcript_logging import log_exception, transcript_for_log
-from speech_to_speech.utils.utils import _generate_id
+from speech_to_speech.utils.utils import _generate_id, audio_to_wav_base64
 
 logger = logging.getLogger(__name__)
 
@@ -204,8 +203,8 @@ class ConnState(BaseModel):
     input_item_by_turn_revision: dict[tuple[str, int | None], str] = Field(default_factory=dict)
     input_items: dict[str, InputItemState] = Field(default_factory=dict)
     input_audio_duration_s: float = 0.0
-    pending_input_audio: np.ndarray | None = None
-    pending_input_audio_sample_rate: int = PIPELINE_SAMPLE_RATE
+    # An explicit response should use native-audio provider settings.
+    pending_native_audio_response: bool = False
     last_item_id: Optional[str] = None
     current_response_params: RealtimeResponseCreateParams | None = None
     pending_assistant_item_id: Optional[str] = None
@@ -715,21 +714,24 @@ class RealtimeService:
             st.speculative_user_turn_revision = event.turn_revision
             st.speculative_user_speech_stopped_at_s = event.speech_stopped_at_s
 
-        st.pending_input_audio = event.audio
-        st.pending_input_audio_sample_rate = event.audio_sample_rate
+        cfg = st.runtime_config
+        if same_speculative_turn and st.speculative_user_item_id:
+            cfg.chat.remove_user_message(st.speculative_user_item_id)
+        item = cfg.chat.add_item(make_user_audio_message(audio_to_wav_base64(event.audio, event.audio_sample_rate)))
+        st.speculative_user_item_id = item.id
+        st.pending_native_audio_response = True
         queue = self.text_prompt_queue
-        if queue and st.runtime_config.create_response_enabled:
+        if queue and cfg.create_response_enabled:
             request = GenerateResponseRequest(
-                runtime_config=st.runtime_config,
-                audio=event.audio,
-                audio_sample_rate=event.audio_sample_rate,
+                runtime_config=cfg,
+                audio_in_history=True,
                 turn_id=event.turn_id,
                 turn_revision=event.turn_revision,
                 speech_stopped_at_s=event.speech_stopped_at_s,
             )
             st.mark_response_pending(request.response_key)
             queue.put(request)
-            st.pending_input_audio = None
+            st.pending_native_audio_response = False
         return []
 
     # ── Metrics ────────────────────────────────────
