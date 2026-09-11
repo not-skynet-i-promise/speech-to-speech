@@ -3821,6 +3821,43 @@ class TestDispatchPipelineEvent:
         assert evt.usage.type == "duration"
         assert service._state(conn_id).response_pending is True
 
+    def test_create_response_false_stores_transcript_for_explicit_response(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+        text_prompt_queue,
+    ):
+        from openai.types.realtime.realtime_audio_input_turn_detection import ServerVad
+
+        runtime_config.session.audio.input.turn_detection = ServerVad(
+            type="server_vad",
+            create_response=False,
+        )
+        events = service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(
+                transcript="hello world",
+                language_code="en",
+                turn_id="turn_1",
+                turn_revision=2,
+                speech_stopped_at_s=123.0,
+            ),
+        )
+
+        assert isinstance(events[0], ConversationItemInputAudioTranscriptionCompletedEvent)
+        assert text_prompt_queue.empty()
+        assert service._state(conn_id).response_pending is False
+        assert runtime_config.chat.buffer[-1].content[0].text == "hello world"
+
+        result = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+
+        assert isinstance(result, ResponseCreatedEvent)
+        request = text_prompt_queue.get_nowait()
+        assert request.turn_id == "turn_1"
+        assert request.turn_revision == 2
+        assert request.speech_stopped_at_s == 123.0
+
     def test_audio_input_completed_marks_response_pending_and_preserves_duration(
         self,
         service,
@@ -3860,14 +3897,197 @@ class TestDispatchPipelineEvent:
         request = text_prompt_queue.get_nowait()
         assert isinstance(request, GenerateResponseRequest)
         assert request.runtime_config is runtime_config
-        assert np.array_equal(request.audio, audio)
-        assert request.audio_sample_rate == 16000
+        assert request.audio is None
         assert request.turn_id == "turn_1"
         assert request.turn_revision == 0
+        assert request.audio_in_history is True
+        assert request.native_audio_item_id == state.pending_native_audio_item_id
+        assert state.pending_native_audio_item_id is not None
+        assert request.input_chat is not runtime_config.chat
 
         service.response._ensure_response(conn_id)
         assert state.input_audio_duration_s == 0.0
         assert state.response_usage.audio_duration_s == 2.5
+
+    def test_create_response_false_preserves_audio_for_explicit_response(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+        text_prompt_queue,
+    ):
+        from openai.types.realtime.realtime_audio_input_turn_detection import ServerVad
+
+        runtime_config.session.audio.input.turn_detection = ServerVad(
+            type="server_vad",
+            create_response=False,
+        )
+        audio = np.zeros(1600, dtype=np.float32)
+        service.dispatch_pipeline_event(
+            conn_id,
+            AudioInputCompletedEvent(
+                audio=audio,
+                audio_sample_rate=16000,
+                audio_duration_s=0.1,
+                turn_id="turn_1",
+                turn_revision=0,
+            ),
+        )
+
+        state = service._state(conn_id)
+        assert text_prompt_queue.empty()
+        assert state.response_pending is False
+        assert state.pending_native_audio_item_id is not None
+        assert runtime_config.chat.buffer[-1].content[0].type == "input_audio"
+
+        result = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+
+        assert isinstance(result, ResponseCreatedEvent)
+        request = text_prompt_queue.get_nowait()
+        assert request.audio is None
+        assert request.audio_in_history is True
+        assert request.turn_id == "turn_1"
+        assert request.native_audio_item_id == state.pending_native_audio_item_id
+
+        service.finish_response(conn_id, response_key=request.response_key)
+        assert state.pending_native_audio_item_id is None
+
+    def test_create_response_false_preserves_multiple_native_audio_turns(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+        text_prompt_queue,
+    ):
+        from openai.types.realtime.realtime_audio_input_turn_detection import ServerVad
+
+        runtime_config.session.audio.input.turn_detection = ServerVad(
+            type="server_vad",
+            create_response=False,
+        )
+        for turn_id, value in (("turn_1", 0.0), ("turn_2", 0.5)):
+            service.dispatch_pipeline_event(
+                conn_id,
+                AudioInputCompletedEvent(
+                    audio=np.full(1600, value, dtype=np.float32),
+                    audio_sample_rate=16000,
+                    audio_duration_s=0.1,
+                    turn_id=turn_id,
+                    turn_revision=0,
+                ),
+            )
+
+        audio_parts = [item.content[0] for item in runtime_config.chat.buffer]
+        assert [part.type for part in audio_parts] == ["input_audio", "input_audio"]
+        assert audio_parts[0].audio != audio_parts[1].audio
+
+        service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        request = text_prompt_queue.get_nowait()
+        assert request.audio_in_history is True
+        assert request.turn_id == "turn_2"
+
+    def test_revised_native_audio_replaces_the_same_turn(self, service, conn_id, runtime_config):
+        from openai.types.realtime.realtime_audio_input_turn_detection import ServerVad
+
+        runtime_config.session.audio.input.turn_detection = ServerVad(
+            type="server_vad",
+            create_response=False,
+        )
+        for revision, value in ((0, 0.0), (1, 0.5)):
+            service.dispatch_pipeline_event(
+                conn_id,
+                AudioInputCompletedEvent(
+                    audio=np.full(1600, value, dtype=np.float32),
+                    turn_id="turn_1",
+                    turn_revision=revision,
+                ),
+            )
+
+        audio_parts = [item.content[0] for item in runtime_config.chat.buffer]
+        assert len(audio_parts) == 1
+        assert audio_parts[0].type == "input_audio"
+
+    def test_failed_native_audio_response_keeps_committed_audio_for_retry(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+        text_prompt_queue,
+    ):
+        from openai.types.realtime.realtime_audio_input_turn_detection import ServerVad
+
+        runtime_config.session.audio.input.turn_detection = ServerVad(
+            type="server_vad",
+            create_response=False,
+        )
+        service.dispatch_pipeline_event(
+            conn_id,
+            AudioInputCompletedEvent(audio=np.zeros(1600, dtype=np.float32), audio_duration_s=0.1),
+        )
+        service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        first_request = text_prompt_queue.get_nowait()
+        service.dispatch_pipeline_event(
+            conn_id,
+            ResponseFailedEvent(message="provider rejected audio", response_key=first_request.response_key),
+        )
+        service.finish_response(conn_id, status="failed", response_key=first_request.response_key)
+
+        assert runtime_config.chat.buffer[-1].content[0].type == "input_audio"
+        retry = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+
+        assert isinstance(retry, ResponseCreatedEvent)
+        retry_request = text_prompt_queue.get_nowait()
+        assert retry_request.runtime_config.chat.buffer[-1].content[0].type == "input_audio"
+        assert retry_request.audio_in_history is True
+        assert retry_request.native_audio_item_id == service._state(conn_id).pending_native_audio_item_id
+
+    def test_each_queued_native_audio_request_uses_its_own_history_snapshot(
+        self,
+        service,
+        conn_id,
+        text_prompt_queue,
+    ):
+        for turn_id, value in (("turn_1", 0.0), ("turn_2", 0.5)):
+            service.dispatch_pipeline_event(
+                conn_id,
+                AudioInputCompletedEvent(
+                    audio=np.full(1600, value, dtype=np.float32),
+                    turn_id=turn_id,
+                    turn_revision=0,
+                ),
+            )
+
+        first = text_prompt_queue.get_nowait()
+        second = text_prompt_queue.get_nowait()
+        first_audio = [item for item in first.input_chat.buffer if item.content[0].type == "input_audio"]
+        second_audio = [item for item in second.input_chat.buffer if item.content[0].type == "input_audio"]
+
+        assert len(first_audio) == 1
+        assert len(second_audio) == 2
+        assert first.native_audio_item_id == first_audio[-1].id
+        assert second.native_audio_item_id == second_audio[-1].id
+
+    def test_each_queued_transcript_request_uses_its_own_history_snapshot(
+        self,
+        service,
+        conn_id,
+        text_prompt_queue,
+    ):
+        for turn_id, transcript in (("turn_1", "first"), ("turn_2", "second")):
+            service.dispatch_pipeline_event(
+                conn_id,
+                TranscriptionCompletedEvent(
+                    transcript=transcript,
+                    turn_id=turn_id,
+                    turn_revision=0,
+                ),
+            )
+
+        first = text_prompt_queue.get_nowait()
+        second = text_prompt_queue.get_nowait()
+
+        assert [item.content[0].text for item in first.input_chat.buffer] == ["first"]
+        assert [item.content[0].text for item in second.input_chat.buffer] == ["first", "second"]
 
     def test_empty_transcription_completed_emits_event_without_response(
         self,
@@ -4461,6 +4681,21 @@ class TestInterruptResponseEnabled:
             "type": "server_vad",
         }
         assert runtime_config.interrupt_response_enabled is True
+
+
+class TestCreateResponseEnabled:
+    def test_defaults_true(self, runtime_config):
+        runtime_config.session.audio.input.turn_detection = None
+        assert runtime_config.create_response_enabled is True
+
+    def test_reads_server_vad_false(self, runtime_config):
+        from openai.types.realtime.realtime_audio_input_turn_detection import ServerVad
+
+        runtime_config.session.audio.input.turn_detection = ServerVad(
+            type="server_vad",
+            create_response=False,
+        )
+        assert runtime_config.create_response_enabled is False
 
 
 # ===================================================================

@@ -75,6 +75,21 @@ class RuntimeConfig(BaseModel):
             return True
         return val if val is not None else True
 
+    @property
+    def create_response_enabled(self) -> bool:
+        """Whether a completed transcription should trigger a response."""
+        assert self.session.audio is not None and self.session.audio.input is not None
+        td = self.session.audio.input.turn_detection
+        if td is None:
+            return True
+        if hasattr(td, "create_response"):
+            value = td.create_response
+        elif isinstance(td, dict):
+            value = td.get("create_response", True)
+        else:
+            return True
+        return value if value is not None else True
+
     def apply_session_update(self, update: RealtimeSessionCreateRequest) -> None:
         """Merge non-None, explicitly-set fields from 'update' into the
         current 'session', preserving any fields not present in the update."""

@@ -52,7 +52,7 @@ from speech_to_speech.api.openai_realtime.handlers import (
 )
 from speech_to_speech.api.openai_realtime.input_state import InputItemState
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
-from speech_to_speech.LLM.chat import Chat, make_user_message
+from speech_to_speech.LLM.chat import Chat, make_user_audio_message, make_user_message
 from speech_to_speech.pipeline.events import (
     AssistantOutputEvent,
     AssistantResponseDoneEvent,
@@ -72,7 +72,7 @@ from speech_to_speech.pipeline.messages import GenerateResponseRequest
 from speech_to_speech.pipeline.queue_types import TextPromptItem
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
 from speech_to_speech.pipeline.transcript_logging import log_exception, transcript_for_log
-from speech_to_speech.utils.utils import _generate_id
+from speech_to_speech.utils.utils import _generate_id, audio_to_wav_base64
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +203,11 @@ class ConnState(BaseModel):
     input_item_by_turn_revision: dict[tuple[str, int | None], str] = Field(default_factory=dict)
     input_items: dict[str, InputItemState] = Field(default_factory=dict)
     input_audio_duration_s: float = 0.0
+    # Latest native-audio input that has not completed a response. Keep the
+    # item identity so an older response cannot consume a newer turn and
+    # failures remain retryable.
+    pending_native_audio_item_id: str | None = None
+    native_audio_item_by_response_key: dict[str, str] = Field(default_factory=dict)
     last_item_id: Optional[str] = None
     current_response_params: RealtimeResponseCreateParams | None = None
     pending_assistant_item_id: Optional[str] = None
@@ -482,6 +487,7 @@ class RealtimeService:
         """Tombstone a response key without losing its pending provider usage."""
         st = self._state(conn_id)
         if response_key is not None:
+            st.native_audio_item_by_response_key.pop(response_key, None)
             input_tokens, output_tokens = st.pending_token_usage.pop(response_key, (0, 0))
             self.total_usage.input_tokens += input_tokens
             self.total_usage.output_tokens += output_tokens
@@ -627,7 +633,7 @@ class RealtimeService:
     # ── STT → LM bridge ────────────────────────────
 
     def _on_transcription_completed(self, conn_id: str, event: TranscriptionCompletedEvent) -> list[ServerEvent]:
-        """Handle a final STT transcription: emit protocol event, append to chat, trigger LM."""
+        """Emit and store a final transcription, then trigger LM when configured."""
         st = self._state(conn_id)
         completed_events = self.conversation.on_transcription_completed(conn_id, event)
         if not completed_events:
@@ -668,9 +674,10 @@ class RealtimeService:
             st.speculative_user_speech_stopped_at_s = event.speech_stopped_at_s
 
         queue = self.text_prompt_queue
-        if queue and transcript:
+        if queue and transcript and cfg.create_response_enabled:
             request = GenerateResponseRequest(
                 runtime_config=cfg,
+                input_chat=cfg.chat.copy(deep=True),
                 language_code=event.language_code,
                 turn_id=event.turn_id,
                 turn_revision=event.turn_revision,
@@ -712,17 +719,26 @@ class RealtimeService:
             st.speculative_user_turn_revision = event.turn_revision
             st.speculative_user_speech_stopped_at_s = event.speech_stopped_at_s
 
+        cfg = st.runtime_config
+        if same_speculative_turn and st.speculative_user_item_id:
+            cfg.chat.remove_user_message(st.speculative_user_item_id)
+        item = cfg.chat.add_item(make_user_audio_message(audio_to_wav_base64(event.audio, event.audio_sample_rate)))
+        st.speculative_user_item_id = item.id
+        st.pending_native_audio_item_id = item.id
         queue = self.text_prompt_queue
-        if queue:
+        if queue and cfg.create_response_enabled:
             request = GenerateResponseRequest(
-                runtime_config=st.runtime_config,
-                audio=event.audio,
-                audio_sample_rate=event.audio_sample_rate,
+                runtime_config=cfg,
+                input_chat=cfg.chat.copy(deep=True),
+                audio_in_history=True,
+                native_audio_item_id=item.id,
                 turn_id=event.turn_id,
                 turn_revision=event.turn_revision,
                 speech_stopped_at_s=event.speech_stopped_at_s,
             )
             st.mark_response_pending(request.response_key)
+            assert item.id is not None
+            st.native_audio_item_by_response_key[request.response_key] = item.id
             queue.put(request)
         return []
 

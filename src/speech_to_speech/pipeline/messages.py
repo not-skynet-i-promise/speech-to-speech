@@ -346,9 +346,16 @@ class GenerateResponseRequest(PipelineMessage):
     tag: Literal["generate_response"] = "generate_response"
     response_key: str = Field(default_factory=lambda: uuid4().hex, exclude=True, repr=False)
     runtime_config: RuntimeConfig
+    # Immutable conversation view captured when this request is queued. The
+    # live chat remains the write-back target, but later user turns must not
+    # leak into an earlier queued generation.
+    input_chat: Any = Field(default=None, exclude=True, repr=False)
     response: RealtimeResponseCreateParams | None = None
     audio: np.ndarray | None = None
     audio_sample_rate: int = 16000
+    # Use native-audio request settings when input is already committed to chat.
+    audio_in_history: bool = False
+    native_audio_item_id: str | None = Field(default=None, exclude=True, repr=False)
     language_code: Optional[str] = None
     turn_id: str | None = None
     turn_revision: int | None = None
